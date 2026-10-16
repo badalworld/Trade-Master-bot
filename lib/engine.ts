@@ -224,7 +224,15 @@ class TradeEngine {
   }
 
   getStatus(): EngineStatus {
-    return { ...this.status, events: this.events, entriesHalted: this.haltEntries || loadRiskPolicy().halted };
+    // Durability and policy are read live, so a stopped engine still reports the truth about the
+    // mount it *would* write to (a start-time snapshot showed "in-process only" even when /data exists).
+    return {
+      ...this.status,
+      events: this.events,
+      entriesHalted: this.haltEntries || loadRiskPolicy().halted,
+      ledgerDurable: ledger.isDurable(),
+      config: loadEngineConfig(),
+    };
   }
 
   /** Flatten every position this engine owns. Never touches foreign positions. */
