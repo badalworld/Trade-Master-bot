@@ -87,6 +87,18 @@ export interface EngineStatusPayload {
       board: { source: 'binance' | 'fallback'; universeSize: number; liquidCount: number } | null;
       skipped: Record<string, number>;
       selected: string | null;
+      /** The opportunity list the fast scan worked from, and what changed on it. */
+      opportunity?: {
+        size: number;
+        cap: number;
+        scanned: number;
+        held: string[];
+        promoted: string[];
+        removed: Array<{ symbol: string; reason: string; detail: string }>;
+        warned: Array<{ symbol: string; strikes: number; reason: string }>;
+        boardAgeMs: number;
+        durable: boolean;
+      } | null;
     } | null;
     events: Array<{ at: number; level: 'INFO' | 'WARN' | 'ERROR' | 'SUCCESS'; kind: string; message: string }>;
     ledgerDurable: boolean;
@@ -290,6 +302,33 @@ export function EngineStatusPanel({ state, loading, error, onAction, onToggleAut
                   <span className="text-slate-200">{e.lastScan.signals} deep-scanned</span>
                   {e.lastScan.failures > 0 ? ` · ${e.lastScan.failures} with no candles` : ''}
                 </div>
+                {e.lastScan.opportunity && (
+                  <div>
+                    <span className="text-cyan-300 font-semibold">Opportunity list</span>{' '}
+                    <span className="text-slate-200">
+                      {e.lastScan.opportunity.size}/{e.lastScan.opportunity.cap}
+                    </span>{' '}
+                    pair{e.lastScan.opportunity.size === 1 ? '' : 's'} · {e.lastScan.opportunity.scanned} scanned this cycle ·
+                    market ranking {Math.round(e.lastScan.opportunity.boardAgeMs / 1000)}s old
+                    {e.lastScan.opportunity.held.length > 0 ? ` · ${e.lastScan.opportunity.held.length} held` : ''}
+                    {e.lastScan.opportunity.durable ? '' : ' · not persisted'}
+                    {e.lastScan.opportunity.promoted.length > 0 && (
+                      <span className="text-emerald-300"> · +{e.lastScan.opportunity.promoted.join(', ')}</span>
+                    )}
+                    {e.lastScan.opportunity.removed.length > 0 && (
+                      <span className="text-rose-300/90">
+                        {' '}
+                        · −{e.lastScan.opportunity.removed.map((r) => `${r.symbol} (${r.reason})`).join(', ')}
+                      </span>
+                    )}
+                    {e.lastScan.opportunity.warned.length > 0 && (
+                      <span className="text-amber-300/90">
+                        {' '}
+                        · strikes: {e.lastScan.opportunity.warned.map((w) => `${w.symbol} ${w.strikes}`).join(', ')}
+                      </span>
+                    )}
+                  </div>
+                )}
                 <div>
                   {e.lastScan.selected ? (
                     <span className="text-emerald-300">Selected {e.lastScan.selected} (best score inside the band)</span>

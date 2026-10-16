@@ -169,6 +169,8 @@ export default function HomePage() {
   const [marketBoard, setMarketBoard] = useState<any>(null);
   const [scanSkipped, setScanSkipped] = useState<Record<string, number> | null>(null);
   const [scanUniverse, setScanUniverse] = useState<any>(null);
+  // The opportunity list: the pairs the market scan promoted, which the fast scan then trades from.
+  const [opportunity, setOpportunity] = useState<any>(null);
   const [logs, setLogs] = useState<LogEntry[]>(INITIAL_LOGS);
 
   // Operator session: when this deployment holds server-side Binance keys, the money endpoints
@@ -996,6 +998,7 @@ export default function HomePage() {
           if (data.board) setMarketBoard(data.board);
           if (data.skipped) setScanSkipped(data.skipped);
           if (data.universe) setScanUniverse(data.universe);
+          if (data.opportunity !== undefined) setOpportunity(data.opportunity);
 
           // Evaluate Auto-Trade Opportunity
           if (botActive) {
@@ -1004,10 +1007,16 @@ export default function HomePage() {
             const skippedText = data.skipped && Object.keys(data.skipped).length > 0
               ? ` Refused: ${Object.entries(data.skipped).map(([r, c]) => `${c} ${r}`).join(', ')}.`
               : '';
+            const listText = data.opportunity
+              ? ` Opportunity list ${data.opportunity.size}/${data.opportunity.cap}` +
+                (data.opportunity.promoted?.length ? `, added ${data.opportunity.promoted.map((p: any) => p.symbol).join(', ')}` : '') +
+                (data.opportunity.removed?.length ? `, removed ${data.opportunity.removed.map((r: any) => `${r.symbol} (${r.reason})`).join(', ')}` : '') +
+                '.'
+              : '';
             appendLog(
               'SCAN',
               'INFO',
-              `Market scan ranked ${board?.liquidCount ?? '?'} liquid USDT-M perps and deep-scanned ${data.signals.length}. Best setup: ${topScore?.symbol || 'None'} (${topScore?.signal || 'NEUTRAL'}, Score: ${topScore?.score || 0}%, Vol ${topScore?.volatilityPercent?.toFixed(2) || '0'}%, ADX ${Number.isFinite(topScore?.regime?.adx) ? topScore.regime.adx.toFixed(0) : '—'}, ER ${Number.isFinite(topScore?.regime?.efficiencyRatio) ? topScore.regime.efficiencyRatio.toFixed(2) : '—'}).${skippedText}`
+              `Market scan ranked ${board?.liquidCount ?? '?'} liquid USDT-M perps and deep-scanned ${data.signals.length}. Best setup: ${topScore?.symbol || 'None'} (${topScore?.signal || 'NEUTRAL'}, Score: ${topScore?.score || 0}%, Vol ${topScore?.volatilityPercent?.toFixed(2) || '0'}%, ADX ${Number.isFinite(topScore?.regime?.adx) ? topScore.regime.adx.toFixed(0) : '—'}, ER ${Number.isFinite(topScore?.regime?.efficiencyRatio) ? topScore.regime.efficiencyRatio.toFixed(2) : '—'}).${listText}${skippedText}`
             );
 
             const openLimit = canOpenNewTrade(positions.length, settings.maxOpenTrades);
@@ -1746,6 +1755,7 @@ export default function HomePage() {
               volatilityBand={scanUniverse?.volatilityBand ?? null}
               chopFilter={scanUniverse?.chopFilter ?? null}
               shortlistSkipped={scanUniverse?.shortlistSkipped ?? null}
+              opportunity={opportunity}
             />
           </div>
         )}

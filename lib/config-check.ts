@@ -58,6 +58,13 @@ export interface ConfigCheckInput {
       chopAdxFloor: number;
       chopEfficiencyFloor: number;
     };
+    /** The opportunity list: the pool the fast execution scan works from. */
+    opportunity?: {
+      enabled: boolean;
+      max: number;
+      strikes: number;
+      cooldownMs: number;
+    };
     symbolAllowlist?: string[];
   };
 }
@@ -273,6 +280,29 @@ export function buildConfigCheck(input: ConfigCheckInput): ConfigCheckResult {
         'The whole market is tradeable: entries are bounded by the scan funnel, not by a symbol list',
         `Ranking every USDT-M perpetual with at least $${(discovery.minQuoteVolumeUsdt / 1_000_000).toFixed(0)}M of 24h turnover, deep-scanning the most volatile ${scan.topN}, and refusing chop (ADX<${scan.chopAdxFloor} and ER<${scan.chopEfficiencyFloor}) and out-of-band volatility (${scan.minVolatilityPercent}%-${scan.maxVolatilityPercent}%). Pairs outside that funnel cannot be entered by the bot.`,
         'Set TRADE_SYMBOL_ALLOWLIST to restrict the bot to named pairs, or TRADE_DISCOVERY_ENABLED=false to go back to the built-in major list.'
+      )
+    );
+  }
+  const opportunity = policy.opportunity;
+  if (discovery?.enabled && opportunity && !opportunity.enabled) {
+    issues.push(
+      issue(
+        'OPPORTUNITY_LIST_DISABLED',
+        'warning',
+        'The opportunity list is OFF: every cycle re-derives a fresh shortlist',
+        'TRADE_OPPORTUNITY_ENABLED=false makes each scan rebuild a candidate slice from the market ranking instead of keeping the opportunity assets it found, so a pair that qualifies and then pauses is re-discovered from scratch rather than staying under watch.',
+        'Set TRADE_OPPORTUNITY_ENABLED=true to keep the promoted opportunity assets in a list that is scanned every cycle and pruned when a pair stops qualifying.'
+      )
+    );
+  }
+  if (opportunity?.enabled && opportunity.max > policy.maxOpenPositions * 4) {
+    issues.push(
+      issue(
+        'OPPORTUNITY_BUDGET_LIMITED',
+        'warning',
+        'The opportunity list is capped by the per-cycle weight budget',
+        `TRADE_OPPORTUNITY_MAX=${opportunity.max} asks for more opportunities than one cycle affords: the budget is TRADE_MAX_OPEN_POSITIONS x 4 = ${policy.maxOpenPositions * 4} pairs per cycle. The list is clamped to that, so the extra slots are never filled.`,
+        `Raise TRADE_MAX_OPEN_POSITIONS if you want a deeper opportunity list, or leave it and treat ${policy.maxOpenPositions * 4} as the honest ceiling.`
       )
     );
   }

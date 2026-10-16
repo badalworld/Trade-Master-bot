@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkRateLimit } from '@/lib/trading-engine';
-import { scanUniverse } from '@/lib/market-data';
+import { resolveOpportunityCap, scanUniverse } from '@/lib/market-data';
+import { loadOpportunityList, saveOpportunityList } from '@/lib/opportunity-store';
 import { loadRiskPolicy } from '@/lib/risk-policy';
 import { sessionStatus } from '@/lib/trade-guard';
 import { requireOperator } from '@/lib/operator-auth';
@@ -30,11 +31,15 @@ export async function GET(req: NextRequest) {
   const safetyCapParam = parseFloat(req.nextUrl.searchParams.get('safetyCap') || '95');
   const safetyCapRatio = !isNaN(safetyCapParam) && safetyCapParam > 0 ? safetyCapParam / 100 : 0.95;
 
+  // The same opportunity list the engine loop trades from: the browser scan refreshes it rather than
+  // keeping a private shortlist, so both halves of the app agree on what the opportunity assets are.
   const scan = await scanUniverse({
     isTestnet,
     policy,
     pairs: req.nextUrl.searchParams.get('pairs')?.split(',') ?? [],
+    opportunity: loadOpportunityList(),
   });
+  const opportunityDurability = scan.opportunity ? saveOpportunityList(scan.opportunity.state) : null;
 
   // If Binance sent no weight header we must not imply the budget is healthy; fall back to a
   // conservative estimate of the calls just made.
@@ -57,6 +62,25 @@ export async function GET(req: NextRequest) {
       rateLimitStatus: checkRateLimit(usedWeight, 1200, safetyCapRatio),
       /** Stage-1 market ranking, so the UI can show what the whole market looked like. */
       board: scan.board,
+      /**
+       * The opportunity list after this cycle: what the fast path holds, what joined, what left and
+       * why. Null when `TRADE_OPPORTUNITY_ENABLED=false`.
+       */
+      opportunity: scan.opportunity
+        ? {
+            mode: 'list' as const,
+            size: scan.opportunity.state.entries.length,
+            cap: resolveOpportunityCap(policy),
+            scanned: scan.opportunity.scanned,
+            held: scan.opportunity.held,
+            promoted: scan.opportunity.promoted,
+            removed: scan.opportunity.removed,
+            warned: scan.opportunity.warned,
+            boardAgeMs: Math.max(0, scan.timestamp - scan.board.generatedAt),
+            durable: opportunityDurability?.durable ?? null,
+            entries: scan.opportunity.state.entries,
+          }
+        : null,
       /** Universe + regime settings this scan actually applied (env, not client input). */
       universe: {
         discovered: scan.board.source === 'binance',

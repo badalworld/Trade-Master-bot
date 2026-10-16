@@ -34,6 +34,8 @@ function base(over: Partial<ConfigCheckInput> = {}): ConfigCheckInput {
       // market-wide case is asserted on its own below, with the numbers it actually applied.
       discovery: { enabled: false, topN: 40, minQuoteVolumeUsdt: 50_000_000 },
       scan: { topN: 12, minVolatilityPercent: 0.6, maxVolatilityPercent: 4, chopAdxFloor: 20, chopEfficiencyFloor: 0.3 },
+      // The shipped configuration: a 20-pair opportunity list refreshed by the market scan.
+      opportunity: { enabled: true, max: 20, strikes: 2, cooldownMs: 300_000 },
       symbolAllowlist: ['BTCUSDT'],
     },
     ...over,
@@ -229,6 +231,43 @@ test('the universe in force is always reported, because it decides what the bot 
   const listed = buildConfigCheck(base());
   assert.ok(!codes(listed).includes('UNIVERSE_MARKET_WIDE'));
   assert.ok(!codes(listed).includes('UNIVERSE_FIXED_LIST'));
+});
+
+test('the opportunity list mode is reported, including when the budget clamps it', () => {
+  // Discovery on with the list off: every cycle rebuilds a shortlist instead of keeping one.
+  const stateless = buildConfigCheck(
+    base({
+      policy: {
+        ...base().policy,
+        symbolAllowlist: [],
+        discovery: { enabled: true, topN: 40, minQuoteVolumeUsdt: 50_000_000 },
+        opportunity: { enabled: false, max: 20, strikes: 2, cooldownMs: 300_000 },
+      },
+    })
+  );
+  const off = stateless.issues.find((i) => i.code === 'OPPORTUNITY_LIST_DISABLED');
+  assert.ok(off, 'a stateless shortlist must not be silent about it');
+  assert.match(off.action, /TRADE_OPPORTUNITY_ENABLED=true/);
+
+  // Asking for a deeper list than one cycle can scan: the clamp is named, with the honest ceiling.
+  const clamped = buildConfigCheck(
+    base({
+      policy: {
+        ...base().policy,
+        symbolAllowlist: [],
+        discovery: { enabled: true, topN: 40, minQuoteVolumeUsdt: 50_000_000 },
+        opportunity: { enabled: true, max: 40, strikes: 2, cooldownMs: 300_000 },
+      },
+    })
+  );
+  const budget = clamped.issues.find((i) => i.code === 'OPPORTUNITY_BUDGET_LIMITED');
+  assert.ok(budget, 'a clamp must be visible');
+  assert.match(budget.detail, /TRADE_MAX_OPEN_POSITIONS x 4 = 20/, 'the arithmetic is shown');
+
+  // The shipped configuration: on, and inside the budget — nothing to report.
+  const shipped = buildConfigCheck(base());
+  assert.ok(!codes(shipped).includes('OPPORTUNITY_LIST_DISABLED'));
+  assert.ok(!codes(shipped).includes('OPPORTUNITY_BUDGET_LIMITED'));
 });
 
 test('a volatility band that cannot be satisfied is a blocker, not a warning', () => {

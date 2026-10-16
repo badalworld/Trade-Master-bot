@@ -15,7 +15,10 @@ import {
   Ban,
 } from 'lucide-react';
 import type { SignalEvaluation } from '@/lib/trading-engine';
-import type { OpportunityBoardSummary } from '@/lib/market-data';
+import type { OpportunityBoardSummary, OpportunityScanReport } from '@/lib/market-data';
+
+/** What the scanner needs to know about the opportunity list (a slice of the scan report + entries). */
+export type OpportunityListReport = OpportunityScanReport & { cap: number; boardAgeMs: number; durable?: boolean | null };
 import { formatCryptoPrice } from '@/lib/utils';
 
 interface ScannerTableProps {
@@ -37,6 +40,11 @@ interface ScannerTableProps {
   skipped?: Record<string, number> | null;
   /** Ranked liquid pairs that did not fit the shortlist this cycle. */
   shortlistSkipped?: number | null;
+  /**
+   * The opportunity list: the pairs the market scan promoted, scanned on their own every cycle. This
+   * is the fast path the bot trades from, so the strip says what is on it and what just left it.
+   */
+  opportunity?: OpportunityListReport | null;
   /** Volatility band in force (floor = chop floor, ceiling = blow-off ceiling). */
   volatilityBand?: { minPercent: number; maxPercent: number } | null;
   /** Chop thresholds in force, shown so the verdicts on screen are self-explaining. */
@@ -61,6 +69,7 @@ export function ScannerTable({
   volatilityBand = null,
   chopFilter = null,
   shortlistSkipped = null,
+  opportunity = null,
 }: ScannerTableProps) {
   const chopFloorLabel = chopFilter ? chopFilter.adxFloor : 20;
   const chopEfficiencyLabel = chopFilter ? chopFilter.efficiencyFloor : 0.3;
@@ -80,6 +89,9 @@ export function ScannerTable({
   });
 
   const tradeableCount = signals.filter((s) => s.scan?.tradeable !== false).length;
+  const listEntry = (symbol: string) => opportunity?.state.entries.find((e) => e.symbol === symbol) ?? null;
+  const promotedSet = new Set((opportunity?.promoted ?? []).map((e) => e.symbol));
+  const warnedMap = new Map((opportunity?.warned ?? []).map((w) => [w.symbol, w]));
   const skippedEntries = Object.entries(skipped ?? {});
   const skippedLabel = skippedEntries.map(([reason, count]) => `${count} ${reason}`).join(' · ');
 
@@ -212,6 +224,38 @@ export function ScannerTable({
           </div>
         )}
 
+        {/* The opportunity list: what the market scan promoted, and what it took back */}
+        {opportunity && (
+          <div className="px-5 py-2 border-b border-slate-800/70 bg-slate-950/60 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-mono">
+            <span className="text-slate-300">
+              <span className="text-cyan-300 font-semibold">Opportunity list</span>{' '}
+              {opportunity.state.entries.length}/{opportunity.cap} pair{opportunity.state.entries.length === 1 ? '' : 's'} · scanned every cycle
+            </span>
+            <span className="text-slate-500">market ranking {Math.round(opportunity.boardAgeMs / 1000)}s old</span>
+            {opportunity.held.length > 0 && (
+              <span className="text-slate-500">{opportunity.held.length} held by open positions</span>
+            )}
+            {opportunity.promoted.length > 0 && (
+              <span className="text-emerald-300">
+                + {opportunity.promoted.map((e) => `${e.symbol} (rank ${e.boardRank})`).join(', ')}
+              </span>
+            )}
+            {opportunity.removed.length > 0 && (
+              <span className="text-rose-300/90">
+                − {opportunity.removed.map((r) => `${r.symbol} (${r.reason})`).join(', ')} removed
+              </span>
+            )}
+            {opportunity.warned.length > 0 && (
+              <span className="text-amber-300/90">
+                {opportunity.warned.map((w) => `${w.symbol} strike ${w.strikes}`).join(', ')}
+              </span>
+            )}
+            {opportunity.durable === false && (
+              <span className="text-amber-300/90">not persisted — a restart re-discovers the market</span>
+            )}
+          </div>
+        )}
+
         {/* Empty State when no API credentials are provided */}
         {!hasApiKey ? (
           <div className="p-12 text-center flex flex-col items-center justify-center space-y-3">
@@ -284,6 +328,32 @@ export function ScannerTable({
                         <td className="py-3 px-4">
                           <div className="flex items-center gap-2">
                             <span className="font-semibold text-slate-200">{sig.symbol}</span>
+                            {(() => {
+                              const entry = listEntry(sig.symbol);
+                              if (!entry) return null;
+                              const warned = warnedMap.get(sig.symbol);
+                              return (
+                                <span
+                                  className="text-[10px] text-slate-400 bg-slate-900 px-1 py-0.2 rounded border border-slate-700/70 font-sans"
+                                  title={`On the opportunity list since ${new Date(entry.addedAt).toLocaleTimeString()} · ranked #${entry.boardRank} on the market board (1 = most volatile)`}
+                                >
+                                  LIST #{entry.boardRank}
+                                </span>
+                              );
+                            })()}
+                            {promotedSet.has(sig.symbol) && (
+                              <span className="text-[10px] text-emerald-300 bg-emerald-950/70 px-1 py-0.2 rounded border border-emerald-800/60 font-sans font-bold">
+                                NEW
+                              </span>
+                            )}
+                            {warnedMap.has(sig.symbol) && (
+                              <span
+                                className="text-[10px] text-amber-300 bg-amber-950/70 px-1 py-0.2 rounded border border-amber-800/60 font-sans font-bold"
+                                title={`Strike ${warnedMap.get(sig.symbol)?.strikes}: this pass failed (${warnedMap.get(sig.symbol)?.reason}). At the limit it leaves the opportunity list.`}
+                              >
+                                STRIKE {warnedMap.get(sig.symbol)?.strikes}
+                              </span>
+                            )}
                             {isHighVol && (
                               <span className="text-[10px] text-amber-300 bg-amber-950/70 px-1 py-0.2 rounded border border-amber-800/60 flex items-center gap-0.5 font-sans font-bold">
                                 <Flame className="w-2.5 h-2.5 text-amber-400" />

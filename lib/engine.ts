@@ -43,7 +43,9 @@ import {
   findProtectiveStop,
   planBracketEnforcement,
 } from './guardian.ts';
-import { scanUniverse, selectBestCandidate } from './market-data.ts';
+import { resolveOpportunityCap, scanUniverse, selectBestCandidate } from './market-data.ts';
+import { loadOpportunityList, saveOpportunityList } from './opportunity-store.ts';
+import { describeOpportunityChange } from './opportunity-list.ts';
 import { ledger } from './position-ledger.ts';
 import { loadRiskPolicy, type RiskPolicy } from './risk-policy.ts';
 import { envCredentials } from './trade-guard.ts';
@@ -105,9 +107,31 @@ export interface EngineStatus {
     skipped: Record<string, number>;
     /** True when a candidate was found and an entry was attempted. */
     selected: string | null;
+    /**
+     * The opportunity list after this cycle: how many assets it holds, which joined, which left and
+     * why, and which are only warned. Null when the list is disabled.
+     */
+    opportunity: EngineOpportunitySummary | null;
   } | null;
   events: EngineEvent[];
   ledgerDurable: boolean;
+}
+
+/**
+ * The opportunity list as the engine reports it: what the fast-path universe held this cycle, what
+ * joined, what left and why. Shared by the status payload and the UI.
+ */
+export interface EngineOpportunitySummary {
+  size: number;
+  cap: number;
+  scanned: number;
+  held: string[];
+  promoted: string[];
+  removed: { symbol: string; reason: string; detail: string }[];
+  warned: { symbol: string; strikes: number; reason: string }[];
+  /** Age of the market ranking the list was reconciled against, in ms. */
+  boardAgeMs: number;
+  durable: boolean;
 }
 
 export interface EngineFailureSummary {
@@ -245,6 +269,8 @@ class TradeEngine {
   private haltEntries = false;
   /** The failure the previous cycle ended on, so an identical one can be recognised as a repeat. */
   private failureStreak: EngineFailureStreak | null = null;
+  /** Reported once instead of every cycle, so a non-durable volume cannot drown the log. */
+  private opportunityDurabilityWarned = false;
   private status: EngineStatus;
   private events: EngineEvent[] = [];
 
@@ -697,11 +723,63 @@ class TradeEngine {
     }
 
     if (gate.allowed) {
+      // The opportunity list is the fast path: the market scan (cached, whole market) refreshes it,
+      // and this cycle trades exactly its members. It is carried across restarts through the data
+      // dir, so a redeploy does not have to re-discover the market before it can trade again.
       const scan = await scanUniverse({
         isTestnet: creds.isTestnet,
         policy,
         skip: ledger.list().map((p) => p.symbol),
+        opportunity: loadOpportunityList(),
       });
+
+      let opportunityReport: EngineOpportunitySummary | null = null;
+      if (scan.opportunity) {
+        const saved = saveOpportunityList(scan.opportunity.state);
+        if (!saved.durable && !this.opportunityDurabilityWarned) {
+          this.opportunityDurabilityWarned = true;
+          this.log(
+            'WARN',
+            'OPPORTUNITY_NOT_DURABLE',
+            `The opportunity list could not be written to ${'TRADE_DATA_DIR'} (${saved.error ?? 'unknown error'}). It keeps working for the life of this process, but a restart will re-discover the market from scratch.`
+          );
+        }
+
+        const promoted = scan.opportunity.promoted.map((entry) => `${entry.symbol} (rank ${entry.boardRank}, ${entry.amplitudePercent.toFixed(2)}% 24h range)`);
+        if (promoted.length > 0) {
+          this.log(
+            'SUCCESS',
+            'OPPORTUNITY_ADDED',
+            `${promoted.length} opportunity asset${promoted.length === 1 ? '' : 's'} promoted by the market scan: ${promoted.join(', ')}. Now scanning ${scan.opportunity.state.entries.length} pair${scan.opportunity.state.entries.length === 1 ? '' : 's'} every cycle.`
+          );
+        }
+        if (scan.opportunity.removed.length > 0) {
+          this.log(
+            'INFO',
+            'OPPORTUNITY_REMOVED',
+            `${scan.opportunity.removed.length} pair${scan.opportunity.removed.length === 1 ? '' : 's'} left the opportunity list: ${scan.opportunity.removed.map(describeOpportunityChange).join(', ')}.`
+          );
+        }
+        if (scan.opportunity.warned.length > 0) {
+          this.log(
+            'INFO',
+            'OPPORTUNITY_WARNED',
+            `Still listed, failed this pass: ${scan.opportunity.warned.map((w) => `${w.symbol} (${w.reason}, strike ${w.strikes}/${policy.opportunity.strikes})`).join(', ')}.`
+          );
+        }
+
+        opportunityReport = {
+          size: scan.opportunity.state.entries.length,
+          cap: resolveOpportunityCap(policy),
+          scanned: scan.opportunity.scanned.length,
+          held: scan.opportunity.held,
+          promoted: scan.opportunity.promoted.map((entry) => entry.symbol),
+          removed: scan.opportunity.removed.map((r) => ({ symbol: r.symbol, reason: r.reason, detail: r.detail })),
+          warned: scan.opportunity.warned,
+          boardAgeMs: Math.max(0, scan.timestamp - scan.board.generatedAt),
+          durable: saved.durable,
+        };
+      }
 
       // The board is the market-wide ranking; the shortlist below it is what was deep-scanned.
       const skippedSummary = Object.entries(scan.skipped)
@@ -709,10 +787,16 @@ class TradeEngine {
         .join(', ');
 
       if (scan.board.source === 'fallback') {
+        // The fallback board is a placeholder with no volatility readings. In list mode it must not be
+        // read as "nothing qualifies", so the list is carried over as it stands — say that, rather
+        // than claiming a scan of the built-in majors that no longer happens.
+        const listState = scan.opportunity ? scan.opportunity.state.entries.length : null;
         this.log(
           'WARN',
           'DISCOVERY_FALLBACK',
-          `Market ranking unavailable (${scan.board.error ?? 'unknown error'}); scanning the built-in ${scan.requestedPairs.length} majors instead. No pair outside that list can be found until the exchange answers.`
+          listState === null
+            ? `Market ranking unavailable (${scan.board.error ?? 'unknown error'}); scanning the built-in ${scan.requestedPairs.length} majors instead. No pair outside that list can be found until the exchange answers.`
+            : `Market ranking unavailable (${scan.board.error ?? 'unknown error'}); the opportunity list is kept as it is (${listState} pair${listState === 1 ? '' : 's'}). Nothing can be promoted or dropped until the exchange answers — a failed ranking is not evidence that a pair stopped qualifying.`
         );
       }
 
@@ -736,6 +820,7 @@ class TradeEngine {
           },
           skipped: scan.skipped,
           selected: candidate ? candidate.symbol : null,
+          opportunity: opportunityReport,
         },
       };
 
@@ -744,10 +829,13 @@ class TradeEngine {
           .slice(0, 3)
           .map((sig) => `${sig.symbol} ${sig.score}%${sig.scan?.skipReason ? ` (${sig.scan.skipReason})` : ''}`)
           .join(', ');
+        const listNote = opportunityReport
+          ? `opportunity list: ${opportunityReport.size}/${opportunityReport.cap} pair${opportunityReport.size === 1 ? '' : 's'}${opportunityReport.held.length > 0 ? ` (${opportunityReport.held.length} held by open positions)` : ''} · market ranking ${Math.round(opportunityReport.boardAgeMs / 1000)}s old · `
+          : '';
         this.log(
           'INFO',
           'NO_SETUP',
-          `${scan.signals.length} pairs deep-scanned from a board of ${scan.board.liquidCount} liquid pairs` +
+          `${listNote}${scan.signals.length} pairs deep-scanned from a board of ${scan.board.liquidCount} liquid pairs` +
             `${skippedSummary ? ` · refused: ${skippedSummary}` : ''}` +
             `${ranked ? ` · closest: ${ranked}` : ''}. Nothing met the entry threshold.`
         );

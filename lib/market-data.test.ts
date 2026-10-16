@@ -155,13 +155,18 @@ function stubExchange(seen: string[]): () => void {
   };
 }
 
-const policy = () =>
+/** Default fixture = the shipped configuration, opportunity list on. Pass overrides to test a mode. */
+const policy = (env: Record<string, string> = {}) =>
   loadRiskPolicy({
     TRADE_DISCOVERY_MIN_QUOTE_VOLUME: '1000000',
     TRADE_SCAN_TOP_N: '12',
     TRADE_MIN_VOLATILITY_PCT: '0.6',
     TRADE_MAX_VOLATILITY_PCT: '4',
+    ...env,
   });
+
+/** The shortlist path, which still exists for `TRADE_OPPORTUNITY_ENABLED=false`. */
+const legacyPolicy = () => policy({ TRADE_OPPORTUNITY_ENABLED: 'false' });
 
 // --------------------------------------------------------------------------- universe
 test('the scan universe is the market board, most volatile first — not a fixed list', () => {
@@ -187,7 +192,9 @@ test('an operator allowlist overrides the discovered universe, and discovery can
 test('the funnel deep-scans the top of the board and gates every pair on the regime', async () => {
   const seen: string[] = [];
   const restore = stubExchange(seen);
-  const p = policy();
+  // The stateless shortlist path: with the opportunity list off, every cycle re-derives a shortlist
+  // from the board, which is exactly why it also re-scans pairs it has already refused.
+  const p = legacyPolicy();
 
   try {
     const scan = await scanUniverse({ isTestnet: true, policy: p });
@@ -246,7 +253,7 @@ test('volatility rank is a percentile of this scan, and the list arrives best-sc
   const restore = stubExchange(seen);
 
   try {
-    const scan = await scanUniverse({ isTestnet: true, policy: policy() });
+    const scan = await scanUniverse({ isTestnet: true, policy: legacyPolicy() });
 
     const wild = scan.signals.find((s) => s.symbol === 'WILDUSDT');
     const quiet = scan.signals.find((s) => s.symbol === 'QUIETUSDT');
@@ -265,11 +272,111 @@ test('pairs already open are skipped, and the shortlist stays inside one cycle b
   const restore = stubExchange(seen);
 
   try {
-    const scan = await scanUniverse({ isTestnet: true, policy: policy(), skip: ['CHOPUSDT', 'QUIETUSDT'] });
+    const scan = await scanUniverse({ isTestnet: true, policy: legacyPolicy(), skip: ['CHOPUSDT', 'QUIETUSDT'] });
     assert.equal(scan.tradeable.GOODUSDT, true, 'skipping a pair must not blind the spec resolution');
     assert.ok(!scan.requestedPairs.includes('CHOPUSDT'), 'an open pair is not re-scanned for entry');
     assert.ok(!scan.requestedPairs.includes('QUIETUSDT'));
     assert.ok(scan.requestedPairs.length <= 24, 'the deep-scan stays bounded');
+  } finally {
+    restore();
+  }
+});
+
+// --------------------------------------------------------------------------- the opportunity list
+test('the scan targets the opportunity list, not a per-cycle slice of the board', async () => {
+  const seen: string[] = [];
+  const restore = stubExchange(seen);
+
+  try {
+    const scan = await scanUniverse({ isTestnet: true, policy: policy(), opportunity: null });
+
+    assert.ok(scan.opportunity, 'list mode reports the list it worked from');
+    const list = scan.opportunity!.state.entries.map((e) => e.symbol);
+    // 24h amplitudes: WILD 80%, GOOD 8%, OPEN 6%, CHOP 2%, QUIET 0.4% — the screening band (0.2%..12%)
+    // keeps the violent pair out of the list entirely, which is what stops the fast scan from spending
+    // every cycle on pairs that will be refused on arrival.
+    assert.deepEqual(list, ['GOODUSDT', 'OPENUSDT', 'CHOPUSDT', 'QUIETUSDT']);
+    assert.deepEqual(scan.opportunity!.scanned, list, 'every list member is deep-scanned');
+    assert.deepEqual(scan.requestedPairs, list, 'and nothing else is');
+    assert.equal(scan.opportunity!.state.entries[0].boardRank, 2, 'ranked by the market scan, most volatile first');
+
+    // The list is state: the next cycle starts from it rather than from scratch.
+    assert.equal(scan.opportunity!.state.boardGeneratedAt > 0, true);
+  } finally {
+    restore();
+  }
+});
+
+test('a refusal warns the list member, and repeated refusals take it off the list', async () => {
+  const seen: string[] = [];
+  const restore = stubExchange(seen);
+
+  try {
+    const first = await scanUniverse({ isTestnet: true, policy: policy(), opportunity: null });
+    const list = first.opportunity!.state;
+
+    // Two pairs are refused by the regime gate (chop, and volatility under the floor): the first pass
+    // is a warning, not an eviction.
+    assert.deepEqual(first.opportunity!.warned, [
+      { symbol: 'CHOPUSDT', strikes: 1, reason: 'choppy' },
+      { symbol: 'QUIETUSDT', strikes: 1, reason: 'vol-below-floor' },
+    ]);
+    assert.deepEqual(first.opportunity!.removed, [], 'nothing was removed on the first refusal');
+
+    // Second pass: the strike limit (2) is reached for both, so they leave the list and are barred
+    // for a while — the freed slots stay open for the next opportunity the market scan finds.
+    const second = await scanUniverse({ isTestnet: true, policy: policy(), opportunity: list });
+    const removed = second.opportunity!.removed;
+    assert.deepEqual(
+      removed.map((r) => [r.symbol, r.reason]).sort(),
+      [
+        ['CHOPUSDT', 'choppy'],
+        ['QUIETUSDT', 'vol-below-floor'],
+      ]
+    );
+    // They were scanned this cycle — that is how they were judged — and left the list afterwards.
+    assert.ok(second.opportunity!.scanned.includes('CHOPUSDT'));
+    assert.ok(removed.every((r) => r.cooldownUntil > Date.now()), 'with a cooldown before re-promotion');
+
+    // From the next cycle on they are no longer opportunity assets: not scanned, not tradeable.
+    const third = await scanUniverse({ isTestnet: true, policy: policy(), opportunity: second.opportunity!.state });
+    assert.ok(!third.requestedPairs.includes('CHOPUSDT'), 'a removed pair stops being scanned');
+    assert.ok(!third.requestedPairs.includes('QUIETUSDT'));
+    assert.equal(third.opportunity!.promoted.length, 0, 'and its cooldown keeps the market scan from re-adding it');
+    assert.deepEqual(
+      second.opportunity!.state.entries.map((e) => e.symbol),
+      ['GOODUSDT', 'OPENUSDT'],
+      'the list keeps the pairs that still qualify'
+    );
+  } finally {
+    restore();
+  }
+});
+
+test('a pair with an open position keeps its place on the list but is not scanned', async () => {
+  const seen: string[] = [];
+  const restore = stubExchange(seen);
+
+  try {
+    const first = await scanUniverse({ isTestnet: true, policy: policy(), opportunity: null });
+    const second = await scanUniverse({
+      isTestnet: true,
+      policy: policy(),
+      opportunity: first.opportunity!.state,
+      skip: ['GOODUSDT'],
+    });
+
+    assert.ok(!second.requestedPairs.includes('GOODUSDT'), 'an open pair is not scanned for entry');
+    assert.deepEqual(second.opportunity!.held, ['GOODUSDT']);
+    assert.ok(
+      second.opportunity!.state.entries.some((e) => e.symbol === 'GOODUSDT'),
+      'but it stays an opportunity asset for when the position closes'
+    );
+    assert.equal(
+      second.opportunity!.state.entries.find((e) => e.symbol === 'GOODUSDT')?.strikes,
+      0,
+      'an unscanned pair is never struck off'
+    );
   } finally {
     restore();
   }

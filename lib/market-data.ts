@@ -33,6 +33,14 @@ import {
 } from './market-regime.ts';
 import { DEFAULT_SCANNED_SYMBOLS, type RiskPolicy } from './risk-policy.ts';
 import { fetchOpportunityBoard, type DiscoveryCandidate, type OpportunityBoard } from './market-scanner.ts';
+import {
+  applyOpportunityVerdicts,
+  planOpportunityUniverse,
+  type OpportunityEntry,
+  type OpportunityListState,
+  type OpportunityRemoval,
+  type OpportunityVerdict,
+} from './opportunity-list.ts';
 
 export const MAX_SCAN_PAIRS = 24;
 /** Candles requested per pair. ADX(14) needs 29 to seed a Wilder average, plus room to settle. */
@@ -107,6 +115,31 @@ export interface ScanResult {
   skipped: Record<string, number>;
   /** Ranked liquid pairs that were not deep-scanned this cycle because the shortlist was full. */
   shortlistSkipped: number;
+  /**
+   * The opportunity list after this cycle: what it holds, what joined and what left. Null when the
+   * list is disabled (the scan then re-derives a shortlist from the board every cycle).
+   */
+  opportunity: OpportunityScanReport | null;
+}
+
+/**
+ * What happened to the opportunity list this cycle — the state to persist, plus the changes worth
+ * reporting to the operator.
+ */
+export interface OpportunityScanReport {
+  mode: 'list';
+  /** The list to persist. The caller owns durability (see `lib/opportunity-store.ts`). */
+  state: OpportunityListState;
+  /** Pairs deep-scanned this cycle: the list, minus members held by an open position. */
+  scanned: string[];
+  /** Members skipped this cycle because a position is already open on them (they keep their place). */
+  held: string[];
+  /** Pairs the market scan promoted this cycle (all of them were scanned in this same cycle). */
+  promoted: OpportunityEntry[];
+  /** Pairs that left the list, with the reason — board screen, verdict, displacement or capacity. */
+  removed: OpportunityRemoval[];
+  /** Members that carried at least one strike out of this cycle, but survived. */
+  warned: { symbol: string; strikes: number; reason: string }[];
 }
 
 async function fetchPairCandles(isTestnet: boolean, pair: string): Promise<PairScan> {
@@ -187,6 +220,12 @@ export interface ScanOptions {
   skip?: string[];
   /** Test seam: inject a board instead of calling the exchange. */
   board?: OpportunityBoard;
+  /**
+   * The opportunity list carried over from the previous cycle (null/absent = none yet). Used when
+   * `policy.opportunity.enabled`: the scan then targets exactly this list — refreshed against the
+   * fresh market ranking first, and pruned by what the deep scan then measures.
+   */
+  opportunity?: OpportunityListState | null;
 }
 
 /**
@@ -203,6 +242,16 @@ export function resolveScanUniverse(board: OpportunityBoard, policy: RiskPolicy)
   if (board.symbols.length > 0) return board.symbols;
   // Discovery on but the board came back empty for any reason: never scan nothing.
   return [...DEFAULT_SCANNED_SYMBOLS];
+}
+
+/**
+ * How many pairs the opportunity list may hold: what the operator asked for, bounded by what one
+ * cycle can afford to scan. Every member is deep-scanned every cycle, so this is also the weight
+ * ceiling — 20 pairs at 5m/100 candles is ~40 weight per cycle against a 2400/min budget.
+ */
+export function resolveOpportunityCap(policy: RiskPolicy): number {
+  const perCycleBudget = Math.min(MAX_SCAN_PAIRS, Math.max(1, policy.maxOpenPositions * 4));
+  return Math.max(1, Math.min(Math.floor(policy.opportunity.max), perCycleBudget));
 }
 
 /**
@@ -341,7 +390,35 @@ export async function scanUniverse(opts: ScanOptions): Promise<ScanResult> {
   let targetPairs: string[];
   let proxySkipped = 0;
 
-  if (explicitList) {
+  // -------------------------------------------------------------------------------------------
+  // The opportunity list, when enabled: the market scan above promotes opportunity assets, and this
+  // cycle scans exactly those — refreshed against the ranking first, so a pair that just qualified is
+  // traded in the same cycle and one that just dropped out stops costing kline weight immediately.
+  // An explicit `pairs=` request bypasses the list (a manual "scan these" must not rewrite it).
+  // -------------------------------------------------------------------------------------------
+  const listMode = policy.opportunity.enabled && requested.length === 0;
+  let plan: ReturnType<typeof planOpportunityUniverse> | null = null;
+
+  if (listMode) {
+    plan = planOpportunityUniverse({
+      state: opts.opportunity ?? null,
+      candidates: board.candidates,
+      boardGeneratedAt: board.generatedAt,
+      // A fallback board is a placeholder, not a ranking: it must not be read as "nothing qualifies".
+      boardFresh: board.source === 'binance',
+      allowlist: policy.discovery.enabled ? policy.symbolAllowlist : [...universe],
+      cap: resolveOpportunityCap(policy),
+      minPercent: policy.scan.minVolatilityPercent,
+      maxPercent: policy.scan.maxVolatilityPercent,
+      proxyMultiplier: SHORTLIST_PROXY_MULTIPLIER,
+      cooldownMs: policy.opportunity.cooldownMs,
+      hold: opts.skip ?? [],
+      now: Date.now(),
+    });
+    targetPairs = plan.symbols;
+    // Everything the list dropped is a refusal this cycle, so "no setup" can name the real reason.
+    proxySkipped = plan.removed.length;
+  } else if (explicitList) {
     targetPairs = explicitList
       .filter((pair) => allowedSet.has(pair))
       .filter((pair) => !skip.has(pair))
@@ -392,6 +469,50 @@ export async function scanUniverse(opts: ScanOptions): Promise<ScanResult> {
 
   const tradeable = await resolveTradeable(isTestnet, signals.map((s) => s.symbol));
 
+  // Report what the deep scan measured back to the list: a member that failed is warned, and at the
+  // configured strike limit it leaves the opportunity list (making room for the next opportunity).
+  let opportunity: OpportunityScanReport | null = null;
+  if (plan) {
+    const verdicts: OpportunityVerdict[] = signals.map((signal) => ({
+      symbol: signal.symbol,
+      ok: signal.scan?.tradeable !== false,
+      reason: signal.scan?.skipReason,
+      detail: signal.scan?.skipDetail,
+      volatilityPercent: signal.volatilityPercent,
+    }));
+    // A pair we asked for candles and did not get is a failure with a reason, not a silent absence.
+    for (const failure of failures) {
+      verdicts.push({ symbol: failure.pair, ok: false, reason: 'no-data', detail: failure.error });
+    }
+
+    const applied = applyOpportunityVerdicts({
+      state: plan.state,
+      verdicts,
+      strikes: policy.opportunity.strikes,
+      cooldownMs: policy.opportunity.cooldownMs,
+      now: Date.now(),
+    });
+
+    const verdictBySymbol = new Map(verdicts.map((v) => [v.symbol, v]));
+    const warned = applied.state.entries
+      .filter((entry) => entry.strikes > 0)
+      .map((entry) => ({
+        symbol: entry.symbol,
+        strikes: entry.strikes,
+        reason: verdictBySymbol.get(entry.symbol)?.reason ?? 'unmeasured',
+      }));
+
+    opportunity = {
+      mode: 'list',
+      state: applied.state,
+      scanned: [...targetPairs],
+      held: plan.held,
+      promoted: plan.promoted,
+      removed: [...plan.removed, ...applied.removed],
+      warned,
+    };
+  }
+
   return {
     timestamp: Date.now(),
     ok: signals.length > 0,
@@ -412,6 +533,7 @@ export async function scanUniverse(opts: ScanOptions): Promise<ScanResult> {
     },
     skipped: summarizeSkips(signals),
     shortlistSkipped: proxySkipped,
+    opportunity,
   };
 }
 

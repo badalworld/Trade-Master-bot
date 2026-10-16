@@ -116,6 +116,16 @@ export async function GET(req: NextRequest) {
       maxMarginUsdt: policy.maxMarginUsdt,
       maxDailyLossUsdt: policy.maxDailyLossUsdt,
       maxOpenPositions: policy.maxOpenPositions,
+      // The universe / band / opportunity-list facts: without them the config check cannot tell an
+      // operator which pairs the bot is able to reach, which is the question most people actually ask.
+      symbolAllowlist: policy.symbolAllowlist,
+      discovery: {
+        enabled: policy.discovery.enabled,
+        topN: policy.discovery.topN,
+        minQuoteVolumeUsdt: policy.discovery.minQuoteVolumeUsdt,
+      },
+      scan: { ...policy.scan },
+      opportunity: { ...policy.opportunity },
     },
   });
 

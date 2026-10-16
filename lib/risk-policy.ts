@@ -58,6 +58,25 @@ export interface ScanConfig {
   chopEfficiencyFloor: number;
 }
 
+/**
+ * The opportunity list: the pool the fast scan works from.
+ *
+ * Stage 1 (the market scan) covers the whole market and is cached; stage 2 scans this list every
+ * cycle, which is what makes the execution path fast — it never re-ranks the market to trade. A pair
+ * is dropped when it stops qualifying (see `lib/opportunity-list.ts`), and the drop is remembered for
+ * a cooldown so a failed pair cannot bounce straight back in.
+ */
+export interface OpportunityConfig {
+  /** false = scan a fresh shortlist every cycle instead of keeping a list (the previous behaviour). */
+  enabled: boolean;
+  /** Maximum pairs held on the list. Bounded in practice by the per-cycle weight budget. */
+  max: number;
+  /** Consecutive failing deep scans before a pair is taken off the list. */
+  strikes: number;
+  /** How long a removed pair is barred from re-promotion. */
+  cooldownMs: number;
+}
+
 export interface RiskPolicy {
   maxLeverage: number;
   minLeverage: number;
@@ -74,6 +93,7 @@ export interface RiskPolicy {
   symbolAllowlist: string[];
   discovery: DiscoveryConfig;
   scan: ScanConfig;
+  opportunity: OpportunityConfig;
   /** Ceiling on effectiveNotional / requestedNotional before the order is refused. */
   maxNotionalDeviationRatio: number;
   /** Reject stops closer than this fraction of price (0.0005 = 5bp). */
@@ -164,6 +184,18 @@ export function loadRiskPolicy(env: Record<string, string | undefined> = process
       maxVolatilityPercent,
       chopAdxFloor: floatFrom(env.TRADE_CHOP_ADX_FLOOR, 20, 0, 100),
       chopEfficiencyFloor: floatFrom(env.TRADE_CHOP_EFFICIENCY_FLOOR, 0.3, 0, 1),
+    },
+    opportunity: {
+      // Building a list needs a market ranking, so the list cannot be on while discovery is off —
+      // that combination silently means "the pinned 12 majors", which is the old behaviour.
+      enabled: boolFrom(env.TRADE_OPPORTUNITY_ENABLED, true) && discoveryEnabled,
+      // 20 opportunities at the default 5-position cap; the scanner bounds this again by the weight
+      // budget, so asking for more than the budget allows is reported rather than paid for.
+      max: intFrom(env.TRADE_OPPORTUNITY_MAX, 20, 1, 100),
+      // One bad reading is a warning, not an eviction: a pair that pauses for a candle should not be
+      // thrown off the list and re-discovered a minute later.
+      strikes: intFrom(env.TRADE_OPPORTUNITY_STRIKES, 2, 1, 10),
+      cooldownMs: intFrom(env.TRADE_OPPORTUNITY_COOLDOWN_MS, 300_000, 0, 3_600_000),
     },
     maxNotionalDeviationRatio: floatFrom(env.TRADE_MAX_NOTIONAL_DEVIATION_RATIO, 1.5, 1, 4),
     minStopDistanceFraction: floatFrom(env.TRADE_MIN_STOP_DISTANCE_PCT, 0.0005, 0.0001, 0.05),
@@ -325,6 +357,7 @@ export function policySummary(policy: RiskPolicy) {
     symbolAllowlist: policy.symbolAllowlist,
     discovery: policy.discovery,
     scan: policy.scan,
+    opportunity: policy.opportunity,
     halted: policy.halted,
     mainnetAllowed: policy.allowMainnet,
     clientKeysAllowed: policy.allowClientProvidedKeys,
