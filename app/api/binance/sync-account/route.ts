@@ -36,9 +36,16 @@ export async function POST(req: NextRequest) {
     }
     const creds = resolution.creds;
 
+    // `positionsOk` matters: a failed positionRisk call must never look like "the account is flat".
+    // The browser reconciles closes against this list, so an empty-but-unverified answer would make
+    // it book open positions as closed.
+    let positionsOk = true;
     const [account, positions, income] = await Promise.all([
       getAccount(creds),
-      getLivePositions(creds).catch(() => []),
+      getLivePositions(creds).catch(() => {
+        positionsOk = false;
+        return [];
+      }),
       getIncome(creds, 200).catch(() => []),
     ]);
 
@@ -69,6 +76,8 @@ export async function POST(req: NextRequest) {
           incomeRecordsCount: income.length,
           openPositionsCount: positions.length,
           canTrade: account.canTrade,
+          /** false = the position list could not be read; treat `positions` as unknown, not empty. */
+          positionsVerified: positionsOk,
         },
         positions: positions.map((p) => ({
           symbol: p.symbol,

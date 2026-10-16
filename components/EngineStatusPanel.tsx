@@ -37,8 +37,9 @@ export interface EngineStatusPayload {
   timestamp: number;
   engine: {
     running: boolean;
-    enabled: boolean;
     config: {
+      /** TRADE_ENGINE_ENABLED — without it the loop cannot run at all, so both controls are inert. */
+      enabled: boolean;
       autoEntry: boolean;
       enforceBrackets: boolean;
       intervalMs: number;
@@ -142,6 +143,9 @@ export function EngineStatusPanel({ state, loading, error, onAction, onToggleAut
 
   const e = state?.engine;
   const running = Boolean(e?.running);
+  // Read from `config`: `engine.enabled` never existed in the payload, so the Start and Autopilot
+  // controls used to be disabled permanently even on a deployment that had enabled the loop.
+  const engineEnabled = Boolean(e?.config.enabled);
   const guardianOnly = running && !e?.config.autoEntry;
   const owned = state?.ledger.openPositions.filter((p) => !p.foreign) ?? [];
   const foreign = state?.ledger.openPositions.filter((p) => p.foreign) ?? [];
@@ -198,9 +202,9 @@ export function EngineStatusPanel({ state, loading, error, onAction, onToggleAut
                 }
                 void toggleAutopilot(next);
               }}
-              disabled={togglingAutopilot || !e?.enabled}
+              disabled={togglingAutopilot || !engineEnabled}
               title={
-                e?.enabled
+                engineEnabled
                   ? 'When on, the server loop opens positions too, without a browser tab. When off it only protects and settles.'
                   : 'Set TRADE_ENGINE_ENABLED=true on the server to use the unattended loop'
               }
@@ -308,8 +312,8 @@ export function EngineStatusPanel({ state, loading, error, onAction, onToggleAut
                 <button
                   type="button"
                   onClick={() => void run('start')}
-                  disabled={busy !== null || !e.enabled}
-                  title={e.enabled ? 'Start the server-side guardian loop' : 'Set TRADE_ENGINE_ENABLED=true on the server first'}
+                  disabled={busy !== null || !engineEnabled}
+                  title={engineEnabled ? 'Start the server-side guardian loop' : 'Set TRADE_ENGINE_ENABLED=true on the server first'}
                   className="mt-3 px-3 py-1.5 text-[11px] font-semibold rounded bg-cyan-400 text-slate-950 hover:bg-cyan-300 disabled:opacity-40 flex items-center gap-1.5"
                 >
                   <Play className="w-3 h-3" />

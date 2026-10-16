@@ -3,6 +3,7 @@ import { checkRateLimit } from '@/lib/trading-engine';
 import { scanUniverse } from '@/lib/market-data';
 import { loadRiskPolicy } from '@/lib/risk-policy';
 import { sessionStatus } from '@/lib/trade-guard';
+import { requireOperator } from '@/lib/operator-auth';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,6 +15,14 @@ export const dynamic = 'force-dynamic';
  * ever propose setups the executor is able to trade.
  */
 export async function GET(req: NextRequest) {
+  // Only the app's own scanner calls this, and it is a fan-out of outbound requests on this
+  // deployment's IP: leaving it open let anyone use the server as a Binance proxy. No-op when this
+  // deployment needs no operator session.
+  const operator = requireOperator(req);
+  if (!operator.ok) {
+    return NextResponse.json({ success: false, code: operator.code, error: operator.error }, { status: operator.httpStatus });
+  }
+
   const policy = loadRiskPolicy();
   const status = sessionStatus(req);
   const isTestnet = status.active ? status.isTestnet : req.nextUrl.searchParams.get('testnet') !== 'false';
@@ -40,6 +49,8 @@ export async function GET(req: NextRequest) {
       scanIntervalSeconds: 15,
       timeframe: '5m',
       signalsCount: scan.signals.length,
+      /** Number of pairs attempted, so "N pairs returned no candles" can name the real total. */
+      requestedPairs: scan.requestedPairs,
       failures: scan.failures,
       weightSource,
       tradeable: scan.tradeable,

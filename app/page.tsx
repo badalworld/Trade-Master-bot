@@ -15,6 +15,7 @@ import { TradeResultOverlay, type TradeResultPayload } from '@/components/TradeR
 import { EngineStatusPanel, type EngineStatusPayload } from '@/components/EngineStatusPanel';
 import { OperatorGate, signOutOperator } from '@/components/OperatorGate';
 import { generateUniqueId } from '@/lib/utils';
+import { classifyExit } from '@/lib/guardian';
 import type { CredentialSession } from '@/components/SettingsView';
 import {
   calculateNextTradeMargin,
@@ -82,6 +83,13 @@ async function apiPost<T extends Record<string, unknown>>(
   }
   return { ok: res.ok, status: res.status, data };
 }
+
+/**
+ * True when a refusal came from the operator wall rather than from the Binance session, so the UI
+ * tells the user to sign in instead of claiming their API key is broken.
+ */
+const isOperatorLockout = (data: unknown): boolean =>
+  String((data as { code?: unknown } | null)?.code ?? '').startsWith('OPERATOR_');
 
 const INITIAL_POSITIONS: TradePosition[] = [];
 const INITIAL_TRADES: ClosedTrade[] = [];
@@ -195,6 +203,16 @@ export default function HomePage() {
   const engineManagedRef = useRef<Set<string>>(new Set());
   // Signals already submitted this session, so a re-render can't re-fire an order.
   const submittedSignalsRef = useRef<Set<string>>(new Set());
+  // True while the server engine is actually running: it is then the book of record for positions
+  // it owns (it settles from Binance's income stream, not from a flat fee estimate).
+  const engineAuthorityRef = useRef<boolean>(false);
+  // Mirror of `positions` for async reconciliation code (state is not readable inside callbacks).
+  const positionsRef = useRef<TradePosition[]>([]);
+  // Set after `finalizePositionClose` is defined; lets the 30s account sync book vanished positions
+  // without the two callbacks depending on each other (which would be a dependency cycle).
+  const finalizeCloseRef = useRef<
+    ((pos: TradePosition, exitPrice: number, reason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'MANUAL_CLOSE') => void) | null
+  >(null);
 
   // Global Interactive Mouse-Move Spotlight & Button Glow Tracker (Jitter Interactive-Button-Glow)
   useEffect(() => {
@@ -362,6 +380,7 @@ export default function HomePage() {
   }, [binanceAccount]);
 
   useEffect(() => {
+    positionsRef.current = positions;
     localStorage.setItem(STORAGE_KEYS.POSITIONS, JSON.stringify(positions));
   }, [positions]);
 
@@ -383,6 +402,8 @@ export default function HomePage() {
       const { ok, status, data } = await apiPost<Record<string, any>>('/api/binance/sync-account', {});
 
       if (status === 401 || status === 403) {
+        // An operator lockout is not a Binance credential problem — leave the session view alone.
+        if (isOperatorLockout(data)) return;
         setSession((prev) => (prev.active ? { ...prev, active: false, source: 'none' } : prev));
         return;
       }
@@ -511,6 +532,24 @@ export default function HomePage() {
               }), ...adopted];
             });
           }
+
+          // Reconcile the other direction: a position that is gone from Binance (exchange bracket
+          // fired, closed by hand, or settled by the engine) must not live on as a phantom open row.
+          // Only `positionsVerified` answers count — a failed positionRisk call returns an empty
+          // list that must never be read as "the account is flat".
+          if (data.balance?.positionsVerified === true) {
+            const liveSymbols = new Set<string>(
+              (Array.isArray(data.positions) ? data.positions : []).map(
+                (lp: { symbol: string }) => lp.symbol
+              )
+            );
+            const vanished = positionsRef.current.filter((p) => !liveSymbols.has(p.symbol));
+            for (const gone of vanished) {
+              // Reuse the normal close path: it books locally (or stands down for the engine) and
+              // reports the reason from where the price sat relative to the bracket.
+              void finalizeCloseRef.current?.(gone, gone.markPrice, classifyExit(gone, gone.markPrice));
+            }
+          }
         }
       }
     } catch {
@@ -608,6 +647,9 @@ export default function HomePage() {
         engineManagedRef.current = new Set(
           (data.ledger?.openPositions ?? []).filter((p) => !p.foreign).map((p) => p.symbol)
         );
+        // Only while the loop is genuinely running does it settle trades from exchange income; a
+        // stopped engine will never book anything, so local booking must take over again.
+        engineAuthorityRef.current = Boolean(data.engine?.running);
       } else {
         setEngineError(data ? JSON.stringify(data).slice(0, 160) : `HTTP ${res.status}`);
       }
@@ -707,6 +749,18 @@ export default function HomePage() {
 
       let finalExitPrice = exitPrice;
 
+      /**
+       * A close that the exchange did not confirm is NOT a closed trade. Booking it anyway would
+       * fabricate PnL from an estimate and hide a live position from this dashboard, so every
+       * failure path below keeps the row and says what is actually known. (The 30s account sync
+       * reconciles the other way round: once Binance really is flat, it books the trade.)
+       */
+      const abortClose = (message: string) => {
+        appendLog('ERROR', 'ERROR', message);
+        closingIdsRef.current.delete(pos.id);
+        setClosingPositionId(null);
+      };
+
       // Flatten on the exchange through the guarded endpoint. The server closes the *live*
       // position size it reads from Binance, so a stale local quantity can't leave a residual.
       if (session.active) {
@@ -719,11 +773,27 @@ export default function HomePage() {
           });
 
           if (status === 401 || status === 403) {
+            if (isOperatorLockout(closeData)) {
+              return abortClose(
+                `Operator sign-in required to close ${pos.symbol} — the server refused before reaching Binance, so the position is untouched. Sign in and close it again.`
+              );
+            }
             setSession((prev) => ({ ...prev, active: false, source: 'none' }));
-            appendLog('ERROR', 'ERROR', `Not authorized to close ${pos.symbol} on Binance — reconnect your API session in Settings. Local bookkeeping only.`);
-          } else if (ok && closeData.success) {
-            if (Number(closeData.avgPrice) > 0) finalExitPrice = Number(closeData.avgPrice);
-            if (closeData.noPosition && engineManagedRef.current.has(pos.symbol)) {
+            return abortClose(
+              `Not authorized to close ${pos.symbol} on Binance (Binance session rejected) — the position is still open there. Reconnect your API key in Settings and retry.`
+            );
+          }
+
+          if (!ok || !closeData.success) {
+            const detail = closeData.error || `HTTP ${status}`;
+            return abortClose(
+              `Binance close failed for ${pos.symbol}: ${detail} The position may still be OPEN on the exchange — verify on Binance. This row is intentionally kept so it cannot be forgotten.`
+            );
+          }
+
+          if (Number(closeData.avgPrice) > 0) finalExitPrice = Number(closeData.avgPrice);
+
+          if (closeData.noPosition && engineManagedRef.current.has(pos.symbol)) {
               // The engine already settled this trade against the exchange income ledger. Booking it
               // again here from local prices would double-count PnL and corrupt the compounding step.
               appendLog('ORDER', 'INFO', `${pos.symbol} was settled by the server engine (see the engine log); not re-booked locally.`);
@@ -734,22 +804,33 @@ export default function HomePage() {
               void untrackWithEngine(pos.symbol);
               return;
             }
+            if (engineAuthorityRef.current && engineManagedRef.current.has(pos.symbol)) {
+              // The running engine owns this symbol and settles from Binance's income stream (real
+              // commission + funding), so it is the book of record for it. Deliberately NOT booking
+              // here: a local flat-fee estimate would double-count the trade and let the browser's
+              // compounding ladder drift away from the settled one. The ledger row is left in place
+              // so the engine can settle this close on its next cycle.
+              appendLog(
+                'ORDER',
+                'INFO',
+                `${pos.symbol} closed on Binance. The server engine owns this position, so it settles the trade from the exchange income ledger (real fees + funding) and books it there — this browser does not re-book it. See the engine panel for the settled PnL.`
+              );
+              engineManagedRef.current.delete(pos.symbol);
+              setPositions((prev) => prev.filter((p) => p.id !== pos.id));
+              closingIdsRef.current.delete(pos.id);
+              setClosingPositionId(null);
+              void refreshEngineStatus();
+              return;
+            }
             if (closeData.noPosition) {
               appendLog('ORDER', 'INFO', `${pos.symbol} was already flat on Binance (exchange bracket fired). Recorded locally at $${roundCryptoPrice(finalExitPrice)}.`);
             }
             void untrackWithEngine(pos.symbol);
-          } else if (!ok) {
-            appendLog('ERROR', 'ERROR', `Binance close failed for ${pos.symbol}: ${closeData.error || 'unknown error'}. Position may still be OPEN on the exchange — check Binance now.`);
-            // Do not erase local tracking of a position the exchange says is still there.
-            if (closeData.residualQty) {
-              closingIdsRef.current.delete(pos.id);
-              setClosingPositionId(null);
-              return;
-            }
-          }
         } catch (err) {
           const e = err as Error;
-          appendLog('ERROR', 'ERROR', `Binance close request errored for ${pos.symbol}: ${e.message}. Verify position state on Binance.`);
+          return abortClose(
+            `Close request for ${pos.symbol} errored (${e.message}). The exchange state is unknown — verify the position on Binance; the row is kept and the next sync will reconcile it.`
+          );
         }
       }
 
@@ -826,8 +907,16 @@ export default function HomePage() {
       setClosingPositionId(null);
       syncBinanceAccount();
     },
-    [appendLog, session.active, syncBinanceAccount, untrackWithEngine]
+    [appendLog, session.active, syncBinanceAccount, untrackWithEngine, refreshEngineStatus]
   );
+
+  // Expose the latest close function to the account-sync reconciler (a ref, not a dependency, so
+  // `syncBinanceAccount` and `finalizePositionClose` do not form a useCallback cycle).
+  useEffect(() => {
+    finalizeCloseRef.current = (pos, exitPrice, reason) => {
+      void finalizePositionClose(pos, exitPrice, reason);
+    };
+  }, [finalizePositionClose]);
 
   // Scan Market Pairs
   const runMarketScan = useCallback(async () => {
@@ -872,7 +961,7 @@ export default function HomePage() {
         appendLog(
           'SCAN',
           'WARN',
-          `${data.failures.length}/${(data.requestedPairs || []).length || data.failures.length} pairs returned no usable candles (${data.failures
+          `${data.failures.length}/${Array.isArray(data.requestedPairs) ? data.requestedPairs.length : '?'} pairs returned no usable candles (${data.failures
             .slice(0, 3)
             .map((f: { pair: string; error: string }) => `${f.pair}: ${f.error}`)
             .join('; ')}).`
@@ -949,6 +1038,10 @@ export default function HomePage() {
 
                   if (status === 401 || status === 403) {
                     setBotActive(false);
+                    if (isOperatorLockout(execData)) {
+                      appendLog('ERROR', 'ERROR', `Operator sign-in required (${status}). Bot paused before sending any order — sign in again to resume.`);
+                      return;
+                    }
                     setSession((prev) => ({ ...prev, active: false, source: 'none' }));
                     appendLog('ERROR', 'ERROR', `Execution unauthorized (${status}). Bot paused — reconnect your API session in Settings.`);
                     return;
@@ -1223,6 +1316,10 @@ export default function HomePage() {
         );
 
         if (status === 401 || status === 403) {
+          if (isOperatorLockout(execData)) {
+            appendLog('ERROR', 'ERROR', `Operator sign-in required (${status}) — no order was sent. Sign in again to trade.`);
+            return;
+          }
           setSession((prev) => ({ ...prev, active: false, source: 'none' }));
           appendLog('ERROR', 'ERROR', 'Execution unauthorized — reconnect your API session in Settings.');
           setActiveTab('settings');
