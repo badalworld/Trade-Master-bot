@@ -28,6 +28,13 @@ import {
   placeBracketOrder,
 } from './binance-client.ts';
 import { formatToStep } from './exchange-specs.ts';
+import {
+  classifyError,
+  failureMessage,
+  toRawFailure,
+  type BinanceFailure,
+  type BinanceFailureCode,
+} from './binance-errors.ts';
 import { closePosition, getSpecMap, openPosition, type OpenSuccess, type RecoveryBody } from './order-executor.ts';
 import {
   classifyExit,
@@ -74,6 +81,12 @@ export interface EngineStatus {
   nextCycleAt: number | null;
   lastError: string | null;
   lastErrorAt: number | null;
+  /**
+   * Classified diagnosis of `lastError` — what actually happened and what to do about it. The raw
+   * message alone is what let an operator stare at "Mandatory parameter 'timestamp' was not sent" and
+   * go looking for a broken API key.
+   */
+  lastFailure: EngineFailureSummary | null;
   cooldownUntil: number | null;
   entriesHalted: boolean;
   dailyLossLocked: boolean;
@@ -86,9 +99,62 @@ export interface EngineStatus {
   ledgerDurable: boolean;
 }
 
+export interface EngineFailureSummary {
+  code: BinanceFailureCode;
+  title: string;
+  action: string;
+  retryable: boolean;
+  at: number;
+  /** Consecutive cycles that failed this same way (1 = first occurrence). */
+  repeats: number;
+  /** Binance's own words, kept verbatim for bug reports. */
+  raw: string;
+}
+
+/** What the previous failed cycle ended on, so a repeat can be recognised as a repeat. */
+export interface EngineFailureStreak {
+  code: BinanceFailureCode;
+  repeats: number;
+}
+
+export interface CycleFailurePlan {
+  failure: BinanceFailure;
+  /** Consecutive occurrences of this same failure, this cycle included. */
+  repeats: number;
+  /** Whether to emit an event this cycle — repeats are throttled (see `planCycleFailure`). */
+  log: boolean;
+  kind: 'CYCLE_FAILED' | 'CYCLE_STILL_FAILING';
+  level: 'ERROR' | 'WARN';
+  message: string;
+  /** Idle time before the next attempt; 0 keeps the normal cycle interval. */
+  cooldownMs: number;
+}
+
 const MAX_EVENTS = 60;
 const MIN_INTERVAL_MS = 5000;
 const COOLDOWN_MS = 60_000;
+/** Slow poll for failures no retry can fix — long enough to spare the API, short enough to notice a fix. */
+const BACKOFF_MS = 120_000;
+/** Identical answers in a row before a deterministic failure is treated as settled, not a blip. */
+const DETERMINISTIC_TOLERANCE = 3;
+/** After the first line, log the same repeating failure once every N cycles instead of every cycle. */
+const REPEAT_LOG_EVERY = 20;
+
+/**
+ * Failures that only a human can clear: the exchange has given a definite answer and re-asking
+ * cannot change it. Transient classes (network, timeout, rate limit) are deliberately absent — for
+ * those, retrying soon *is* the fix.
+ */
+const DETERMINISTIC_CODES = new Set<BinanceFailureCode>([
+  'GEO_BLOCKED',
+  'INVALID_KEY',
+  'IP_NOT_ALLOWED',
+  'KEY_NETWORK_MISMATCH',
+  'SIGNATURE_INVALID',
+  'TIMESTAMP_DRIFT',
+  'REQUEST_INVALID',
+  'UNKNOWN',
+]);
 
 function bool(v: string | undefined, d: boolean): boolean {
   if (v === undefined || v === '') return d;
@@ -109,6 +175,56 @@ export function loadEngineConfig(env: Record<string, string | undefined> = proce
   };
 }
 
+/**
+ * Decide what a failed cycle should say, and how soon it should try again.
+ *
+ * Pure on purpose. The loop's most consequential recovery behaviour — does it hammer the exchange
+ * every 15s and print one identical ERROR per cycle, or does it settle down and keep an eye on the
+ * problem? — has to be reviewable and testable without a live exchange.
+ *
+ * Two shapes of failure were previously treated identically:
+ *
+ *  - TRANSIENT (network, timeout, rate limit): retrying soon is the fix, so the cadence is untouched.
+ *  - DETERMINISTIC (bad key, IP not on the whitelist, geo-block, malformed request): no retry changes
+ *    the answer, only a human can. Retrying every 15s burns API weight and buries the one line that
+ *    matters under identical copies of itself — the log this was written for held 60 copies of the
+ *    same error in twelve minutes. After a few attempts the loop settles into a slow poll and repeats
+ *    the line only occasionally. It never stops polling: the fix happens on Binance's side (a key
+ *    regenerated, an IP whitelisted) and has to be picked up without anyone restarting the app.
+ */
+export function planCycleFailure(
+  err: unknown,
+  opts: { isTestnet: boolean; previous?: EngineFailureStreak | null }
+): CycleFailurePlan {
+  const failure = classifyError(err, opts.isTestnet);
+  const raw = toRawFailure(err).message;
+  const repeats = opts.previous?.code === failure.code ? opts.previous.repeats + 1 : 1;
+  const first = repeats === 1;
+  const binanceCode = failure.binanceCode !== null ? `, binance ${failure.binanceCode}` : '';
+
+  return {
+    failure,
+    repeats,
+    log: first || repeats % REPEAT_LOG_EVERY === 0,
+    kind: first ? 'CYCLE_FAILED' : 'CYCLE_STILL_FAILING',
+    level: first ? 'ERROR' : 'WARN',
+    message: first
+      ? `${failureMessage(failure)} [${failure.code}${binanceCode}] — Binance said: ${raw}`
+      : `repeat ${repeats}, same failure [${failure.code}${binanceCode}]: ${failure.title} — ${failure.action}`,
+    cooldownMs: cooldownForFailure(failure.code, repeats),
+  };
+}
+
+/**
+ * How long to wait before asking again. Rate limits keep the existing 60s window reset; a
+ * deterministic failure earns a slower poll once it has proved it is not a blip.
+ */
+function cooldownForFailure(code: BinanceFailureCode, repeats: number): number {
+  if (code === 'RATE_LIMITED') return COOLDOWN_MS;
+  if (repeats < DETERMINISTIC_TOLERANCE) return 0;
+  return DETERMINISTIC_CODES.has(code) ? BACKOFF_MS : 0;
+}
+
 type Timer = ReturnType<typeof setTimeout>;
 
 class TradeEngine {
@@ -116,6 +232,8 @@ class TradeEngine {
   private running = false;
   private busy = false;
   private haltEntries = false;
+  /** The failure the previous cycle ended on, so an identical one can be recognised as a repeat. */
+  private failureStreak: EngineFailureStreak | null = null;
   private status: EngineStatus;
   private events: EngineEvent[] = [];
 
@@ -132,6 +250,7 @@ class TradeEngine {
       nextCycleAt: null,
       lastError: null,
       lastErrorAt: null,
+      lastFailure: null,
       cooldownUntil: null,
       entriesHalted: false,
       dailyLossLocked: false,
@@ -315,17 +434,49 @@ class TradeEngine {
     this.busy = true;
     const started = Date.now();
     try {
-      await this.runCycle();
-      this.status = { ...this.status, lastError: null, cycles: this.status.cycles + 1 };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.log('ERROR', 'CYCLE_FAILED', message);
-      this.status = { ...this.status, lastError: message, lastErrorAt: Date.now(), cycles: this.status.cycles + 1 };
-      // Rate-limit and maintenance responses get a cooldown instead of hammering the API.
-      if (err instanceof BinanceApiError && (err.httpStatus === 429 || err.httpStatus === 418 || err.code === -1003)) {
-        this.status = { ...this.status, cooldownUntil: Date.now() + COOLDOWN_MS };
-        this.log('WARN', 'COOLDOWN', `Backing off for ${COOLDOWN_MS / 1000}s (Binance ${err.httpStatus}/${err.code ?? 'n/a'}).`);
+      // A cycle skipped for cooldown is not evidence that anything recovered, so it must not clear
+      // the failure the operator still has to act on.
+      const outcome = await this.runCycle();
+      if (outcome === 'skipped') {
+        this.status = { ...this.status, cycles: this.status.cycles + 1 };
+      } else {
+        this.failureStreak = null;
+        this.status = {
+          ...this.status,
+          lastError: null,
+          lastErrorAt: null,
+          lastFailure: null,
+          cycles: this.status.cycles + 1,
+        };
       }
+    } catch (err) {
+      const plan = planCycleFailure(err, {
+        isTestnet: this.creds()?.isTestnet ?? this.status.network === 'testnet',
+        previous: this.failureStreak,
+      });
+      this.failureStreak = { code: plan.failure.code, repeats: plan.repeats };
+      if (plan.log) this.log(plan.level, plan.kind, plan.message);
+      // Announce the pause once per window, not on every cycle that is still inside it.
+      const alreadyCooling = Boolean(this.status.cooldownUntil && this.status.cooldownUntil > Date.now());
+      if (plan.cooldownMs > 0 && !alreadyCooling) {
+        this.log('WARN', 'COOLDOWN', `Next attempt in ${Math.round(plan.cooldownMs / 1000)}s (${plan.failure.code}).`);
+      }
+      this.status = {
+        ...this.status,
+        lastError: plan.failure.title,
+        lastErrorAt: Date.now(),
+        lastFailure: {
+          code: plan.failure.code,
+          title: plan.failure.title,
+          action: plan.failure.action,
+          retryable: plan.failure.retryable,
+          at: Date.now(),
+          repeats: plan.repeats,
+          raw: toRawFailure(err).message,
+        },
+        cycles: this.status.cycles + 1,
+        ...(plan.cooldownMs > 0 ? { cooldownUntil: Date.now() + plan.cooldownMs } : {}),
+      };
     } finally {
       this.busy = false;
       this.status = { ...this.status, lastCycleAt: Date.now(), lastCycleDurationMs: Date.now() - started };
@@ -336,13 +487,13 @@ class TradeEngine {
     }
   }
 
-  private async runCycle(): Promise<void> {
+  private async runCycle(): Promise<'skipped' | 'done'> {
     const creds = this.creds();
     if (!creds) {
       this.stop('credentials disappeared');
-      return;
+      return 'skipped';
     }
-    if (this.status.cooldownUntil && this.status.cooldownUntil > Date.now()) return;
+    if (this.status.cooldownUntil && this.status.cooldownUntil > Date.now()) return 'skipped';
 
     const policy: RiskPolicy = loadRiskPolicy();
     const [account, live] = await Promise.all([
@@ -657,6 +808,7 @@ class TradeEngine {
       foreignPositions: ledger.list().filter((p) => p.foreign).map((p) => p.symbol),
       unprotectedPositions: unprotected,
     };
+    return 'done';
   }
 
   /**

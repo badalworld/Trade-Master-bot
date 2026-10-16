@@ -57,6 +57,21 @@ export interface EngineStatusPayload {
     nextCycleAt: number | null;
     lastError: string | null;
     lastErrorAt: number | null;
+    /**
+     * Classified diagnosis of `lastError`. Rendered instead of the bare message: "the API key is
+     * wrong" and "this app sent a malformed request" need completely different reactions from the
+     * operator, and the raw string cannot tell them apart.
+     */
+    lastFailure: {
+      code: string;
+      title: string;
+      action: string;
+      retryable: boolean;
+      at: number;
+      /** How many consecutive cycles have failed this same way. */
+      repeats: number;
+      raw: string;
+    } | null;
     cooldownUntil: number | null;
     entriesHalted: boolean;
     dailyLossLocked: boolean;
@@ -277,10 +292,37 @@ export function EngineStatusPanel({ state, loading, error, onAction, onToggleAut
               </div>
             )}
 
-            {e.lastError && (
-              <div className="p-3 rounded-md border border-rose-900 bg-rose-950/30 text-[11px] font-mono text-rose-300">
-                last error · {fmtAgo(e.lastErrorAt, nowMs)} — {e.lastError}
+            {e.lastFailure ? (
+              <div className="p-3 rounded-md border border-rose-900 bg-rose-950/30 text-[11px] text-rose-200 space-y-1.5">
+                <div className="flex items-start gap-2">
+                  <Octagon className="w-4 h-4 shrink-0 mt-0.5 text-rose-400" />
+                  <span>
+                    <strong className="text-rose-100">{e.lastFailure.title}</strong>{' '}
+                    <span className="font-mono text-rose-300/70">
+                      [{e.lastFailure.code}
+                      {e.lastFailure.repeats > 1 ? ` · ${e.lastFailure.repeats} cycles in a row` : ''}]
+                    </span>
+                  </span>
+                </div>
+                <p className="text-rose-200/90">{e.lastFailure.action}</p>
+                <p className="text-rose-300/80">
+                  {e.lastFailure.retryable
+                    ? 'Transient — the loop keeps retrying on its own.'
+                    : 'Retrying will not change this; it needs a fix on the exchange or in the configuration.'}
+                  {e.cooldownUntil && e.cooldownUntil > nowMs
+                    ? ` Next attempt in ${Math.max(1, Math.round((e.cooldownUntil - nowMs) / 1000))}s.`
+                    : ''}
+                </p>
+                <p className="font-mono text-rose-300/60 break-words">
+                  first seen {fmtAgo(e.lastFailure.at, nowMs)} · Binance said: {e.lastFailure.raw}
+                </p>
               </div>
+            ) : (
+              e.lastError && (
+                <div className="p-3 rounded-md border border-rose-900 bg-rose-950/30 text-[11px] font-mono text-rose-300">
+                  last error · {fmtAgo(e.lastErrorAt, nowMs)} — {e.lastError}
+                </div>
+              )
             )}
 
             {e.events.length > 0 && (

@@ -1,10 +1,10 @@
 # Pre-Live Audit — Trade Master (Binance Futures Bot)
 
-**Date:** 2026-10-16 (round 4 — diagnosis & UI truth) · **Branch:** `arena/5674d799-trade-master-bot`
+**Date:** 2026-10-16 (round 5 — signed-read failure) · **Branch:** `arena/937908a7-trade-master-bot`
 **Audit verdict:** ❌ still NOT CLEARED for live trading with real funds.
-**Remediation status:** round-1 (B1–B5, H1–H4), round-2 (R2-1 … R2-9) and round-3 (R3-1 … R3-7)
-items fixed; round-4 items (R4-1 … R4-3) fixed in code, verified by `tsc`, `eslint`, **97/97 unit
-tests**, a production build (15 routes) and live route probes.
+**Remediation status:** round-1 (B1–B5, H1–H4), round-2 (R2-1 … R2-9), round-3 (R3-1 … R3-7) and
+round-4 (R4-1 … R4-3) items fixed; round-5 items (R5-1 … R5-4) fixed in code, verified by `tsc`,
+`eslint`, **116/116 unit tests**, a production build (15 routes) and a live engine probe.
 **Still not cleared for real money** — the strategy has no backtest and no track record, so it must
 earn that on testnet first.
 
@@ -19,6 +19,108 @@ position on the exchange with no stop-loss and no monitoring process**.
 > the *policy* answer instead, because the endpoints were never authenticated). All three are fixed
 > below; the round-1 narrative is kept for history and its claims about the current code should be
 > read through this header.
+
+---
+
+## Round 5 — every signed read went out empty (`-1102` behind the `-2015`) (branch `arena/937908a7-trade-master-bot`)
+
+**Origin:** the operator's engine log for 2026-10-16, 18:42–18:54 UTC — ~60 lines, in two phases:
+
+```
+[engine:error] CYCLE_FAILED: Invalid API-key, IP, or permissions for action, request ip: 54.247.26.145   ×20, 18:42:30 → 18:51:07
+[engine:error] CYCLE_FAILED: Mandatory parameter 'timestamp' was not sent, was empty/null, or malformed. ×20, 18:51:23 → 18:54:56
+```
+
+Both phases come from the same `catch` in the engine loop, so both are cycle failures; the code change
+is below, and the first is a finding about the deployment rather than about the code.
+
+### R5-1 · CRITICAL — a signed GET's parameters never left the process
+
+`lib/binance-client.ts` built the signed payload correctly (`recvWindow` + `timestamp` + HMAC-SHA256)
+and then attached it with `...(method === 'GET' ? {} : { body })`. For a **GET there was no body to
+attach it to**, and it was not put on the URL either, so the request left with *nothing at all* — no
+timestamp, no signature, no symbol. `fetch` silently ignores `body` on GET/HEAD, so nothing threw;
+Binance's required-parameter check answers first (`-1102`) and the operator sees a message that reads
+like a credentials problem.
+
+Blast radius — every signed **read**: `/fapi/v2/account`, `/fapi/v2/positionRisk`, `/fapi/v1/income`,
+`/fapi/v1/openOrders`, `/fapi/v1/order` (status poll), `/fapi/v1/positionSide/dual`. That is the
+guardian loop's entire input, and `getAccount` is the first call of every cycle, so the loop aborted
+before reconciliation — which is exactly why the earlier audit's runtime run showed 27 consecutive
+failed cycles with `AUTO_FLATTEN` 0 and `BRACKET_REARMED` 0. Writes (place/cancel/leverage/margin) put
+the payload in the body and were unaffected: the app could have *opened* a position while being unable
+to see it, verify its stop, or settle it. That asymmetry is what makes this CRITICAL rather than HIGH.
+
+**Fix:** the signed payload goes on the query string for GET (`${path}?${payload}&signature=…`); writes
+keep using the body as before. Order and encoding are unchanged, so the signature still covers exactly
+what is sent.
+
+**Evidence (before/after, intercepting `fetch` in a harness):**
+
+```
+before  GET https://fapi.binance.com/fapi/v2/account                      body: (none)   → -1102
+after   GET https://fapi.binance.com/fapi/v2/account?recvWindow=5000&timestamp=…&signature=…  body: (none)  → 200
+```
+
+**Regression test:** `lib/binance-client.test.ts` (10 cases) asserts the wire format itself — that a
+signed GET carries `timestamp`/`recvWindow`/`signature` on the URL with no body, that the HMAC verifies
+against the payload exactly as sent, that a write keeps its payload in the body, and that a rejection
+keeps Binance's code and message. Re-introducing the old signing (mutation check) fails 4 of them; with
+the fix all 10 pass.
+
+### R5-2 · HIGH — the loop retried a permanent failure forever and printed it every cycle
+
+Twelve minutes produced ~40 identical `ERROR` lines and ~40 API round-trips for a failure that no retry
+could change. `lib/binance-errors.ts` already existed to classify exactly this, but the engine never
+called it: it logged `err.message` verbatim and cooled down only for 429/418/-1003.
+
+**Fix:** `planCycleFailure()` (pure, exported, unit-tested) classifies each failure, and:
+
+- the **first** occurrence is logged in full — diagnosis, remedy, Binance's own words;
+- an **identical repeat** is logged once every 20 cycles (`CYCLE_STILL_FAILING`, WARN) instead of every cycle;
+- a deterministically-failing class (key, IP allowlist, geo-block, clock skew, malformed request) backs
+  off to a 120s poll once three identical answers prove it is not a blip; **transient classes (network,
+  timeout, rate limit) keep the existing fast cadence**, so the engine observed in the Phase-2 audit
+  (27 failed cycles, no escalation, no order spam) behaves exactly as before;
+- the loop **never stops retrying** — the fix happens in Binance's console, and it must be noticed without
+  restarting the app;
+- a cycle skipped for cooldown no longer counts as a recovery, so the failure the operator still has to
+  act on is not wiped from the status.
+
+### R5-3 · MEDIUM — `-1102` was reported as `UNKNOWN`, so the one line that mattered said nothing
+
+`Mandatory parameter 'timestamp' was not sent` fell through every classifier rule to `UNKNOWN` ("Inspect
+the raw message below"). It now maps to a new `REQUEST_INVALID` class that says plainly that this is the
+app's bug and not the key's, names a missing `timestamp`/`signature` as the usual cause, and answers HTTP
+500 rather than 401 — the operator is not sent to Binance API Management for a fault that is ours. The
+same applies to `-1002`, `-1100`, `-1103`–`-1106`, `-1130`. Signature mismatches (`-1022`) still outrank
+it, so a genuinely wrong secret is still reported as a wrong secret.
+
+### R5-4 · LOW — the UI showed `lastError` as a bare string
+
+`EngineStatusPanel` now renders the classified diagnosis: what happened, what to do, whether retrying can
+help, how many cycles it has repeated, when the next attempt is, and Binance's raw words underneath for a
+bug report.
+
+### Fixed / verified in this round
+
+`npx tsc --noEmit` clean · `npx eslint .` clean · `npm test` **116/116** (was 97; +10 client wire-format,
++5 classification, +4 cycle-failure policy, +1 live engine cycle against a stubbed exchange) ·
+`NODE_ENV=production next build` clean (15 routes) · live probe on a real server process
+(`TRADE_ENGINE_ENABLED=true`, testnet, no egress to Binance): 8 cycles produced **one** `CYCLE_FAILED`
+line and `engine.lastFailure = { code: NETWORK_UNREACHABLE, retryable: true, repeats: 4 }` with
+`cooldownUntil: null` — classification and throttling working, fast cadence preserved for the transient
+class.
+
+### What this round does NOT explain
+
+The **first** phase of the log — `Invalid API-key, IP, or permissions for action, request ip:
+54.247.26.145` — is Binance judging the key, its IP allowlist or its permissions, before any parameter is
+parsed. No code change can clear it, and this environment cannot reproduce the operator's account to
+confirm which of the three it is; `/api/network/ip` reports the address to whitelist. It is worth noting
+that the second phase began at 18:51:23 with no deploy in between: whatever changed on Binance's side
+(an IP allowlist edit, a key regenerated, a permissions toggle) exposed the parameter bug underneath,
+which had been failing every signed read the whole time.
 
 ---
 

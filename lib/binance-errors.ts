@@ -16,6 +16,7 @@ export type BinanceFailureCode =
   | 'KEY_NETWORK_MISMATCH'
   | 'SIGNATURE_INVALID'
   | 'TIMESTAMP_DRIFT'
+  | 'REQUEST_INVALID'
   | 'RATE_LIMITED'
   | 'NETWORK_UNREACHABLE'
   | 'TIMEOUT'
@@ -43,6 +44,14 @@ interface RawFailure {
 }
 
 const RATE_LIMIT_HTTP = new Set([418, 429]);
+
+/**
+ * Binance's "I could not even read your request" family. These are answered before the key is
+ * judged, so they must never be reported as a credential problem: -1102 is the mandatory-parameter
+ * error (a signed call that arrived with no `timestamp`/`signature` at all), the rest are the
+ * sibling malformed-parameter codes.
+ */
+const MALFORMED_REQUEST_CODES = new Set([-1100, -1102, -1103, -1104, -1105, -1106, -1130]);
 
 /**
  * Accepts anything thrown by the Binance client (or a plain Error) and pulls out the fields the
@@ -113,7 +122,23 @@ export function classifyBinanceFailure(
     );
   }
 
-  // 4. -2015 is Binance's catch-all for "key / IP / permission". Split it as far as the text allows.
+  // 4. A request Binance could not parse at all. Diagnosed explicitly because it is *our* bug, and
+  //    because it masquerades as a credential problem: the operator sees an "Invalid API-key"-shaped
+  //    failure and goes hunting for a key that was never judged. The key is not in question here.
+  //    (Deliberately narrow: -1002 is left alone, because "not authorized" can equally mean a key
+  //    that lacks the endpoint's permission — telling the operator "it is our bug" would be a guess.)
+  if (
+    (binanceCode !== null && MALFORMED_REQUEST_CODES.has(binanceCode)) ||
+    /mandatory parameter|was not sent, was empty|empty\/null|illegal characters|not a valid|invalid parameter/.test(m)
+  ) {
+    return make(
+      'REQUEST_INVALID',
+      `Binance rejected the request before acting on it${binanceCode !== null ? ` (code ${binanceCode})` : ''}`,
+      'This is a bug in the request the app built, not a credential problem. Either a parameter the endpoint requires never arrived — a signed call sent without its `timestamp`/`signature` looks exactly like this — or the value was rejected by the exchange filters. Retrying unchanged will keep failing; the raw message names the parameter.'
+    );
+  }
+
+  // 5. -2015 is Binance's catch-all for "key / IP / permission". Split it as far as the text allows.
   if (binanceCode === -2015 || /invalid api-key/.test(m)) {
     if (/request ip/.test(m)) {
       return make(
@@ -136,7 +161,7 @@ export function classifyBinanceFailure(
     );
   }
 
-  // 5. Plain HTTP auth failures.
+  // 6. Plain HTTP auth failures.
   if (httpStatus === 401) {
     return make(
       'INVALID_KEY',
@@ -152,7 +177,7 @@ export function classifyBinanceFailure(
     );
   }
 
-  // 6. Transport failures: the request never reached an authenticated answer.
+  // 7. Transport failures: the request never reached an authenticated answer.
   if (httpStatus === 0) {
     if (/timed out|timeout|abort/.test(m)) {
       return make(
@@ -201,6 +226,7 @@ export function httpStatusForFailure(code: BinanceFailureCode): number {
     case 'TIMEOUT':
       return 502;
     case 'TIMESTAMP_DRIFT':
+    case 'REQUEST_INVALID':
       return 500;
     default:
       return 401; // credential-class failures (key, secret, network mismatch, IP allowlist, permissions)

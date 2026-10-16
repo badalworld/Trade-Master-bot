@@ -9,7 +9,7 @@ import path from 'path';
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-engine-'));
 process.env.TRADE_DATA_DIR = dir;
 
-const { loadEngineConfig, engine } = await import('./engine.ts');
+const { loadEngineConfig, planCycleFailure, engine } = await import('./engine.ts');
 const { ledger } = await import('./position-ledger.ts');
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
@@ -95,6 +95,69 @@ test('a ledger from the other network blocks the start instead of adopting forei
   freshLedger();
 });
 
+// --------------------------------------------------------------------------- failing cycles
+const binanceError = (message: string, httpStatus: number, code?: number) =>
+  Object.assign(new Error(message), { name: 'BinanceApiError', httpStatus, code });
+
+test('the first failed cycle is logged in full: what happened, what to do, and Binance\'s own words', () => {
+  const plan = planCycleFailure(
+    binanceError("Mandatory parameter 'timestamp' was not sent, was empty/null, or malformed.", 400, -1102),
+    { isTestnet: false }
+  );
+
+  assert.equal(plan.repeats, 1);
+  assert.equal(plan.kind, 'CYCLE_FAILED');
+  assert.equal(plan.level, 'ERROR');
+  assert.equal(plan.log, true);
+  assert.equal(plan.failure.code, 'REQUEST_INVALID');
+  assert.match(plan.message, /not a credential problem/, 'the remedy has to be in the log, not just in the UI');
+  assert.match(plan.message, /Mandatory parameter 'timestamp'/, 'the raw message stays for bug reports');
+  assert.equal(plan.cooldownMs, 0, 'a one-off must not slow the loop down');
+});
+
+test('an identical failure repeating does not print once per cycle, but is never forgotten', () => {
+  const error = binanceError('Invalid API-key, IP, or permissions for action., request ip: 54.247.26.145', 400, -2015);
+  let streak: { code: 'IP_NOT_ALLOWED'; repeats: number } | null = null;
+  const lines: string[] = [];
+
+  for (let cycle = 1; cycle <= 40; cycle++) {
+    const plan = planCycleFailure(error, { isTestnet: false, previous: streak });
+    streak = { code: plan.failure.code as 'IP_NOT_ALLOWED', repeats: plan.repeats };
+    if (plan.log) lines.push(`${plan.kind}:${plan.repeats}`);
+    assert.equal(plan.repeats, cycle, 'repeats must count consecutive cycles, not log lines');
+  }
+
+  // 40 failing cycles produced 3 log lines instead of 40, and the first one is the full diagnosis.
+  assert.deepEqual(lines, ['CYCLE_FAILED:1', 'CYCLE_STILL_FAILING:20', 'CYCLE_STILL_FAILING:40']);
+});
+
+test('a failure no retry can fix backs off, a transient one keeps the fast cadence', () => {
+  const deterministic = binanceError('Invalid API-key, IP, or permissions for action., request ip: 54.247.26.145', 400, -2015);
+  assert.equal(planCycleFailure(deterministic, { isTestnet: false }).cooldownMs, 0, 'one bad answer could still be a blip');
+  assert.equal(
+    planCycleFailure(deterministic, { isTestnet: false, previous: { code: 'IP_NOT_ALLOWED', repeats: 2 } }).cooldownMs,
+    120_000,
+    'after three identical answers the loop should stop every-15s retries and settle into a slow poll'
+  );
+
+  // Engine-down is exactly the case the trading audit exercised (27 failed cycles, no escalation):
+  // that cadence must not change, because retrying soon is what fixes it.
+  const offline = binanceError('fetch failed', 0);
+  assert.equal(planCycleFailure(offline, { isTestnet: false, previous: { code: 'NETWORK_UNREACHABLE', repeats: 500 } }).cooldownMs, 0);
+  const rateLimited = binanceError('Too many requests', 429);
+  assert.equal(planCycleFailure(rateLimited, { isTestnet: false }).cooldownMs, 60_000, 'keep the existing rate-limit cooldown');
+});
+
+test('a different failure restarts the count instead of inheriting the old streak', () => {
+  const plan = planCycleFailure(binanceError('fetch failed', 0), {
+    isTestnet: false,
+    previous: { code: 'INVALID_KEY', repeats: 9 },
+  });
+  assert.equal(plan.repeats, 1);
+  assert.equal(plan.failure.code, 'NETWORK_UNREACHABLE');
+  assert.equal(plan.log, true, 'a new failure is news even if the old one had gone quiet');
+});
+
 // --------------------------------------------------------------------------- autopilot switch
 test('arming unattended MAINNET entries requires confirmation', () => {
   freshLedger();
@@ -131,5 +194,74 @@ test('testnet autopilot needs no ceremony, and nothing can be armed without cred
     assert.match(r.message, /BINANCE_API_KEY/);
     assert.equal(ledger.getAutopilot().serverEntries, false, 'a refused switch must not be persisted');
   });
+  freshLedger();
+});
+
+// --------------------------------------------------------------------------- live cycle, real path
+test('a cycle Binance rejects ends up in the status as a diagnosis, not a bare string', async () => {
+  freshLedger();
+
+  // Exactly the answer that rejected every signed read in production, returned for every request.
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    requests.push(String(input));
+    return new Response(
+      JSON.stringify({
+        code: -1102,
+        msg: "Mandatory parameter 'timestamp' was not sent, was empty/null, or malformed.",
+      }),
+      { status: 400 }
+    );
+  }) as typeof fetch;
+
+  const env: Record<string, string | undefined> = {
+    BINANCE_API_KEY: 'k',
+    BINANCE_API_SECRET: 's',
+    BINANCE_TESTNET: 'true',
+    TRADE_ENGINE_ENABLED: 'true',
+    TRADE_ENGINE_INTERVAL_MS: '5000',
+  };
+  const saved: Record<string, string | undefined> = {};
+  for (const [k, v] of Object.entries(env)) {
+    saved[k] = process.env[k];
+    process.env[k] = v;
+  }
+
+  try {
+    const started = engine.start();
+    assert.equal(started.ok, true, started.message);
+
+    // The first cycle is scheduled with no delay, so this settles in a few ticks.
+    const deadline = Date.now() + 4000;
+    while (!engine.getStatus().lastFailure && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  } finally {
+    engine.stop('test finished');
+    globalThis.fetch = originalFetch;
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+
+  const status = engine.getStatus();
+  assert.ok(requests.length > 0, 'the cycle must actually have called the exchange');
+  assert.equal(status.lastFailure?.code, 'REQUEST_INVALID');
+  assert.match(status.lastFailure?.raw ?? '', /Mandatory parameter 'timestamp'/);
+  assert.match(status.lastFailure?.action ?? '', /not a credential problem/);
+  assert.equal(status.lastFailure?.repeats, 1);
+  assert.match(status.lastError ?? '', /rejected the request/, 'the one-line summary is the diagnosis too');
+  assert.ok(
+    status.events.some((e) => e.kind === 'CYCLE_FAILED' && /not a credential problem/.test(e.message)),
+    'the operator sees the remedy in the event log'
+  );
+  assert.equal(
+    status.events.some((e) => e.kind === 'AUTO_FLATTEN' || e.kind === 'CLOSE_FAILED'),
+    false,
+    'a rejected API call must never escalate into closing a position'
+  );
+
   freshLedger();
 });
