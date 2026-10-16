@@ -358,6 +358,74 @@ export async function getOrderStatus(
   }
 }
 
+export interface ConditionalOrder {
+  orderId: number | string;
+  symbol: string;
+  type: string;
+  side: string;
+  stopPrice: number;
+  status: string;
+}
+
+/**
+ * Live conditional orders for a symbol. The guardian loop uses this to answer a question the UI
+ * never could: is the protective stop still on the book right now?
+ */
+export async function getConditionalOrders(creds: BinanceCreds, symbol?: string): Promise<ConditionalOrder[]> {
+  const { data } = await signedRequest<Json[] | Json>(
+    creds,
+    'GET',
+    '/fapi/v1/openOrders',
+    symbol ? { symbol } : {}
+  );
+  const rows = Array.isArray(data) ? data : [];
+  return rows.map((o) => ({
+    orderId: (o.orderId as number | string) ?? '',
+    symbol: String(o.symbol ?? ''),
+    type: String(o.type ?? ''),
+    side: String(o.side ?? ''),
+    stopPrice: parseFloat(String(o.stopPrice ?? '0')) || 0,
+    status: String(o.status ?? 'NEW'),
+  }));
+}
+
+/**
+ * Settled money for a trade window, straight from the income ledger: realized PnL plus commission
+ * plus funding. This replaces the flat "0.1% of notional" fee estimate used for reported PnL.
+ */
+export async function getSettledPnlSince(
+  creds: BinanceCreds,
+  sinceMs: number,
+  symbol?: string
+): Promise<{ realized: number; commission: number; funding: number; net: number; rows: number } | null> {
+  try {
+    const params: Record<string, string | number> = { startTime: Math.floor(sinceMs), limit: 1000 };
+    if (symbol) params.symbol = symbol;
+    const { data } = await signedRequest<Json[]>(creds, 'GET', '/fapi/v1/income', params);
+    if (!Array.isArray(data)) return null;
+    let realized = 0;
+    let commission = 0;
+    let funding = 0;
+    for (const row of data) {
+      const amount = parseFloat(String(row.income ?? '0')) || 0;
+      const type = String(row.incomeType ?? '');
+      if (type === 'REALIZED_PNL') realized += amount;
+      else if (type === 'COMMISSION') commission += amount;
+      else if (type === 'FUNDING_FEE') funding += amount;
+    }
+    return {
+      realized: Number(realized.toFixed(4)),
+      commission: Number(commission.toFixed(4)),
+      funding: Number(funding.toFixed(4)),
+      net: Number((realized + commission + funding).toFixed(4)),
+      rows: data.length,
+    };
+  } catch {
+    // null = "could not settle from the exchange"; callers must fall back and label it as such.
+    return null;
+  }
+}
+
 /** Signed GET used by the account sync route; kept here so signing lives in exactly one file. */
 export async function getIncome(
   creds: BinanceCreds,

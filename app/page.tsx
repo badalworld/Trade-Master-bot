@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { Header } from '@/components/Header';
 import { KpiMetricsStrip, type BinanceAccountMetrics } from '@/components/KpiMetricsStrip';
 import { ActivePositions } from '@/components/ActivePositions';
@@ -11,6 +12,7 @@ import { DiagnosticsLog, type LogEntry } from '@/components/DiagnosticsLog';
 import { SettingsView, type BotSettings } from '@/components/SettingsView';
 import { PnlChartWidget } from '@/components/PnlChartWidget';
 import { TradeResultOverlay, type TradeResultPayload } from '@/components/TradeResultOverlay';
+import { EngineStatusPanel, type EngineStatusPayload } from '@/components/EngineStatusPanel';
 import { generateUniqueId } from '@/lib/utils';
 import type { CredentialSession } from '@/components/SettingsView';
 import {
@@ -146,6 +148,11 @@ export default function HomePage() {
   });
   const [logs, setLogs] = useState<LogEntry[]>(INITIAL_LOGS);
 
+  // Server-side guardian: authoritative position protection + ledger, alive without this tab.
+  const [engineState, setEngineState] = useState<EngineStatusPayload | null>(null);
+  const [engineLoading, setEngineLoading] = useState<boolean>(false);
+  const [engineError, setEngineError] = useState<string | null>(null);
+
   // Connection Test
   const [isTestingConnection, setIsTestingConnection] = useState<boolean>(false);
   const [connectionResult, setConnectionResult] = useState<{
@@ -167,6 +174,9 @@ export default function HomePage() {
   // ...and in-flight opens/scans, which previously had no lock at all: two overlapping scan cycles
   // could submit the same live entry twice.
   const scanInFlightRef = useRef<boolean>(false);
+  // Symbols the server engine is actively guarding. The browser monitor stands down for those so a
+  // trade is never closed (or booked) twice.
+  const engineManagedRef = useRef<Set<string>>(new Set());
   // Signals already submitted this session, so a re-render can't re-fire an order.
   const submittedSignalsRef = useRef<Set<string>>(new Set());
 
@@ -534,6 +544,87 @@ export default function HomePage() {
     };
   }, [session.active, session.isTestnet, syncBinanceAccount]);
 
+  const refreshEngineStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/engine/status', {
+        headers: { 'X-TM-Request': '1' },
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      const data = (await res.json().catch(() => null)) as EngineStatusPayload | null;
+      if (res.ok && data) {
+        setEngineState(data);
+        setEngineError(null);
+        engineManagedRef.current = new Set(
+          (data.ledger?.openPositions ?? []).filter((p) => !p.foreign).map((p) => p.symbol)
+        );
+      } else {
+        setEngineError(data ? JSON.stringify(data).slice(0, 160) : `HTTP ${res.status}`);
+      }
+    } catch (err) {
+      setEngineError((err as Error).message);
+    } finally {
+      setEngineLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // Scheduled rather than called inline so the effect itself performs no state update.
+    const kick = setTimeout(() => void refreshEngineStatus(), 250);
+    const interval = setInterval(() => void refreshEngineStatus(), 10000);
+    return () => {
+      clearTimeout(kick);
+      clearInterval(interval);
+    };
+  }, [refreshEngineStatus]);
+
+  const onRefreshEngine = React.useCallback(() => {
+    setEngineLoading(true);
+    void refreshEngineStatus();
+  }, [refreshEngineStatus]);
+
+  const handleEngineAction = useCallback(
+    async (action: 'start' | 'stop' | 'halt-entries' | 'resume-entries' | 'flatten-all'): Promise<string | null> => {
+      try {
+        const { ok, data } = await apiPost<Record<string, unknown>>('/api/engine/control', {
+          action,
+          ...(action === 'flatten-all' ? { confirm: 'FLATTEN' } : {}),
+        });
+        await refreshEngineStatus();
+        appendLog(
+          'SYSTEM',
+          ok ? 'SUCCESS' : 'WARN',
+          `Engine ${action}: ${String(data.message ?? data.error ?? (ok ? 'done' : 'failed'))}`
+        );
+        return ok ? null : String(data.error ?? data.message ?? 'Engine action failed');
+      } catch (err) {
+        return (err as Error).message;
+      }
+    },
+    [appendLog, refreshEngineStatus]
+  );
+
+  /** Register a UI-opened position with the server guardian so it survives this tab closing. */
+  const trackWithEngine = useCallback(async (pos: TradePosition) => {
+    try {
+      await apiPost('/api/engine/track', pos as unknown as Record<string, unknown>);
+    } catch {
+      /* the local ledger stays authoritative; the panel will show if tracking failed */
+    }
+  }, []);
+
+  const untrackWithEngine = useCallback(async (symbol: string) => {
+    try {
+      await fetch(`/api/engine/track?symbol=${encodeURIComponent(symbol)}`, {
+        method: 'DELETE',
+        headers: { 'X-TM-Request': '1' },
+        credentials: 'same-origin',
+      });
+    } catch {
+      /* best effort */
+    }
+  }, []);
+
   // Execute a position close on Binance and record trade history + compounding
   const finalizePositionClose = useCallback(
     async (
@@ -563,9 +654,21 @@ export default function HomePage() {
             appendLog('ERROR', 'ERROR', `Not authorized to close ${pos.symbol} on Binance — reconnect your API session in Settings. Local bookkeeping only.`);
           } else if (ok && closeData.success) {
             if (Number(closeData.avgPrice) > 0) finalExitPrice = Number(closeData.avgPrice);
+            if (closeData.noPosition && engineManagedRef.current.has(pos.symbol)) {
+              // The engine already settled this trade against the exchange income ledger. Booking it
+              // again here from local prices would double-count PnL and corrupt the compounding step.
+              appendLog('ORDER', 'INFO', `${pos.symbol} was settled by the server engine (see the engine log); not re-booked locally.`);
+              engineManagedRef.current.delete(pos.symbol);
+              setPositions((prev) => prev.filter((p) => p.id !== pos.id));
+              closingIdsRef.current.delete(pos.id);
+              setClosingPositionId(null);
+              void untrackWithEngine(pos.symbol);
+              return;
+            }
             if (closeData.noPosition) {
               appendLog('ORDER', 'INFO', `${pos.symbol} was already flat on Binance (exchange bracket fired). Recorded locally at $${roundCryptoPrice(finalExitPrice)}.`);
             }
+            void untrackWithEngine(pos.symbol);
           } else if (!ok) {
             appendLog('ERROR', 'ERROR', `Binance close failed for ${pos.symbol}: ${closeData.error || 'unknown error'}. Position may still be OPEN on the exchange — check Binance now.`);
             // Do not erase local tracking of a position the exchange says is still there.
@@ -654,7 +757,7 @@ export default function HomePage() {
       setClosingPositionId(null);
       syncBinanceAccount();
     },
-    [appendLog, session.active, syncBinanceAccount]
+    [appendLog, session.active, syncBinanceAccount, untrackWithEngine]
   );
 
   // Scan Market Pairs
@@ -862,6 +965,7 @@ export default function HomePage() {
                     if (execData.bracketWarning) {
                       appendLog('SYSTEM', 'WARN', `Trade Master: ${execData.bracketWarning}`);
                     }
+                    void trackWithEngine(newPosition);
                     syncBinanceAccount();
                   }
                 } catch (apiErr: unknown) {
@@ -905,6 +1009,7 @@ export default function HomePage() {
     settings.scanIntervalSeconds,
     appendLog,
     syncBinanceAccount,
+    trackWithEngine,
   ]);
 
   const runMarketScanRef = useRef(runMarketScan);
@@ -973,7 +1078,13 @@ export default function HomePage() {
             }
           }
 
-          if ((isHitTP || isHitSL) && !closingIdsRef.current.has(pos.id)) {
+          if (
+            (isHitTP || isHitSL) &&
+            !closingIdsRef.current.has(pos.id) &&
+            // The server engine owns this one: two brains acting on one position means a duplicated
+            // close and a double-booked trade in history.
+            !engineManagedRef.current.has(pos.symbol)
+          ) {
             toClose.push({
               pos: { ...pos, markPrice: currentPrice, unrealizedPnl, unrealizedPnlPercent },
               exitPrice: currentPrice,
@@ -1105,6 +1216,7 @@ export default function HomePage() {
           if (execData.bracketWarning) {
             appendLog('SYSTEM', 'WARN', `Trade Master: ${execData.bracketWarning}`);
           }
+          void trackWithEngine(newPos);
           syncBinanceAccount();
         }
       } catch (apiErr: unknown) {
@@ -1120,6 +1232,7 @@ export default function HomePage() {
       settings.leverage,
       settings.maxOpenTrades,
       syncBinanceAccount,
+      trackWithEngine,
     ]
   );
 
@@ -1345,6 +1458,25 @@ export default function HomePage() {
         {/* Tab 1: Active Positions Dashboard, PnL Chart & Selected Symbol Order Flow Chart */}
         {activeTab === 'positions' && (
           <div className="space-y-6">
+            <EngineStatusPanel
+              state={engineState}
+              loading={engineLoading}
+              error={engineError}
+              onAction={handleEngineAction}
+              onRefresh={onRefreshEngine}
+            />
+            {!engineState?.engine?.running && (
+              <div className="flex items-start gap-2 p-3 rounded-lg border border-amber-800/70 bg-amber-950/30 text-[11px] text-amber-200">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>
+                  <strong>No server-side guardian is running.</strong> Stop-loss re-arming, breach checks and
+                  the durable ledger only work while this browser tab is open — close the tab and the only
+                  protection left is whatever conditional orders are sitting on Binance. Set
+                  <code className="mx-1 px-1 rounded bg-slate-900 text-cyan-300">TRADE_ENGINE_ENABLED=true</code>
+                  (plus server API keys) to run it on the server.
+                </span>
+              </div>
+            )}
             <PnlChartWidget
               trades={closedTrades}
               totalPnl={totalPnl}

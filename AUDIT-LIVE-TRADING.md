@@ -209,3 +209,94 @@ The app *is* deployable: build passes, `output: 'standalone'` is Cloud Run-ready
 advisable is deploying this build to a public URL with mainnet keys wired to it, because that is
 exactly the B3/B4 combination (unauthenticated public order endpoint, no risk caps). Deploying to
 a private URL for UI testing only is fine.
+
+---
+
+# Phase 2 — unattended protection (added after the remediation commit)
+
+Verdict item (e) in the summary said the loop lives in a browser tab: close the tab and the only
+thing left between a leveraged position and a total loss is whatever conditional orders happen to be
+sitting on Binance. That is an architectural property, so it was fixed architectically rather than
+with another guard clause.
+
+## What moved server-side
+
+| File | Responsibility |
+|---|---|
+| `lib/order-executor.ts` | **All** money logic (sizing → order → brackets → fill reconciliation), no Next.js imports. `app/api/binance/execute` is now a ~80-line shell over it, and the engine calls the same functions. A route and a daemon that each re-implement order placement always drift; this removes the second implementation. |
+| `lib/position-ledger.ts` | Durable trade ledger: atomic tmp+rename JSON under `TRADE_DATA_DIR`, network stamp, settlement + compounding via `calculateNextTradeMargin` (one compounding rule for UI and server). |
+| `lib/guardian.ts` | Pure, testable safety decisions: is a stop live, re-arm vs adopt vs flatten, is the bracket breached, may we enter. No I/O, no `Date.now()` inside the decisions. |
+| `lib/market-data.ts` | `scanUniverse` + `isActionableSignal` shared by the scan route and the engine, including the `1000PEPE`/`PEPE` retry and fail-closed tradeability. |
+| `lib/engine.ts` | The loop: reconcile → protect → backstop → settle → (opt-in) enter. Singleton on `globalThis`. |
+| `instrumentation.ts` | Boots the loop with the server; `SIGINT`/`SIGTERM` flush the ledger. |
+| `app/api/engine/{status,control,track}` | Read state, operator controls (`flatten-all` needs `confirm:"FLATTEN"`), and the UI→engine ownership bridge. |
+| `components/EngineStatusPanel.tsx` | Makes the invisible visible: running/idle, cycles, durability, owned vs foreign vs unprotected, event log, and the buttons. |
+
+Defaults are deliberately inert: `TRADE_ENGINE_ENABLED=false`, `TRADE_ENGINE_AUTO_ENTRY=false`
+(guardian-only: it can close and protect, never open), env credentials required, engine-side leverage
+still hard-capped to the `TRADE_MIN/MAX_LEVERAGE` band. A default deploy behaves exactly as before.
+
+## Defects found *while building* Phase 2 (all fixed, all with tests or runtime evidence)
+
+1. **The guardian would have re-placed an existing stop every cycle.** The first draft looked for
+   `status === 'STOP'` in `/fapi/v1/openOrders`, but futures conditional orders report `NEW` there.
+   Nothing would ever match ⇒ a fresh `STOP_MARKET` appended each cycle. Fixed by filtering on
+   type + exit side + non-terminal status, and pinned by a test that asserts `NEW` counts.
+2. **Two engines in one process.** Next compiles `instrumentation.ts` into its own bundle, so the
+   module-level `export const engine` existed twice: the loop was genuinely running while
+   `/api/engine/status` reported `running:false` — and the second ledger copy would have overwritten
+   the first's file with a stale snapshot. Fixed by hoisting the engine and ledger singletons onto
+   `globalThis`. Verified live: after the fix the API reports the real `cycles`/`events` and
+   `stop`/`start` through the control route affect the loop that is actually running.
+3. **`specCache` was not keyed by network** (open item from Phase 1). Testnet filters could be reused
+   for a mainnet order after a network flip. Cache is now `{testnet|mainnet}`-keyed (and shared across
+   bundles via `globalThis`, for the same reason as #2).
+4. **Engine entries were fail-open on tradeability**: `tradeable[symbol] !== false` accepts an absent
+   key. Changed to `=== true`.
+5. **`-1121` (invalid symbol) triggered a 60 s cooldown**, which would have paused *protection* for
+   every other position because one bad symbol was configured. Removed from the cooldown triggers.
+6. **Forced closes on uncertain state**: the escalation counter used to increment on any error, so a
+   Binance outage or a missing local tick spec could end with the engine closing real positions. Now
+   only an *answered* rejection (`BinanceApiError`) counts toward flatten; unreachable/unknown state
+   logs `BRACKET_DEFERRED`, marks the position unprotected and retries — it never destroys.
+7. **Double-brain accounting**: with the engine owning a symbol, the browser's 2 s monitor now stands
+   down, and a close the engine already settled is dropped locally instead of being booked a second
+   time with price-derived PnL.
+
+## Runtime evidence gathered here
+
+`TRADE_DATA_DIR` pointed at a real directory, dummy env credentials, a hand-seeded ledger containing
+one owned `BTCUSDT LONG` with `slOrderId`, `TRADE_ENGINE_INTERVAL_MS=8000`, and **no egress to
+Binance at all** (the sandbox allowlist blocks `testnet.binancefuture.com`) — i.e. a total API outage
+with a leveraged position on the books, which is precisely when bad safety code does damage:
+
+- `instrumentation` logged `STARTED … auto-entry OFF (default) · bracket enforcement ON` — it did not
+  open anything.
+- **27 consecutive failed cycles** (`CYCLE_FAILED … fetch failed`), and across all of them:
+  `AUTO_FLATTEN` 0, `CLOSE_FAILED` 0, `TRADE_SETTLED` 0, `BRACKET_REARMED` 0. The position survived in
+  the ledger with `unprotectedCycles: 0` — no escalation, no order spam.
+- A stale `pnlDay` (`2000-01-01`) with `realizedPnlTodayUsdt: -999` reset to `0` on load, so the daily
+  loss breaker cannot stay tripped forever by an old file.
+- `GET /api/engine/status` with no `X-TM-Request` header → `403 ORIGIN_REJECTED`; with it → the live
+  engine state (`running:true, cycles:5, credentialSource:"env", ledgerDurable:true`).
+- `POST /api/engine/control` with a wrong `Origin` → 403 (CSRF guard shared with trading). With correct
+  origin: `stop` → `running:false` + `STOPPED` event, `start` → `running:true` and cycles continuing
+  from 7, `halt-entries` → `ENTRIES_HALTED`, `flatten-all` without `confirm` → `400 CONFIRM_REQUIRED`
+  and the position untouched, unknown action → `UNKNOWN_ACTION`. No action ever reached the ledger file
+  destructively.
+- Gates on the final tree: `tsc --noEmit` 0 errors · `eslint` 0 problems · `node --test` **42/42**
+  (19 of them new for guardian + ledger) · `next build` succeeds with the three `/api/engine/*` routes.
+
+## Still not cleared for live money, and why nothing more in this repo can change that
+
+1. **No exchange response has ever been parsed by this code.** Order acceptance, bracket rejection
+   reasons, `MIN_NOTIONAL` behaviour, fill reconciliation and income-based settlement are all written
+   against documented behaviour, not observed traffic.
+2. **Soak time is the remaining requirement** — ≥ 2 weeks on testnet with roughly 100 reviewed fills,
+   plus a deliberate "kill the tab mid-trade" drill and a "block the API for an hour" drill (the
+   second one is what the log above demonstrates, at the code level only).
+3. **Durability is deployment-dependent**: without a mounted volume `ledgerDurable:false` and the
+   engine's ownership knowledge dies with the container (positions then become `foreign` — reported,
+   not managed). Never enable `TRADE_ENGINE_AUTO_ENTRY` on an ephemeral filesystem.
+4. **The strategy itself is unproven**: still no backtest and no closed-trade history. This is now a
+   measurement gap, not a code defect — the ledger will produce that history on testnet.
