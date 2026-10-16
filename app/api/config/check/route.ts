@@ -146,6 +146,9 @@ export async function GET(req: NextRequest) {
       cycles: engineStatus.cycles,
       credentialSource: engineStatus.credentialSource,
       lastError: engineStatus.lastError,
+      // The classified form of the same failure: the diagnosis and the remedy, so a single call to
+      // this endpoint answers "why is the loop failing and what do I do about it?".
+      lastFailure: engineStatus.lastFailure,
     },
     ledger: { path: dataDir, durable: ledger.isDurable() },
     policy: policySummary(policy),

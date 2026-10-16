@@ -277,11 +277,16 @@ Representative refusal codes: `OPERATOR_AUTH_REQUIRED`, `OPERATOR_AUTH_NOT_CONFI
 ```bash
 npm run lint          # eslint (also enforced during `next build`)
 npx tsc --noEmit      # strict type-check
-npm test              # 70 tests, 7 files, node:test + native TypeScript
+npm test              # 116 tests, 10 files, node:test + native TypeScript
 ```
 
 The suite covers the parts that lose money if they are wrong:
 
+- **Binance client wire format** — a signed GET carries `timestamp`/`signature` on the query string
+  (not in a body `fetch` would drop), the HMAC verifies against the payload as sent, order rejections
+  keep Binance's code and never look like fills, and the daily-PnL read fails closed with `NaN`.
+- **Cycle-failure policy** — first failure logged in full, identical repeats throttled, deterministic
+  failures backing off, transient ones keeping the fast cadence.
 - **Sizing** — `MIN_NOTIONAL` bumps, lot rounding, deviation refusal (the 5–10× over-size regression),
   unknown-symbol refusal, tick-aligned prices, malformed-bracket refusal.
 - **Risk policy** — leverage/margin/notional caps, symbol allowlist, position cap, mainnet gate,
@@ -293,7 +298,7 @@ The suite covers the parts that lose money if they are wrong:
 - **Ledger** — compounding ladder, UTC-day PnL rollover, persistence round-trip, network mismatch.
 - **Strategy math** — HVN/POC/value area, absorption, imbalance, ATR, signal scoring, rate limiting.
 
-Verified state of this revision: `tsc` clean · `eslint` clean · **97/97 tests** · production build
+Verified state of this revision: `tsc` clean · `eslint` clean · **116/116 tests** · production build
 clean (15 routes) · live route probes (anonymous money calls answer **401**, oversized requests
 answer **409 POLICY_BLOCKED**, unreachable exchange answers **502 NETWORK_UNREACHABLE** with the
 remedy rather than a bogus credential rejection). Live audit history and the honest list of what has *not* been proven
@@ -342,6 +347,8 @@ DEPLOYMENT.md  AUDIT-LIVE-TRADING.md
 | `KEY_NETWORK_MISMATCH` | The keys belong to the other network: testnet needs keys from `testnet.binancefuture.com`, mainnet needs mainnet keys. |
 | `GEO_BLOCKED` (HTTP 451) | Binance refuses this server's location *before* authentication. Move the deployment to a permitted region — no key or permission change helps. |
 | `IP_NOT_ALLOWED` | The key's IP restriction does not include the server's egress IP. Add it (see `/api/network/ip`) or clear the restriction. |
+| `REQUEST_INVALID` (e.g. `Mandatory parameter 'timestamp' was not sent`) | Binance rejected the request *before* judging the key: a required parameter never arrived (the app's bug), not a credential problem. Retrying unchanged will keep failing — report the raw message. |
+| Engine panel keeps showing the same `CYCLE_FAILED` | Each failure is classified (key, IP allowlist, geo-block, malformed request, network) and the panel shows the diagnosis, the remedy and how many cycles it has repeated. A first line is logged in full; an identical repeat is logged every 20th cycle instead of every cycle, and failures no retry can fix back off to a 2-minute poll — the loop never stops retrying, so a fix made in Binance is picked up on its own. |
 | `TIMESTAMP_DRIFT` / `SIGNATURE_INVALID` | Host clock skew >1s (enable NTP) / the secret does not match the key (re-copy or regenerate). |
 | `BINANCE_UNREACHABLE` / `TIMEOUT` | Egress/DNS problem: no credential would work. Check outbound HTTPS, then `/api/config/check` reachability. |
 | `409 POLICY_BLOCKED` | The request violated a server cap (leverage, margin, notional, symbol, position count) — see `violations[]`. |

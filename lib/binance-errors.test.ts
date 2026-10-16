@@ -76,6 +76,42 @@ test('-2015 with no IP detail on mainnet lists all three possible causes', () =>
   assert.match(f.action, /IP restriction/);
 });
 
+test("the -1102 that broke every signed read is a client bug, not a key problem", () => {
+  // Verbatim from production: this is what an engine cycle logged every 15 seconds.
+  const f = classifyError(
+    err("Mandatory parameter 'timestamp' was not sent, was empty/null, or malformed.", 400, -1102),
+    false
+  );
+  assert.equal(f.code, 'REQUEST_INVALID');
+  assert.equal(f.retryable, false, 'nothing about this changes on its own — a retry just repeats it');
+  assert.match(f.title, /before acting on it/);
+  assert.match(f.action, /not a credential problem/);
+  assert.match(f.action, /timestamp/);
+  // The two diagnoses an operator would otherwise jump to must not be what they are told.
+  assert.notEqual(f.code, 'INVALID_KEY');
+  assert.notEqual(f.code, 'TIMESTAMP_DRIFT');
+});
+
+test('the rest of the malformed-request family is recognised too', () => {
+  for (const code of [-1100, -1103, -1104, -1105, -1106, -1130]) {
+    assert.equal(classifyError(err('rejected', 400, code), false).code, 'REQUEST_INVALID', `code ${code}`);
+  }
+  // ...including when the code is absent but the wording is unmistakable.
+  const noCode = classifyError(err("Mandatory parameter 'quantity' was not sent, was empty/null, or malformed.", 400), false);
+  assert.equal(noCode.code, 'REQUEST_INVALID');
+});
+
+test('a real signature mismatch still outranks the malformed-request catch-all', () => {
+  const f = classifyError(err('Signature for this request is not valid.', 400, -1022), true);
+  assert.equal(f.code, 'SIGNATURE_INVALID');
+});
+
+test('an unclassified 400 stays UNKNOWN rather than being blamed on the client', () => {
+  const f = classifyError(err('Something new from Binance', 400, -9999), false);
+  assert.equal(f.code, 'UNKNOWN');
+  assert.equal(f.binanceCode, -9999);
+});
+
 test('plain HTTP auth failures are classified', () => {
   assert.equal(classifyError(err('Unauthorized', 401), false).code, 'INVALID_KEY');
   assert.equal(classifyError(err('Forbidden', 403), false).code, 'IP_NOT_ALLOWED');
@@ -127,6 +163,8 @@ test('each failure maps to an honest HTTP status instead of a blanket 401', () =
   assert.equal(httpStatusForFailure('KEY_NETWORK_MISMATCH'), 401);
   assert.equal(httpStatusForFailure('IP_NOT_ALLOWED'), 401);
   assert.equal(httpStatusForFailure('TIMESTAMP_DRIFT'), 500);
+  // A request we built wrong is our 500 to own, never a 401 that points at the operator's key.
+  assert.equal(httpStatusForFailure('REQUEST_INVALID'), 500);
 });
 
 test('failureMessage always carries both the diagnosis and the action', () => {

@@ -60,20 +60,27 @@ async function signedRequest<T = Json>(
 
   const query = usp.toString();
   const signature = crypto.createHmac('sha256', creds.apiSecret).update(query).digest('hex');
-  const body = `${query}&signature=${signature}`;
+  const signedPayload = `${query}&signature=${signature}`;
+
+  // Where the signed payload goes depends on the verb, and getting it wrong fails silently: `fetch`
+  // ignores `body` on a GET/HEAD request, so a GET whose parameters were only placed in `body`
+  // reaches Binance with *nothing* — no timestamp, no signature, no symbol — and comes back as
+  // `-1102 Mandatory parameter 'timestamp' was not sent`. Every signed read (account, positionRisk,
+  // income, openOrders, order status) goes through here, so the read path has to use the query
+  // string. Binance accepts the payload in either place, so writes keep using the body as before.
+  const payloadInQuery = method === 'GET';
+  const url = `${baseUrlFor(creds.isTestnet)}${path}${payloadInQuery ? `?${signedPayload}` : ''}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   try {
-    const res = await fetch(`${baseUrlFor(creds.isTestnet)}${path}`, {
+    const res = await fetch(url, {
       method,
       headers: {
         'X-MBX-APIKEY': creds.apiKey,
         'Content-Type': 'application/x-www-form-urlencoded',
       },
-      // Binance accepts the signed payload as a query string on every verb; sending it in `body`
-      // for DELETE mirrors the previous behaviour while keeping GET-style signing intact.
-      ...(method === 'GET' ? {} : { body }),
+      ...(payloadInQuery ? {} : { body: signedPayload }),
       signal: controller.signal,
       cache: 'no-store',
     });
