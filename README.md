@@ -235,6 +235,7 @@ means the signed operator session is required when `TM_OPERATOR_AUTH` says so.
 | `/api/engine/control` | POST | operator + CSRF | `start` · `stop` · `halt-entries` · `resume-entries` · `flatten-all` (needs `confirm:"FLATTEN"`) · `set-auto-entry` |
 | `/api/engine/track` | POST / DELETE | operator + CSRF | Register/unregister a UI-opened position with the guardian |
 | `/api/network/ip` | GET | operator | Verified egress IPv4 for the Binance key whitelist (never guesses) |
+| `/api/config/check` | GET | operator | **Deployment self-diagnosis**: verdict, both-host reachability, why a key is or is not active, and an explicit fix list |
 
 **Request examples**
 
@@ -253,6 +254,18 @@ curl -s -b /tmp/tm.jar -X POST https://<service>/api/binance/execute \
   -d '{"action":"OPEN","symbol":"BTCUSDT","side":"LONG","margin":99999,"leverage":50,"price":111000,"stopLoss":110000,"takeProfit":113000}' | jq '.code, .violations[].code'
 # → 409 POLICY_BLOCKED  [MARGIN_TOO_LARGE, LEVERAGE_OUT_OF_RANGE, NOTIONAL_TOO_LARGE]
 ```
+
+**Something not working? Ask the deployment:**
+
+```bash
+curl -s -b /tmp/tm.jar -H 'X-TM-Request: 1' https://<service>/api/config/check | jq '{verdict, headline, targetNetwork, issues}'
+```
+
+One call returns the verdict (`READY_TESTNET`, `READY_MAINNET`, `LOCKED_OPERATOR_TOKEN_MISSING`,
+`NO_CREDENTIALS`, `CREDENTIALS_REJECTED`, `GEO_BLOCKED`, `BINANCE_UNREACHABLE`, `MAINNET_LOCKED`),
+a reachability report for **both** Binance hosts, whether the credentials actually resolved, and an
+actionable list of blockers/warnings — including the two that catch most people: an unset
+`BINANCE_TESTNET` (which silently means *testnet*) and a missing `TM_OPERATOR_TOKEN`.
 
 Representative refusal codes: `OPERATOR_AUTH_REQUIRED`, `OPERATOR_AUTH_NOT_CONFIGURED`,
 `POLICY_BLOCKED`, `MAINNET_DISABLED`, `TRADE_HALTED`, `DAILY_LOSS_BREAKER`, `DAILY_LOSS_UNKNOWN`,
@@ -280,9 +293,10 @@ The suite covers the parts that lose money if they are wrong:
 - **Ledger** — compounding ladder, UTC-day PnL rollover, persistence round-trip, network mismatch.
 - **Strategy math** — HVN/POC/value area, absorption, imbalance, ATR, signal scoring, rate limiting.
 
-Verified state of this revision: `tsc` clean · `eslint` clean · **70/70 tests** · production build
-clean (14 routes) · live route probes (anonymous money calls answer **401**, oversized requests
-answer **409 POLICY_BLOCKED**). Live audit history and the honest list of what has *not* been proven
+Verified state of this revision: `tsc` clean · `eslint` clean · **97/97 tests** · production build
+clean (15 routes) · live route probes (anonymous money calls answer **401**, oversized requests
+answer **409 POLICY_BLOCKED**, unreachable exchange answers **502 NETWORK_UNREACHABLE** with the
+remedy rather than a bogus credential rejection). Live audit history and the honest list of what has *not* been proven
 are in [`AUDIT-LIVE-TRADING.md`](AUDIT-LIVE-TRADING.md).
 
 ## Project structure
@@ -303,6 +317,8 @@ lib/
   exchange-specs.ts         exchange filters + pure sizing / tick alignment
   risk-policy.ts            server-side caps, daily-loss gate, position-mode rules
   operator-auth.ts          operator cookie: signing, verification, throttling
+  binance-errors.ts         failure classifier: geo-block / IP / key / transport, with remedies
+  config-check.ts           pure deployment diagnosis behind GET /api/config/check
   trade-guard.ts            CSRF guard, credential resolution, idempotency
   engine.ts                 unattended guardian loop
   guardian.ts               pure guardian decisions (re-arm / adopt / flatten / breach)
@@ -322,6 +338,12 @@ DEPLOYMENT.md  AUDIT-LIVE-TRADING.md
 | `401 OPERATOR_AUTH_REQUIRED` | Not signed in (or the 12 h cookie expired). Sign in with the operator token. |
 | `401 NO_SESSION` | No Binance credential session. Add keys via Settings, or set `BINANCE_API_KEY`/`BINANCE_API_SECRET` server-side. |
 | `409 MAINNET_DISABLED` | Mainnet orders are locked. Set `TRADE_ALLOW_MAINNET=true` only after a clean testnet run. |
+| Key is verified but the badge says **TESTNET · PAPER FUNDS** | `BINANCE_TESTNET` is unset (or `true`), so the deployment targets testnet on purpose — real mainnet keys are rejected there with `-2015`. Set `BINANCE_TESTNET=false` (and `TRADE_ALLOW_MAINNET=true`) for real money. Run `/api/config/check` to see this called out as `TESTNET_FLAG_UNSET`. |
+| `KEY_NETWORK_MISMATCH` | The keys belong to the other network: testnet needs keys from `testnet.binancefuture.com`, mainnet needs mainnet keys. |
+| `GEO_BLOCKED` (HTTP 451) | Binance refuses this server's location *before* authentication. Move the deployment to a permitted region — no key or permission change helps. |
+| `IP_NOT_ALLOWED` | The key's IP restriction does not include the server's egress IP. Add it (see `/api/network/ip`) or clear the restriction. |
+| `TIMESTAMP_DRIFT` / `SIGNATURE_INVALID` | Host clock skew >1s (enable NTP) / the secret does not match the key (re-copy or regenerate). |
+| `BINANCE_UNREACHABLE` / `TIMEOUT` | Egress/DNS problem: no credential would work. Check outbound HTTPS, then `/api/config/check` reachability. |
 | `409 POLICY_BLOCKED` | The request violated a server cap (leverage, margin, notional, symbol, position count) — see `violations[]`. |
 | `409 DAILY_LOSS_UNKNOWN` | The daily PnL could not be read from Binance; entries stay locked until the exchange answers (deliberately fail-closed). |
 | `409 HEDGE_MODE_UNSUPPORTED` | The account is in Hedge Mode; switch it to One-Way Mode in Binance. |
@@ -353,6 +375,8 @@ Stated plainly, because they matter more than the feature list:
   single instance (`--max-instances=1`); env-key deployments are stateless.
 - **Exchange-facing behaviour is not unit-testable.** Whether Binance accepts a given bracket
   (`timeInForce` on `STOP_MARKET` with `closePosition=true`) can only be proven by a live testnet run.
+  The error classifier is unit-tested against Binance's documented responses; the live paths it
+  depends on (a real 451, a real `-2015` allowlist rejection) have not been observed from this repo.
 - **Unproven under load.** Rate-limit backoff and cooldown paths are implemented but have not been
   exercised against a sustained Binance weight limit in production.
 

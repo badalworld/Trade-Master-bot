@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { baseUrlFor, getAccount, publicGet } from '@/lib/binance-client';
+import { classifyError } from '@/lib/binance-errors';
 import { loadRiskPolicy, policySummary } from '@/lib/risk-policy';
 import { checkRequestIntegrity, envCredentials, resolveCredentials, sessionStatus } from '@/lib/trade-guard';
 import { requireOperator } from '@/lib/operator-auth';
@@ -40,11 +41,13 @@ export async function POST(req: NextRequest) {
     const started = Date.now();
     let pingOk = false;
     let pingError: string | null = null;
+    let pingFailure: ReturnType<typeof classifyError> | null = null;
     try {
       await publicGet(isTestnet, '/fapi/v1/ping', '', 5000);
       pingOk = true;
     } catch (err) {
       pingError = (err as Error).message;
+      pingFailure = classifyError(err, isTestnet);
     }
     const latencyMs = Date.now() - started;
 
@@ -54,6 +57,7 @@ export async function POST(req: NextRequest) {
     let authValid = false;
     let balanceInfo = null;
     let errorMessage: string | null = resolution.ok ? null : resolution.error;
+    let authFailure: ReturnType<typeof classifyError> | null = null;
 
     if (resolution.ok) {
       try {
@@ -67,7 +71,10 @@ export async function POST(req: NextRequest) {
           canTrade: account.canTrade,
         };
       } catch (err) {
-        errorMessage = (err as Error).message || 'Binance rejected the credentials';
+        // Name the real cause (wrong network / IP allowlist / geo-block / permissions) instead of
+        // reporting every failure as a rejected credential.
+        authFailure = classifyError(err, resolution.creds.isTestnet);
+        errorMessage = authFailure.title;
       }
     }
 
@@ -79,7 +86,7 @@ export async function POST(req: NextRequest) {
       endpoint: baseUrl,
       network: isTestnet ? 'testnet' : 'mainnet',
       credentialSource: resolution.ok ? resolution.creds.source : 'none',
-      ping: { status: pingOk ? 'ONLINE' : 'UNREACHABLE', latencyMs, error: pingError },
+      ping: { status: pingOk ? 'ONLINE' : 'UNREACHABLE', latencyMs, error: pingError, failure: pingFailure },
       auth: {
         provided: resolution.ok,
         valid: authValid,
@@ -88,6 +95,7 @@ export async function POST(req: NextRequest) {
           : authValid
             ? `Authenticated against ${isTestnet ? 'testnet' : 'MAINNET'} — trading enabled for this session`
             : errorMessage || 'No usable credentials resolved on the server.',
+        failure: authFailure,
         balance: balanceInfo,
       },
       orderPlacementAllowed: !policy.halted && !mainnetBlocked,

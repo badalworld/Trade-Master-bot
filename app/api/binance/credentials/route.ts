@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAccount, publicGet, TESTNET_BASE, MAINNET_BASE } from '@/lib/binance-client';
 import { loadRiskPolicy, policySummary } from '@/lib/risk-policy';
+import { classifyError, httpStatusForFailure } from '@/lib/binance-errors';
 import { isSecureRequest, requireOperator } from '@/lib/operator-auth';
 import {
   checkRequestIntegrity,
@@ -84,19 +85,23 @@ export async function POST(req: NextRequest) {
         }
       );
     } catch (err) {
-      const e = err as Error & { code?: number };
+      // Never say "rejected these credentials" when they were not evaluated: a geo-block, a dead
+      // network path and a rate limit all used to be reported as a bad key, which sent operators
+      // hunting for the wrong problem. The classifier names the real cause and the fix.
+      const failure = classifyError(err, isTestnet);
       return NextResponse.json(
         {
           success: false,
           verified: false,
           network: isTestnet ? 'testnet' : 'mainnet',
-          error: `Binance rejected these credentials: ${e.message}`,
-          binanceCode: e.code ?? null,
-          hint: isTestnet
-            ? 'Create a key at the Binance Futures Testnet API management page — mainnet keys do not work on testnet.'
-            : 'Check the key has "Enable Futures" permission and that no IP restriction blocks this server.',
+          code: failure.code,
+          error: failure.title,
+          hint: failure.action,
+          retryable: failure.retryable,
+          raw: (err as Error).message,
+          binanceCode: failure.binanceCode,
         },
-        { status: 401 }
+        { status: httpStatusForFailure(failure.code) }
       );
     }
   } catch (err) {

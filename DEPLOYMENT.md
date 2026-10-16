@@ -178,6 +178,35 @@ brackets are what actually protect money while that happens). And nothing here h
 against the live Binance API from the audit environment — the order-placement paths, bracket
 acceptance and income settlement still have exactly one source of truth: a real testnet run.
 
+## 5b. Region, reachability and self-diagnosis
+
+**Binance enforces Futures access by the *source IP's region*, before authentication.** Restricted
+locations include the United States, Malaysia, Ontario (Canada), Cuba, Iran, Syria, North Korea and
+Crimea. The response is **HTTP 451** with *"Service unavailable from a restricted location"*, and it
+cannot be worked around: no API key, permission or flag changes it, and Binance.US has no futures
+platform to move to. **Pick a cloud region that Binance serves for Futures before you deploy**, or
+the bot will never trade regardless of configuration.
+
+One call answers "why isn't this working?":
+
+```bash
+curl -s -b /tmp/tm.jar -H 'X-TM-Request: 1' https://<service>/api/config/check | jq
+```
+
+| Verdict | Meaning | Fix |
+|---|---|---|
+| `READY_TESTNET` / `READY_MAINNET` | Credentials resolved, host reachable, gates open | — |
+| `LOCKED_OPERATOR_TOKEN_MISSING` | Server keys exist but `TM_OPERATOR_TOKEN` is unset → every money route answers 503 | Set the token secret and redeploy |
+| `NO_CREDENTIALS` | No complete key pair (check `PARTIAL_ENV_KEYS`: it names the missing half) | Set both secrets |
+| `CREDENTIALS_REJECTED` | Binance answered and refused — the issue carries `INVALID_KEY`, `KEY_NETWORK_MISMATCH`, `IP_NOT_ALLOWED`, `SIGNATURE_INVALID`… | Follow the issue's `action` |
+| `GEO_BLOCKED` | HTTP 451 from this region | Move the deployment |
+| `BINANCE_UNREACHABLE` | DNS/egress failure — **no key would work** | Fix outbound HTTPS |
+| `MAINNET_LOCKED` | Mainnet keys but `TRADE_ALLOW_MAINNET=false` | Intentional until you have a clean testnet run |
+
+It also reports both hosts' reachability, the effective `BINANCE_TESTNET` value (with a warning when
+it is unset — the trap that silently keeps a deployment on testnet paper funds), engine state,
+ledger writability and the resolved risk policy.
+
 ## 6. Verifying a deploy
 
 Run these in order. The first block is the one that matters: a stranger must not be able to trade.
@@ -218,7 +247,19 @@ curl -s -b /tmp/tm.jar -H 'X-TM-Request: 1' https://<service>/api/engine/status 
 curl -s https://<service>/api/network/ip | jq '{ipv4, verified, warnings}'
 ```
 
-Rules of thumb: **401 is the correct answer for every anonymous money call.** If step 2 or 3 returns
+Rules of thumb: **401 is the correct answer for every anonymous money call.**
+
+Then ask the deployment to diagnose itself, which must answer without any guessing:
+
+```bash
+curl -s -b /tmp/tm.jar -H 'X-TM-Request: 1' https://<service>/api/config/check \
+  | jq '{verdict, targetNetwork, blockers, issues: [.issues[] | {severity, code, title}]}'
+```
+
+A correct production deployment reports `READY_MAINNET` (or `READY_TESTNET` while validating) with
+`blockers: 0`. Anything else names the exact problem and the fix — including
+`TESTNET_FLAG_UNSET` when `BINANCE_TESTNET` was never set, which is why a deployment can look
+configured while still trading paper funds. If step 2 or 3 returns
 anything else, do not fund the deployment. Clickjacking is blocked by `X-Frame-Options: DENY` +
 `frame-ancestors 'none'`, so this page cannot be embedded in another site (if you *need* it embedded
 in an applet shell, that trade-off has to be made deliberately in `next.config.ts`).

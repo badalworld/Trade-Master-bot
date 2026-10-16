@@ -1,10 +1,10 @@
 # Pre-Live Audit — Trade Master (Binance Futures Bot)
 
-**Date:** 2026-10-16 (round 3 — full-codebase pass) · **Branch:** `arena/76447d6f-trade-master-bot`
+**Date:** 2026-10-16 (round 4 — diagnosis & UI truth) · **Branch:** `arena/5674d799-trade-master-bot`
 **Audit verdict:** ❌ still NOT CLEARED for live trading with real funds.
-**Remediation status:** round-1 (B1–B5, H1–H4) and round-2 (R2-1 … R2-9) items fixed; round-3 items
-(R3-1 … R3-7) fixed in code, verified by `tsc`, `eslint`, **70/70 unit tests**, a production build
-(14 routes) and live route probes. `README.md` added as the operator-facing entry point.
+**Remediation status:** round-1 (B1–B5, H1–H4), round-2 (R2-1 … R2-9) and round-3 (R3-1 … R3-7)
+items fixed; round-4 items (R4-1 … R4-3) fixed in code, verified by `tsc`, `eslint`, **97/97 unit
+tests**, a production build (15 routes) and live route probes.
 **Still not cleared for real money** — the strategy has no backtest and no track record, so it must
 earn that on testnet first.
 
@@ -19,6 +19,95 @@ position on the exchange with no stop-loss and no monitoring process**.
 > the *policy* answer instead, because the endpoints were never authenticated). All three are fixed
 > below; the round-1 narrative is kept for history and its claims about the current code should be
 > read through this header.
+
+---
+
+## Round 4 — deployment diagnosis and UI truth (branch `arena/5674d799-trade-master-bot`)
+
+**Origin:** an operator deployed on Aiven with real mainnet keys and saw the badge
+`TESTNET · PAPER FUNDS` while the log announced `STARTED on MAINNET (REAL MONEY)`, with every
+verification attempt reporting *"Binance rejected these credentials"*. Their exported browser log
+showed three `-2015` rejections, then `ENV_CREDENTIALS_ACTIVE`, then a "MAINNET START" banner — a
+diagnosis failure, not a usage error. These three fixes came out of it.
+
+### R4-1 · HIGH — the browser and the server could disagree about which network was live
+The network badge read the **server** (`session.isTestnet`, from `BINANCE_TESTNET` / the credential
+session) while the start warning and the start log read the **browser's** `localStorage` toggle
+(`settings.isTestnet`). The badge was right and the banner was wrong — the log claimed a real-money
+start on a deployment that was actually on testnet. The reverse case is the dangerous one: a
+mainnet deployment with a stale testnet toggle would start **with no real-money warning at all**
+(`app/page.tsx` line 1536 emitted the warning from the browser value only).
+
+**Fix:** the start path now derives the effective network from the verified session
+(`const effectiveIsTestnet = session.isTestnet`), uses it for the warning and the log line, and
+writes it back into the stored settings; the session refresh also syncs the browser's view from the
+server's answer whenever credentials are active. Settings now states where the network comes from
+when the server owns the keys, and the credentials-target picker is labelled as ignored in that case.
+
+### R4-2 · HIGH — every failure was reported as a rejected credential
+`POST /api/binance/credentials` answered `401 Binance rejected these credentials: <raw message>` for
+*every* failure — including a wrong-network key (`-2015`), an IP-allowlist miss, a `451` geo-block,
+a rate limit, a timeout and a DNS outage, none of which evaluate the credentials at all. This is
+exactly what sent the operator hunting for a broken key. There was **no 451 handling anywhere in the
+codebase** (verified by grep).
+
+**Fix:** `lib/binance-errors.ts` classifies a failure into `GEO_BLOCKED`, `IP_NOT_ALLOWED`,
+`INVALID_KEY`, `KEY_NETWORK_MISMATCH` (the `-2015`-on-testnet case, named explicitly so the "you
+pasted mainnet keys while `BINANCE_TESTNET` was true" trap is self-explaining), `SIGNATURE_INVALID`,
+`TIMESTAMP_DRIFT`, `RATE_LIMITED`, `NETWORK_UNREACHABLE`, `TIMEOUT`, `UNKNOWN` — each with a
+`title`, an actionable `action` and a `retryable` flag — plus `httpStatusForFailure()` so the route
+returns an honest status (451 geo-block, 429 throttle, 502 unreachable) instead of a blanket 401.
+Wired into the credentials route and `/api/binance/test-connection`; the UI now logs the remedy next
+to the error. **Verified live:** a dummy-key verify from this sandbox now answers
+`502 NETWORK_UNREACHABLE — "This server could not reach Binance at all … this is an egress/DNS
+problem, not a credential problem"` where it previously answered `401 "Binance rejected these
+credentials"`.
+
+### R4-3 · MEDIUM — there was no way to ask the deployment what was wrong with it
+Diagnosis meant reading logs and guessing. Added `GET /api/config/check` (operator-gated, app-header
+guarded), which reports the verdict, **both** Binance hosts' reachability, whether credentials
+resolved and which class of failure came back, plus `BINANCE_TESTNET`'s raw value, engine state,
+ledger writability and risk policy. The judgement lives in pure, unit-tested `lib/config-check.ts`.
+
+Verdicts: `READY_TESTNET`, `READY_MAINNET`, `LOCKED_OPERATOR_TOKEN_MISSING`, `NO_CREDENTIALS`,
+`CREDENTIALS_REJECTED`, `GEO_BLOCKED`, `BINANCE_UNREACHABLE`, `MAINNET_LOCKED`.
+
+Notably it calls out, as `TESTNET_FLAG_UNSET`, the exact trap from the report: with `BINANCE_TESTNET`
+absent the deployment silently targets testnet paper funds, and the warning explains how to leave it.
+
+**Verified live** on three throwaway instances: keyless → `NO_CREDENTIALS` with
+`TESTNET_FLAG_UNSET` + `ENGINE_DISABLED` warnings; mainnet keys + token → `BINANCE_UNREACHABLE`
+(not a credential rejection) with `MAINNET_LOCKED` as a warning and the endpoint
+`https://fapi.binance.com`; only `BINANCE_API_KEY` set → `PARTIAL_ENV_KEYS` naming the missing half.
+(One bug was caught by these tests before commit: the `PARTIAL_ENV_KEYS` branch was unreachable
+because it required both keys present *and* one missing.)
+
+### Added in this round
+- `lib/binance-errors.ts` + `lib/binance-errors.test.ts` (16 tests), `lib/config-check.ts` +
+  `lib/config-check.test.ts` (14 tests). Suite: 70 → **97**, still no network dependency in any test.
+- README: `/api/config/check` in the API reference, a "something not working" recipe, six new
+  troubleshooting rows (testnet badge trap, `KEY_NETWORK_MISMATCH`, `GEO_BLOCKED`, `IP_NOT_ALLOWED`,
+  `TIMESTAMP_DRIFT`/`SIGNATURE_INVALID`, `BINANCE_UNREACHABLE`).
+- DEPLOYMENT.md §5b: the region requirement (Binance blocks by source-IP region *before*
+  authentication, and Binance.US has no futures platform), the verdict table, and a
+  config-check step in §6.
+
+### Verification for this round
+`npx tsc --noEmit` clean · `npm run lint` clean · `npm test` **97/97** · `NODE_ENV=production next
+build` clean (**15 routes**) · live probes on three instances as above (anonymous `/api/config/check`
+401, signed-in 200, direct browsing 403).
+
+### Confirmed NOT a problem (ruled out with evidence)
+The operator's log also rules out the regional block that this round documents: their scans returned
+real market data for 12 pairs and the authenticated call answered in ~215 ms from
+`request ip: 54.247.26.145` (AWS eu-west-1), so Binance was reachable and answered a genuine `-2015`
+— a credential/flag problem, not HTTP 451.
+
+### Still unproven (unchanged)
+No order has ever been placed against a real exchange from this environment, so bracket acceptance
+and income settlement remain unverified; the strategy still has no backtest or track record. The
+error classifier is unit-tested against Binance's documented responses — a live 451 and a live
+allowlist `-2015` have not been observed here.
 
 ---
 
