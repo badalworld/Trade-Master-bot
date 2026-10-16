@@ -117,6 +117,33 @@ function readState(): LedgerState {
   }
 }
 
+/**
+ * Persistence health, as last observed.
+ *
+ * A failing data directory used to print one identical `[ledger] persist failed:` line per save —
+ * in production that was once every ~15 s, forever, which buries everything else in the log. The
+ * same information is kept here instead: the first failure of each distinct kind is printed, the
+ * rest are counted, and the current state is available to the engine, `/api/engine/status` and
+ * `/api/config/check` so it can be reported once, in the operator's words, with a remedy.
+ */
+export interface LedgerPersistence {
+  /** Where the ledger is being written (or would be). */
+  path: string;
+  /** True while writes succeed: the ledger survives a restart. */
+  durable: boolean;
+  /** Set once a write has actually failed, with the OS error. */
+  error: string | null;
+  /** How many writes have failed since the process started. */
+  failures: number;
+  /** When the last failure happened. */
+  lastFailureAt: number | null;
+}
+
+let persistenceError: string | null = null;
+let persistenceFailures = 0;
+let lastFailureAt: number | null = null;
+let reportedError: string | null = null;
+
 function writeState(snapshot: LedgerState): void {
   try {
     const file = ledgerPath();
@@ -124,10 +151,24 @@ function writeState(snapshot: LedgerState): void {
     const tmp = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 2), 'utf8');
     fs.renameSync(tmp, file); // atomic replace: a crash cannot truncate the ledger
+    persistenceError = null;
+    reportedError = null;
   } catch (err) {
     // Durability is best-effort; the in-memory copy stays authoritative for this process — but
-    // silently losing the ledger is not acceptable either.
-    console.error('[ledger] persist failed:', (err as Error).message);
+    // silently losing the ledger is not acceptable, so the first failure of each kind is surfaced
+    // and everything else is counted.
+    const message = (err as Error).message;
+    persistenceError = message;
+    persistenceFailures += 1;
+    lastFailureAt = Date.now();
+    if (reportedError !== message) {
+      reportedError = message;
+      console.error(
+        `[ledger] persist failed: ${message} — ${path.dirname(ledgerPath())} is not writable. ` +
+          'Positions, compounding and the daily-loss figure now live in memory only and will be lost on restart. ' +
+          'Set TRADE_DATA_DIR to a mounted, writable volume. (Repeated failures are counted, not logged.)'
+      );
+    }
   }
 }
 
@@ -292,6 +333,17 @@ const ledgerImpl = {
       s.network = network;
       writeState(s);
     }
+  },
+
+  /** What persistence is actually doing right now (path, last error, failure count). */
+  persistence(): LedgerPersistence {
+    return {
+      path: ledgerPath(),
+      durable: this.isDurable(),
+      error: persistenceError,
+      failures: persistenceFailures,
+      lastFailureAt,
+    };
   },
 
   /** True when a writable TRADE_DATA_DIR is configured, i.e. state survives a restart. */

@@ -4,7 +4,7 @@ import { classifyError, type BinanceFailure } from '@/lib/binance-errors';
 import { buildConfigCheck, type ReachabilityProbe } from '@/lib/config-check';
 import { engine, loadEngineConfig } from '@/lib/engine';
 import { operatorAuthMode, operatorAuthRequired, operatorTokenConfigured, requireOperator } from '@/lib/operator-auth';
-import { ledger, ledgerPath } from '@/lib/position-ledger';
+import { ledger } from '@/lib/position-ledger';
 import { loadRiskPolicy, policySummary } from '@/lib/risk-policy';
 import { envCredentials, resolveCredentials, sessionStatus } from '@/lib/trade-guard';
 
@@ -47,7 +47,7 @@ export async function GET(req: NextRequest) {
   const engineConfig = loadEngineConfig(env);
   const engineStatus = engine.getStatus();
   const policy = loadRiskPolicy();
-  const dataDir = ledgerPath();
+  const persistence = ledger.persistence();
 
   // ---------------------------------------------------------------- reachability (both hosts)
   const probe = async (testnet: boolean): Promise<ReachabilityProbe> => {
@@ -109,7 +109,12 @@ export async function GET(req: NextRequest) {
     verification: { attempted: verification.attempted, ok: verification.ok, failure: verification.failure },
     reachability: { testnet: testnetReach, mainnet: mainnetReach },
     engine: { enabled: engineConfig.enabled, autoEntry: engineConfig.autoEntry, running: engineStatus.running },
-    ledger: { durable: ledger.isDurable(), path: dataDir },
+    ledger: {
+      durable: persistence.durable,
+      path: persistence.path,
+      error: persistence.error,
+      failures: persistence.failures,
+    },
     policy: {
       halted: policy.halted,
       allowMainnet: policy.allowMainnet,
@@ -160,7 +165,12 @@ export async function GET(req: NextRequest) {
       // this endpoint answers "why is the loop failing and what do I do about it?".
       lastFailure: engineStatus.lastFailure,
     },
-    ledger: { path: dataDir, durable: ledger.isDurable() },
+    ledger: {
+      path: persistence.path,
+      durable: persistence.durable,
+      error: persistence.error,
+      failures: persistence.failures,
+    },
     policy: policySummary(policy),
     blockers,
     issues: result.issues,

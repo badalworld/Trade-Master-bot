@@ -265,3 +265,79 @@ test('a cycle Binance rejects ends up in the status as a diagnosis, not a bare s
 
   freshLedger();
 });
+
+
+// ---------------------------------------------------------------------------------------------
+// The ledger that cannot be written (a Cloud Run instance whose /app is read-only, 2026-10-16).
+// The failure mode was: one identical EACCES line per save forever, no operator-facing explanation,
+// silent automated trading with an in-memory daily-loss counter, and a SIGTERM message claiming the
+// ledger had been "flushed to disk".
+// ---------------------------------------------------------------------------------------------
+test('an unwritable ledger is reported once, blocks entries, and is not claimed as persisted', () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    return new Response(JSON.stringify({ code: -1102, msg: 'rejected' }), { status: 400 });
+  }) as typeof fetch;
+
+  const saved: Record<string, string | undefined> = {};
+  const set = (k: string, v: string | undefined) => {
+    saved[k] = process.env[k];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  };
+  set('TRADE_DATA_DIR', '/dev/null/trade-master');
+  set('BINANCE_API_KEY', 'k');
+  set('BINANCE_API_SECRET', 's');
+  set('BINANCE_TESTNET', 'true');
+  set('TRADE_ENGINE_ENABLED', 'true');
+  set('TRADE_ENGINE_AUTO_ENTRY', 'true');
+  set('TRADE_ENGINE_INTERVAL_MS', '5000');
+  set('TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER', undefined);
+
+  try {
+    freshLedger();
+    const started = engine.start();
+    assert.equal(started.ok, true, started.message);
+
+    const status = engine.getStatus();
+    assert.equal(status.ledgerDurable, false, 'the status must not claim persistence that does not happen');
+    assert.equal(status.ledgerPath, '/dev/null/trade-master/trade-ledger.json');
+    assert.ok(status.ledgerError, 'the OS error is carried in the status, not only in the log');
+    assert.equal(status.config.allowNonDurableLedger, false, 'entries are refused unless explicitly overridden');
+
+    const warning = status.events.find((e) => e.kind === 'LEDGER_NOT_DURABLE');
+    assert.ok(warning, 'the operator gets an explanation, once');
+    assert.match(warning.message, /cannot be written to/);
+    assert.match(warning.message, /TRADE_DATA_DIR/, 'with the knob that fixes it');
+    assert.match(warning.message, /REFUSED/, 'and the consequence for automated entries');
+    assert.equal(
+      status.events.filter((e) => e.kind === 'LEDGER_NOT_DURABLE').length,
+      1,
+      'one explanation, not one per cycle'
+    );
+
+    const stopped = engine.stop('test finished');
+    assert.equal(stopped.ok, true);
+    const stopEvent = engine.getStatus().events.find((e) => e.kind === 'STOPPED');
+    assert.match(stopEvent?.message ?? '', /NOT persisted/, 'the stop message tells the truth');
+    assert.doesNotMatch(stopEvent?.message ?? '', /flushed to disk/);
+  } finally {
+    try {
+      engine.stop('test cleanup');
+    } catch {
+      /* already stopped */
+    }
+    globalThis.fetch = originalFetch;
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    freshLedger();
+  }
+});
+
+test('the ephemeral-ledger override is explicit and reachable from env', () => {
+  const c = loadEngineConfig({ TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER: 'true' });
+  assert.equal(c.allowNonDurableLedger, true);
+  assert.equal(loadEngineConfig({}).allowNonDurableLedger, false, 'off unless asked for');
+});

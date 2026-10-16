@@ -185,3 +185,41 @@ test('isDurable reports the truth about the mount', () => {
   process.env.TRADE_DATA_DIR = previous;
   fs.rmSync(blocked, { recursive: true, force: true });
 });
+
+
+// ---------------------------------------------------------------------------------------------
+// Persistence health. Production showed one identical `[ledger] persist failed: EACCES` line per
+// save (every ~15s, forever) on a Cloud Run instance whose /app is read-only, and a SIGTERM message
+// claiming the ledger had been "flushed to disk" when nothing had been written at all.
+// ---------------------------------------------------------------------------------------------
+
+test('a writable data dir reports durable, with no error', () => {
+  process.env.TRADE_DATA_DIR = dir;
+  const health = ledger.persistence();
+  assert.equal(health.durable, true);
+  assert.equal(health.error, null);
+  assert.equal(health.failures, 0);
+  assert.match(health.path, /trade-ledger\.json$/);
+});
+
+test('an unwritable data dir is reported as not durable, with the OS error and a failure count', () => {
+  // A read-only location that cannot be created by anyone (a file, not a directory, in the path).
+  process.env.TRADE_DATA_DIR = '/dev/null/trade-master';
+  try {
+    ledger.__reset();
+    ledger.upsert(position());
+    ledger.flush();
+
+    const health = ledger.persistence();
+    assert.equal(health.durable, false, 'a read-only path is never durable');
+    assert.ok(health.error, 'the OS error is kept, not just printed once');
+    assert.ok(health.failures >= 1, 'failures are counted so the status can show a rate');
+    assert.ok(health.lastFailureAt && health.lastFailureAt > 0);
+
+    // The write failure must not take the process down: the in-memory ledger stays authoritative.
+    assert.equal(ledger.list().length, 1, 'the position is still tracked in memory');
+  } finally {
+    process.env.TRADE_DATA_DIR = dir;
+    ledger.__reset();
+  }
+});
