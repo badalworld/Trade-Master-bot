@@ -92,6 +92,8 @@ interface Props {
   loading: boolean;
   error: string | null;
   onAction: (action: 'start' | 'stop' | 'halt-entries' | 'resume-entries' | 'flatten-all') => Promise<string | null>;
+  /** Turns server-side entry automation on/off; returns an error string when it was refused. */
+  onToggleAutopilot: (enabled: boolean, confirm?: string) => Promise<string | null>;
   onRefresh: () => void;
 }
 
@@ -103,7 +105,7 @@ const fmtAgo = (ts: number | null, now: number): string => {
   return `${Math.floor(s / 3600)}h ago`;
 };
 
-export function EngineStatusPanel({ state, loading, error, onAction, onRefresh }: Props) {
+export function EngineStatusPanel({ state, loading, error, onAction, onToggleAutopilot, onRefresh }: Props) {
   const [busy, setBusy] = useState<string | null>(null);
   // Clock kept in state so rendering stays pure (no Date.now() during render).
   const [now, setNow] = useState<number>(0);
@@ -113,6 +115,18 @@ export function EngineStatusPanel({ state, loading, error, onAction, onRefresh }
   }, []);
   const [actionError, setActionError] = useState<string | null>(null);
   const [confirmFlatten, setConfirmFlatten] = useState<boolean>(false);
+  const [confirmAutopilot, setConfirmAutopilot] = useState<boolean>(false);
+  const [togglingAutopilot, setTogglingAutopilot] = useState<boolean>(false);
+
+  const toggleAutopilot = async (enabled: boolean) => {
+    setTogglingAutopilot(true);
+    setActionError(null);
+    const needsConfirm = enabled && state?.engine.network === 'mainnet';
+    const message = await onToggleAutopilot(enabled, needsConfirm ? 'ENABLE_AUTOPILOT' : undefined);
+    setTogglingAutopilot(false);
+    setConfirmAutopilot(false);
+    if (message) setActionError(message);
+  };
 
   // Until the ticker fires, age against the server's own read timestamp.
   const nowMs = now || (state?.timestamp ?? 0);
@@ -160,6 +174,54 @@ export function EngineStatusPanel({ state, loading, error, onAction, onRefresh }
             <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
             refresh
           </button>
+        </div>
+
+        <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-[11px] font-semibold text-slate-200">
+                Autopilot — no manual step in the loop
+              </p>
+              <p className="text-[10.5px] text-slate-500 font-mono mt-0.5">
+                1. paste Binance API key → 2. press Start → 3. nothing else. Scan, entry sizing,
+                leverage, TP + SL brackets, close on breach, compounding and the ledger all run by
+                themselves; every order still passes the server-side risk policy.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                const next = !Boolean(e?.config.autoEntry);
+                if (next && e?.network === 'mainnet' && !confirmAutopilot) {
+                  setConfirmAutopilot(true);
+                  return;
+                }
+                void toggleAutopilot(next);
+              }}
+              disabled={togglingAutopilot || !e?.enabled}
+              title={
+                e?.enabled
+                  ? 'When on, the server loop opens positions too, without a browser tab. When off it only protects and settles.'
+                  : 'Set TRADE_ENGINE_ENABLED=true on the server to use the unattended loop'
+              }
+              className={`relative shrink-0 px-3 py-1.5 text-[11px] font-semibold rounded-md border transition-colors flex items-center gap-2 ${
+                e?.config.autoEntry
+                  ? 'bg-emerald-500/15 border-emerald-500/60 text-emerald-300 hover:bg-emerald-500/25'
+                  : 'bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800'
+              } disabled:opacity-40`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${e?.config.autoEntry ? 'bg-emerald-400' : 'bg-slate-500'}`}
+              />
+              {togglingAutopilot
+                ? 'Applying…'
+                : confirmAutopilot
+                  ? 'Click again to confirm MAINNET entries'
+                  : e?.config.autoEntry
+                    ? 'Trading automatically'
+                    : 'Guardian only — enable full autopilot'}
+            </button>
+          </div>
         </div>
 
         {!e ? (

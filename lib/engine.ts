@@ -183,10 +183,14 @@ class TradeEngine {
     ledger.setNetwork(network);
 
     const config = loadEngineConfig();
+    // Entries may also be switched on from the app itself (persisted), so "fully automated" does not
+    // require redeploying with a new environment variable every time.
+    const persistedAutopilot = ledger.getAutopilot().serverEntries && (!ledger.getNetwork() || ledger.getNetwork() === network);
+    const effective = { ...config, autoEntry: config.autoEntry || persistedAutopilot };
     ledger.setPolicyInputs(config.baseMargin, config.compoundingPercent);
     this.status = {
       ...this.status,
-      config,
+      config: effective,
       running: true,
       credentialSource: 'env',
       network,
@@ -198,9 +202,9 @@ class TradeEngine {
     this.log(
       'SUCCESS',
       'STARTED',
-      `Guardian loop active on ${creds.isTestnet ? 'testnet' : 'MAINNET'} every ${Math.round(config.intervalMs / 1000)}s · auto-entry ${config.autoEntry ? 'ON' : 'OFF (default)'} · bracket enforcement ${config.enforceBrackets ? 'ON' : 'OFF'}`
+      `Guardian loop active on ${creds.isTestnet ? 'testnet' : 'MAINNET'} every ${Math.round(config.intervalMs / 1000)}s · auto-entry ${effective.autoEntry ? `ON (${config.autoEntry ? 'env' : 'autopilot switch'})` : 'OFF (guardian only)'} · bracket enforcement ${effective.enforceBrackets ? 'ON' : 'OFF'}`
     );
-    if (!creds.isTestnet && !config.autoEntry) {
+    if (!creds.isTestnet && !effective.autoEntry) {
       this.log('WARN', 'MAINNET_GUARDIAN', 'Guardian is running against MAINNET: it can close positions but will not open them unless TRADE_ENGINE_AUTO_ENTRY=true.');
     }
     return { ok: true, message: 'Engine started' };
@@ -216,6 +220,44 @@ class TradeEngine {
     return { ok: true, message: `Engine ${reason}` };
   }
 
+  /**
+   * Flip server-side entries without a redeploy. Turning it on is refused while the engine is not
+   * running against a network whose order gate is closed, because the switch must never become a way
+   * to sneak past `TRADE_ALLOW_MAINNET` - that check still runs on every single order.
+   */
+  setAutoEntry(enabled: boolean, confirm?: string): { ok: boolean; message: string; requiresConfirm?: boolean } {
+    const envEnabled = loadEngineConfig().autoEntry;
+    // Which network would this setting actually trade on? The status field cannot answer that: before
+    // the first start it still holds the safe default, so keying the confirmation off it let
+    // "unattended MAINNET entries" be armed on an idle engine with nobody confirming anything.
+    const creds = this.creds();
+    if (enabled && !creds) {
+      return {
+        ok: false,
+        message:
+          'Nothing to enable: the unattended loop needs BINANCE_API_KEY / BINANCE_API_SECRET on the server ' +
+          '(a browser session cannot outlive the tab).',
+      };
+    }
+    const network = creds && !creds.isTestnet ? ('mainnet' as const) : ('testnet' as const);
+    if (enabled && network === 'mainnet' && !envEnabled && String(confirm ?? '').trim().toUpperCase() !== 'ENABLE_AUTOPILOT') {
+      return {
+        ok: false,
+        requiresConfirm: true,
+        message:
+          'Enabling unattended MAINNET entries needs an explicit confirmation (and TRADE_ALLOW_MAINNET must ' +
+          'already be true). Re-send with confirm:"ENABLE_AUTOPILOT".',
+      };
+    }
+    ledger.setAutopilot({ serverEntries: enabled });
+    this.status = { ...this.status, config: { ...this.status.config, autoEntry: enabled || envEnabled } };
+    const message = enabled
+      ? `Server-side entries on ${network} ${this.running ? 'enabled' : 'saved; they start with the next engine start'}: the loop will scan, open and bracket positions on its own (all still bounded by the risk policy).`
+      : `Server-side entries ${this.running ? 'disabled; the loop is guardian-only again' : 'cleared from the saved settings'}.`;
+    this.log(enabled ? 'WARN' : 'INFO', enabled ? 'AUTOPILOT_ON' : 'AUTOPILOT_OFF', message);
+    return { ok: true, message };
+  }
+
   setHaltEntries(halt: boolean): { ok: boolean; message: string } {
     this.haltEntries = halt;
     this.status = { ...this.status, entriesHalted: halt };
@@ -226,12 +268,18 @@ class TradeEngine {
   getStatus(): EngineStatus {
     // Durability and policy are read live, so a stopped engine still reports the truth about the
     // mount it *would* write to (a start-time snapshot showed "in-process only" even when /data exists).
+    // `autoEntry` is the exception: it is a runtime switch, so env alone would hide it (and a dashboard
+    // that lies about whether the bot trades by itself is worse than a stale one).
+    const envConfig = loadEngineConfig();
+    const autoEntry = this.running
+      ? this.status.config.autoEntry
+      : envConfig.autoEntry || ledger.getAutopilot().serverEntries;
     return {
       ...this.status,
       events: this.events,
       entriesHalted: this.haltEntries || loadRiskPolicy().halted,
       ledgerDurable: ledger.isDurable(),
-      config: loadEngineConfig(),
+      config: { ...envConfig, autoEntry },
     };
   }
 

@@ -147,6 +147,32 @@ test('patches merge without dropping engine metadata', () => {
   assert.equal(ledger.get('NOPEUSDT'), undefined);
 });
 
+test('the autopilot switch survives a restart, and defaults to off', () => {
+  fresh();
+  assert.deepEqual(ledger.getAutopilot(), { serverEntries: false }, 'a fresh ledger must not trade unattended by accident');
+
+  ledger.setAutopilot({ serverEntries: true });
+  ledger.flush();
+  ledger.__reload();
+  assert.equal(ledger.getAutopilot().serverEntries, true, 'automation that resets on deploy is not automation');
+
+  ledger.setAutopilot({ serverEntries: false });
+  ledger.flush();
+  ledger.__reload();
+  assert.equal(ledger.getAutopilot().serverEntries, false);
+});
+
+test('a ledger file predating the autopilot field still loads', () => {
+  fresh();
+  fs.writeFileSync(
+    path.join(dir, 'trade-ledger.json'),
+    JSON.stringify({ version: 1, network: 'testnet', positions: {}, closedTrades: [] }),
+    'utf8'
+  );
+  ledger.__reload();
+  assert.deepEqual(ledger.getAutopilot(), { serverEntries: false });
+});
+
 test('isDurable reports the truth about the mount', () => {
   fresh();
   assert.equal(ledger.isDurable(), true);

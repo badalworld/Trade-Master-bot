@@ -300,3 +300,79 @@ with a leveraged position on the books, which is precisely when bad safety code 
    not managed). Never enable `TRADE_ENGINE_AUTO_ENTRY` on an ephemeral filesystem.
 4. **The strategy itself is unproven**: still no backtest and no closed-trade history. This is now a
    measurement gap, not a code defect — the ledger will produce that history on testnet.
+
+---
+
+# Phase 3 — "fully automated" made true, and the UI scoped to one page
+
+Requested behaviour: *the user pastes a Binance API key, presses Start, and the bot does everything —
+market scan, trade execution, TP/SL, closes. No manual task.* That claim was tested against the code
+rather than accepted, and both halves of it needed work.
+
+## Verified: what is automatic after pressing Start
+
+| Step | Who does it | Evidence |
+|---|---|---|
+| Scan the allowlist (HVN profile + absorption + stacked imbalance, 5m) | `runMarketScan` on the 15 s interval; server-side `scanUniverse` when the engine runs | no click path exists to "approve" a scan |
+| Position sizing (LOT_SIZE / MIN_NOTIONAL / tick rounding) | `lib/order-executor.ts` only | fail-closed: no `exchangeInfo` ⇒ `422`, no order |
+| Risk policy (margin/leverage/notional/cap/daily loss/allowlist/mainnet gate) | `validateOpenRequest` inside the executor, so **both** UI and engine pass through it | `POLICY_BLOCKED` probes above |
+| Entry order → read the fill → place STOP_MARKET + TAKE_PROFIT_MARKET | `openPosition`; a stop that cannot be placed triggers auto-flatten | B1 remediation |
+| TP/SL monitoring and closing | browser 2 s monitor for UI-owned trades; engine guardian for engine-owned ones; the exchange brackets always | `engineManagedRef` stand-down prevents double closes |
+| Ledger, realized PnL, +20 % compounding | `recordClose` (settled from Binance income when the engine closes) | `position-ledger.test.ts` |
+
+Nothing in that list requires a human between Start and the closed trade. What *was* manual, and is
+now fixed, is the part outside the tab — see below.
+
+## The one remaining manual step, removed
+
+Server-side unattended entries previously needed `TRADE_ENGINE_AUTO_ENTRY=true` **plus a redeploy**,
+which contradicts "no manual task". There is now an **Autopilot** switch in the engine panel
+(`POST /api/engine/control {"action":"set-auto-entry","enabled":true}`), persisted in the ledger as
+`autopilot.serverEntries`, and re-applied on every start. Proved live: enabled through the API,
+process killed, restarted →
+
+```
+[engine:success] STARTED: Guardian loop active on testnet every 12s · auto-entry ON (autopilot switch) · bracket enforcement ON
+```
+
+The env var remains the floor (if it is `true`, the UI cannot switch entries off), and the switch still
+cannot bypass `TRADE_ALLOW_MAINNET`, the symbol allowlist or any cap — it only decides whether the loop
+is allowed to *try*.
+
+## Two defects found while wiring it (both fixed, both with tests)
+
+1. **The dashboard could not see the switch it had just flipped.** `getStatus()` was re-reading
+   `loadEngineConfig()` wholesale, so the runtime override was overwritten by env on every read:
+   autopilot was genuinely ON (log showed `AUTOPILOT_ON`, entries were being attempted) while the API
+   answered `autoEntry: false`. A monitoring surface that contradicts the thing it monitors is worse
+   than none, so `autoEntry` is now overlaid explicitly, and while the loop is idle `getStatus()`
+   reports what the *next start would do* rather than the env default.
+2. **Unattended MAINNET entries could be armed with no confirmation.** The confirm requirement keyed
+   off `engine.getStatus().network`, which is still the safe `'testnet'` default on an engine that has
+   never started — so a fresh instance with mainnet keys and the loop idle accepted
+   `set-auto-entry {enabled:true}` silently (observed: HTTP 200, `autopilot.serverEntries: true`
+   written to disk). The decision now lives in `engine.setAutoEntry`, derives the network from the
+   credentials that *would* be used, and requires `confirm:"ENABLE_AUTOPILOT"` (HTTP 428 without it).
+   While there: `enabled` is parsed strictly — `{"enabled":"maybe"}` used to mean "off", which is a
+   silent no-op a UI bug could hide behind; it is now `400 ENABLE_REQUIRED`.
+
+## UI scope change
+
+The interactive 3D telemetry cards (balance, equity, fees, funding, realized PnL, win rate, positions,
+next margin, API weight, scan cycle) were rendered above the tabs, so they appeared on every screen
+including Settings. They now render only on the first tab (the terminal), where the numbers belong.
+The footer no longer repeats configuration values — margin/leverage are live settings shown in
+Settings and in the KPI strip, and duplicating them in a footer invites the reader to trust a number
+that may not match what the server will actually accept. The footer is now the copyright/credit line.
+
+## Status
+
+`tsc` 0 errors · `eslint` 0 problems · `node --test` **49/49** (7 new: 2 ledger autopilot, 5 engine
+gating) · `next build` clean. Live probes: `400 ENABLE_REQUIRED` on missing/bogus `enabled`, `200` +
+`autoEntry:true` in status + persisted flag on testnet, refusal-and-confirm shape on mainnet, cards
+absent from the Settings-tab SSR HTML, new footer present in it.
+
+The blocking condition for real money is unchanged and cannot be changed by code written in a sandbox
+that cannot reach the exchange: **no Binance response has been parsed by this code, and the strategy
+has no profitable-trade history or backtest.** Full automation makes that soak *more* important, not
+less — an unattended loop that trades badly is worse than a manual one.

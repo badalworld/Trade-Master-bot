@@ -625,6 +625,25 @@ export default function HomePage() {
     }
   }, []);
 
+  /** One switch, no redeploy: let the server open trades unattended (still fully policy-gated). */
+  const handleToggleAutopilot = useCallback(
+    async (enabled: boolean, confirm?: string): Promise<string | null> => {
+      const { ok, data } = await apiPost<Record<string, unknown>>('/api/engine/control', {
+        action: 'set-auto-entry',
+        enabled,
+        ...(confirm ? { confirm } : {}),
+      });
+      await refreshEngineStatus();
+      appendLog(
+        'SYSTEM',
+        ok ? (enabled ? 'WARN' : 'INFO') : 'ERROR',
+        `Autopilot: ${String(data.message ?? data.error ?? 'no response')}`
+      );
+      return ok ? null : String(data.error ?? data.message ?? 'Could not change autopilot state');
+    },
+    [appendLog, refreshEngineStatus]
+  );
+
   // Execute a position close on Binance and record trade history + compounding
   const finalizePositionClose = useCallback(
     async (
@@ -1436,7 +1455,8 @@ export default function HomePage() {
 
       {/* 2. Main Terminal Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6">
-        {/* KPI Performance Strip */}
+        {/* KPI telemetry cards belong to the terminal (1st page) only — other tabs are focused views */}
+        {activeTab === 'positions' && (
         <KpiMetricsStrip
           totalPnl={totalPnl}
           totalPnlPercent={totalPnlPercent}
@@ -1454,6 +1474,7 @@ export default function HomePage() {
           botActive={botActive}
           binanceAccount={binanceAccount}
         />
+        )}
 
         {/* Tab 1: Active Positions Dashboard, PnL Chart & Selected Symbol Order Flow Chart */}
         {activeTab === 'positions' && (
@@ -1464,6 +1485,7 @@ export default function HomePage() {
               error={engineError}
               onAction={handleEngineAction}
               onRefresh={onRefreshEngine}
+              onToggleAutopilot={handleToggleAutopilot}
             />
             {!engineState?.engine?.running && (
               <div className="flex items-start gap-2 p-3 rounded-lg border border-amber-800/70 bg-amber-950/30 text-[11px] text-amber-200">
@@ -1579,8 +1601,16 @@ export default function HomePage() {
       </main>
 
       {/* Footer */}
-      <footer className="border-t border-slate-900 bg-slate-950 py-4 px-6 text-center text-xs text-slate-500 font-mono">
-        Trade Master · Binance Futures Terminal · ${settings.baseMargin.toFixed(2)} Base Margin · {settings.leverage}x Isolated (10x–15x)
+      <footer className="border-t border-slate-900 bg-slate-950 py-5 px-6 text-center">
+        <p className="text-xs text-slate-500 font-mono">
+          © 2026 All Rights Reserved. Design &amp; Development by{' '}
+          <a
+            href="mailto:badalworld@gmail.com"
+            className="text-cyan-400 hover:text-cyan-300 underline-offset-2 hover:underline transition-colors"
+          >
+            Badalworld
+          </a>
+        </p>
       </footer>
 
       {/* Full-Screen Trade Result Celebration / Sad Mode Overlay */}

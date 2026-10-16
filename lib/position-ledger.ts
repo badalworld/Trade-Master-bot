@@ -51,6 +51,12 @@ export interface LedgerState {
    * accounts, and treating them as the same is how someone's real position gets closed by accident.
    */
   network: 'testnet' | 'mainnet' | null;
+  /**
+   * Operator switches that must survive a restart, because "fully automated" that resets to manual
+   * on every deploy is not automated. Kept separate from config (which comes from env) so a UI
+   * toggle can never look like a credential change.
+   */
+  autopilot: { serverEntries: boolean };
 }
 
 export const DEFAULT_COMPOUNDING: CompoundingState = {
@@ -80,6 +86,7 @@ function emptyState(): LedgerState {
     realizedPnlTodayUsdt: 0,
     pnlDay: utcDay(now),
     network: null,
+    autopilot: { serverEntries: false },
   };
 }
 
@@ -98,6 +105,7 @@ function readState(): LedgerState {
     if (!state.positions || typeof state.positions !== 'object') state.positions = {};
     if (!Array.isArray(state.closedTrades)) state.closedTrades = [];
     state.compounding = { ...DEFAULT_COMPOUNDING, ...(state.compounding ?? {}) };
+    state.autopilot = { serverEntries: Boolean(state.autopilot?.serverEntries) };
     // A stale day's realized PnL must not keep the loss breaker tripped forever.
     if (state.pnlDay !== utcDay(Date.now())) {
       state.pnlDay = utcDay(Date.now());
@@ -253,6 +261,16 @@ const ledgerImpl = {
       s.startedAt = Date.now();
     }
     if (Number.isFinite(value)) s.realizedPnlTodayUsdt = Number(value.toFixed(4));
+    touch();
+  },
+
+  getAutopilot(): { serverEntries: boolean } {
+    return { ...ensure().autopilot };
+  },
+
+  setAutopilot(patch: Partial<{ serverEntries: boolean }>): void {
+    const stateNow = ensure();
+    stateNow.autopilot = { ...stateNow.autopilot, ...patch };
     touch();
   },
 

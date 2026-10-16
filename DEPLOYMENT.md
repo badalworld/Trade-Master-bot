@@ -116,9 +116,13 @@ be ignored when they are not met):
   but not managed). NFS Filestore / a PVC / a mounted disk is required for real unattended use.
 - **Server-side credentials only.** The loop reads `BINANCE_API_KEY`/`BINANCE_API_SECRET` from the
   environment; a browser session cannot outlive the tab, so by design it will not start without them.
-- **Start guardian-only.** `TRADE_ENGINE_AUTO_ENTRY=false` means it can only *reduce* risk (close,
-  re-arm, settle) — it never opens a position. Turn auto-entry on only after you have watched the
-  guardian's log for a while.
+- **Start guardian-only, then decide.** `TRADE_ENGINE_AUTO_ENTRY=false` means the loop can only *reduce*
+  risk (close, re-arm, settle) — it never opens a position. The same switch is exposed in the app
+  (Positions tab → **Autopilot**) and persisted in the ledger, so enabling full automation is one click
+  instead of a redeploy, and it survives restarts — which is the whole point of unattended trading.
+  On MAINNET that button will not arm anything without a second confirming click, and
+  `TRADE_ALLOW_MAINNET=true` must already be set, because "the bot opened a trade I never asked for" is
+  precisely the failure these gates exist to prevent.
 
 **Interaction with the browser tab.** A trade opened from the UI is registered with the engine
 (`/api/engine/track`), so closing the tab does not orphan it. While the engine reports it owns a
@@ -135,6 +139,7 @@ re-booked locally.
 | Start / stop the loop | `POST /api/engine/control {"action":"start"}` |
 | Stop opening, keep protecting | `POST /api/engine/control {"action":"halt-entries"}` |
 | Close everything the engine owns | `POST /api/engine/control {"action":"flatten-all","confirm":"FLATTEN"}` |
+| Arm / disarm unattended entries | `POST /api/engine/control {"action":"set-auto-entry","enabled":true}` (MAINNET also needs `"confirm":"ENABLE_AUTOPILOT"`) |
 
 **What this does *not* fix.** It is not a hosted strategy service: there is still no database, no
 multi-user isolation, no alerting, and no recovery if the instance is replaced mid-cycle (the exchange
