@@ -1,0 +1,6 @@
+{
+  "name": "Trade Master",
+  "description": "Automated Binance Futures algorithmic trading bot scanning 5m candles every 15 seconds with a 3-indicator strategy, dynamic TP/SL, profit compounding, and API rate-limit defense.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
