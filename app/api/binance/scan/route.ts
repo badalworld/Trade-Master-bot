@@ -21,28 +21,24 @@ const DEFAULT_PAIRS = [
   'PEPEUSDT',
 ];
 
-export async function GET(req: NextRequest) {
-  const url = new URL(req.url);
-  const requestedPairs = url.searchParams.get('pairs')?.split(',') || DEFAULT_PAIRS;
-  const maxScanCount = Math.min(requestedPairs.length, 12);
-  const targetPairs = requestedPairs.slice(0, maxScanCount);
+async function fetchPairCandles(
+  baseUrl: string,
+  pair: string
+): Promise<{ pair: string; candles: Candle[]; weight: number }> {
+  const symbolsToTry = pair === 'PEPEUSDT' ? ['PEPEUSDT', '1000PEPEUSDT'] : [pair];
+  let highestWeight = 0;
 
-  let usedWeight = 42;
-  const evaluatedSignals: SignalEvaluation[] = [];
-  const rawCandlesMap: Record<string, Candle[]> = {};
-
-  for (const pair of targetPairs) {
-    let candles: Candle[] = [];
-
+  for (const sym of symbolsToTry) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 2500);
+      const timeout = setTimeout(() => controller.abort(), 3000);
 
       const res = await fetch(
-        `https://fapi.binance.com/fapi/v1/klines?symbol=${pair}&interval=5m&limit=35`,
+        `${baseUrl}/fapi/v1/klines?symbol=${sym}&interval=5m&limit=40`,
         {
           signal: controller.signal,
           headers: { 'User-Agent': 'TradeMaster-LiveScanner/1.0' },
+          cache: 'no-store',
         }
       );
       clearTimeout(timeout);
@@ -50,37 +46,82 @@ export async function GET(req: NextRequest) {
       const weightHeader = res.headers.get('x-mbx-used-weight-1m');
       if (weightHeader) {
         const parsedWeight = parseInt(weightHeader, 10);
-        if (!isNaN(parsedWeight) && parsedWeight > usedWeight) {
-          usedWeight = parsedWeight;
+        if (!isNaN(parsedWeight) && parsedWeight > highestWeight) {
+          highestWeight = parsedWeight;
         }
       }
 
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data) && data.length > 0) {
-          candles = data.map((item: (number | string)[]) => ({
+        if (Array.isArray(data) && data.length >= 25) {
+          const now = Date.now();
+          const candles: Candle[] = data.map((item: (number | string)[]) => ({
             time: Number(item[0]),
             open: parseFloat(String(item[1])),
             high: parseFloat(String(item[2])),
             low: parseFloat(String(item[3])),
             close: parseFloat(String(item[4])),
             volume: parseFloat(String(item[5])),
+            takerBuyVolume: item[9] !== undefined ? parseFloat(String(item[9])) : undefined,
+            isClosed: item[6] !== undefined ? now >= Number(item[6]) : true,
           }));
+          return { pair, candles, weight: highestWeight };
         }
       }
     } catch {
-      // If public Binance API fails to respond, return empty or skip offline mock candles
-    }
-
-    if (candles.length >= 25) {
-      rawCandlesMap[pair] = candles;
-      const signal = evaluate3IndicatorSignal(pair, candles);
-      evaluatedSignals.push(signal);
+      // Try fallback symbol or return empty
     }
   }
 
-  evaluatedSignals.sort((a, b) => b.volatilityPercent - a.volatilityPercent);
-  const rateLimitStatus = checkRateLimit(usedWeight, 1200);
+  return { pair, candles: [], weight: highestWeight };
+}
+
+export async function GET(req: NextRequest) {
+  const url = new URL(req.url);
+  const requestedPairs = url.searchParams.get('pairs')?.split(',') || DEFAULT_PAIRS;
+  const isTestnet = url.searchParams.get('testnet') === 'true';
+  const safetyCapParam = parseFloat(url.searchParams.get('safetyCap') || '95');
+  const safetyCapRatio = !isNaN(safetyCapParam) && safetyCapParam > 0 ? safetyCapParam / 100 : 0.95;
+
+  const baseUrl = isTestnet
+    ? 'https://testnet.binancefuture.com'
+    : 'https://fapi.binance.com';
+
+  const maxScanCount = Math.min(requestedPairs.length, 12);
+  const targetPairs = requestedPairs.slice(0, maxScanCount);
+
+  let usedWeight = 24;
+  const evaluatedSignals: SignalEvaluation[] = [];
+  const rawCandlesMap: Record<string, Candle[]> = {};
+
+  // Parallelized kline fetching across all target pairs for low latency
+  const results = await Promise.allSettled(
+    targetPairs.map((pair) => fetchPairCandles(baseUrl, pair.trim().toUpperCase()))
+  );
+
+  for (const res of results) {
+    if (res.status === 'fulfilled') {
+      const { pair, candles, weight } = res.value;
+      if (weight > usedWeight) {
+        usedWeight = weight;
+      }
+      if (candles.length >= 25) {
+        rawCandlesMap[pair] = candles;
+        const signal = evaluate3IndicatorSignal(pair, candles);
+        evaluatedSignals.push(signal);
+      }
+    }
+  }
+
+  // Sort by high volatility (with tie-breaking on signal score)
+  evaluatedSignals.sort((a, b) => {
+    if (Math.abs(b.volatilityPercent - a.volatilityPercent) > 0.05) {
+      return b.volatilityPercent - a.volatilityPercent;
+    }
+    return b.score - a.score;
+  });
+
+  const rateLimitStatus = checkRateLimit(usedWeight, 1200, safetyCapRatio);
 
   return NextResponse.json({
     timestamp: Date.now(),

@@ -5,6 +5,7 @@ import { Header } from '@/components/Header';
 import { KpiMetricsStrip, type BinanceAccountMetrics } from '@/components/KpiMetricsStrip';
 import { ActivePositions } from '@/components/ActivePositions';
 import { ScannerTable } from '@/components/ScannerTable';
+import { InteractiveChart } from '@/components/InteractiveChart';
 import { TradeHistory } from '@/components/TradeHistory';
 import { DiagnosticsLog, type LogEntry } from '@/components/DiagnosticsLog';
 import { SettingsView, type BotSettings } from '@/components/SettingsView';
@@ -15,6 +16,7 @@ import {
   calculateNextTradeMargin,
   canOpenNewTrade,
   checkRateLimit,
+  roundCryptoPrice,
   type SignalEvaluation,
   type TradePosition,
   type ClosedTrade,
@@ -34,20 +36,19 @@ const STORAGE_KEYS = {
   BINANCE_ACCOUNT: 'trade_master_binance_account_v1',
 };
 
-// Initial default settings matching user requirements
+// Initial default settings matching user requirements ($2 Base Margin, 10x-15x Isolated Leverage)
 const DEFAULT_SETTINGS: BotSettings = {
   apiKey: '',
   apiSecret: '',
   isTestnet: false,
-  baseMargin: 2.0, // $2 margin
-  leverage: 10, // 10x leverage
+  baseMargin: 2.0, // $2.00 base margin
+  leverage: 10, // 10x isolated leverage (10x-15x supported)
   maxOpenTrades: 5, // max 5 concurrent trades
   compoundingPercent: 20, // 20% of profit amount
   scanIntervalSeconds: 15, // 15s scan
   rateLimitSafetyCap: 95, // 95% threshold
 };
 
-// Initial state for fresh start
 const INITIAL_POSITIONS: TradePosition[] = [];
 const INITIAL_TRADES: ClosedTrade[] = [];
 
@@ -57,7 +58,7 @@ const INITIAL_LOGS: LogEntry[] = [
     timestamp: new Date().toLocaleTimeString(),
     category: 'SYSTEM',
     severity: 'INFO',
-    message: 'Trade Master terminal initialized. Auto-persistence active.',
+    message: 'Trade Master terminal initialized ($2.00 Base Margin · 10x–15x Isolated · 3-Indicator TP/SL).',
   },
   {
     id: 'log-2',
@@ -97,6 +98,7 @@ export default function HomePage() {
 
   // Positions & Compounding
   const [positions, setPositions] = useState<TradePosition[]>(INITIAL_POSITIONS);
+  const [closingPositionId, setClosingPositionId] = useState<string | null>(null);
   const [closedTrades, setClosedTrades] = useState<ClosedTrade[]>(INITIAL_TRADES);
   const [compoundingState, setCompoundingState] = useState<CompoundingState>({
     baseMargin: 2.0,
@@ -109,13 +111,13 @@ export default function HomePage() {
 
   // Rate Limiting & Logs
   const [rateLimitStatus, setRateLimitStatus] = useState<RateLimitStatus>({
-    usedWeight: 84,
+    usedWeight: 24,
     maxLimit: 1200,
-    usageRatio: 0.07,
-    usagePercent: 7.0,
+    usageRatio: 0.02,
+    usagePercent: 2.0,
     isSafe: true,
     isThrottled: false,
-    remainingWeight: 1056,
+    remainingWeight: 1116,
   });
   const [logs, setLogs] = useState<LogEntry[]>(INITIAL_LOGS);
 
@@ -134,6 +136,27 @@ export default function HomePage() {
 
   // Full Screen Celebration / Sad Mode Modal on Trade Close
   const [tradeResultModal, setTradeResultModal] = useState<TradeResultPayload | null>(null);
+
+  // Track in-flight automated closes so a single position isn't closed twice concurrently
+  const closingIdsRef = useRef<Set<string>>(new Set());
+
+  // Global Interactive Mouse-Move Spotlight & Button Glow Tracker (Jitter Interactive-Button-Glow)
+  useEffect(() => {
+    const handlePointerMove = (e: PointerEvent) => {
+      const hoveredEls = document.querySelectorAll<HTMLElement>(
+        '.neon-section:hover, .neon-card:hover, .interactive-glow-btn:hover'
+      );
+      hoveredEls.forEach((el) => {
+        const rect = el.getBoundingClientRect();
+        el.style.setProperty('--mouse-x', `${e.clientX - rect.left}px`);
+        el.style.setProperty('--mouse-y', `${e.clientY - rect.top}px`);
+        el.style.setProperty('--spotlight-opacity', '1');
+      });
+    };
+
+    window.addEventListener('pointermove', handlePointerMove, { passive: true });
+    return () => window.removeEventListener('pointermove', handlePointerMove);
+  }, []);
 
   // Helper to append logs (instantly persists up to 500 entries so logs are never lost on restart)
   const appendLog = useCallback(
@@ -169,9 +192,15 @@ export default function HomePage() {
     const timer = setTimeout(() => {
       try {
         const savedSettings = localStorage.getItem(STORAGE_KEYS.SETTINGS);
+        let parsedSettings: Partial<BotSettings> | null = null;
         if (savedSettings) {
-          const parsed = JSON.parse(savedSettings);
-          setSettings((prev) => ({ ...prev, ...parsed }));
+          parsedSettings = JSON.parse(savedSettings);
+          setSettings((prev) => ({
+            ...prev,
+            ...parsedSettings,
+            baseMargin: Number(parsedSettings?.baseMargin) || 2.0,
+            leverage: Math.min(15, Math.max(10, Number(parsedSettings?.leverage) || 10)),
+          }));
         }
 
         const savedAccount = localStorage.getItem(STORAGE_KEYS.BINANCE_ACCOUNT);
@@ -195,7 +224,27 @@ export default function HomePage() {
         const savedCompounding = localStorage.getItem(STORAGE_KEYS.COMPOUNDING);
         if (savedCompounding) {
           const parsed = JSON.parse(savedCompounding);
-          setCompoundingState((prev) => ({ ...prev, ...parsed }));
+          const restoredBase = Number(parsedSettings?.baseMargin ?? parsed.baseMargin) || 2.0;
+          const restoredCompPct = Number(parsedSettings?.compoundingPercent ?? parsed.compoundingPercent) || 20;
+          setCompoundingState((prev) => ({
+            ...prev,
+            ...parsed,
+            baseMargin: restoredBase,
+            compoundingPercent: restoredCompPct,
+            currentMargin:
+              (parsed.consecutiveWins || 0) === 0
+                ? restoredBase
+                : Math.max(restoredBase, Number(parsed.currentMargin) || restoredBase),
+          }));
+        } else if (parsedSettings) {
+          const restoredBase = Number(parsedSettings.baseMargin) || 2.0;
+          const restoredCompPct = Number(parsedSettings.compoundingPercent) || 20;
+          setCompoundingState((prev) => ({
+            ...prev,
+            baseMargin: restoredBase,
+            currentMargin: restoredBase,
+            compoundingPercent: restoredCompPct,
+          }));
         }
 
         const savedLogs = localStorage.getItem(STORAGE_KEYS.LOGS);
@@ -211,10 +260,25 @@ export default function HomePage() {
     return () => clearTimeout(timer);
   }, []);
 
+  // Helper to apply updated settings and sync CompoundingState
+  const applyUpdatedSettings = useCallback((newSet: BotSettings) => {
+    setSettings(newSet);
+    const newBase = Number(newSet.baseMargin) || 2.0;
+    const newCompPct = Number(newSet.compoundingPercent) || 20;
+    setCompoundingState((prev) => ({
+      ...prev,
+      baseMargin: newBase,
+      compoundingPercent: newCompPct,
+      currentMargin: prev.consecutiveWins === 0 ? newBase : Math.max(newBase, prev.currentMargin),
+    }));
+  }, []);
+
   // 2. PERSISTENCE SAVERS
   useEffect(() => {
-    if (settings.apiKey || settings.apiSecret) {
+    try {
       localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(settings));
+    } catch {
+      // ignore
     }
   }, [settings]);
 
@@ -240,7 +304,7 @@ export default function HomePage() {
     localStorage.setItem(STORAGE_KEYS.LOGS, JSON.stringify(logs.slice(0, 500)));
   }, [logs]);
 
-  // 3. BINANCE ACCOUNT AUTO-SYNC (Fetches Starting Balance, Equity, Platform Fees, Funding Fees)
+  // 3. BINANCE ACCOUNT AUTO-SYNC (Fetches Starting Balance, Equity, Platform Fees, Funding Fees & Live Positions)
   const syncBinanceAccount = useCallback(async () => {
     if (!settings.apiKey || !settings.apiSecret) return;
 
@@ -251,22 +315,27 @@ export default function HomePage() {
         body: JSON.stringify({
           apiKey: settings.apiKey,
           apiSecret: settings.apiSecret,
+          isTestnet: settings.isTestnet,
         }),
       });
 
       if (res.ok) {
         const data = await res.json();
+        if (typeof data.usedWeight === 'number') {
+          setRateLimitStatus(
+            checkRateLimit(data.usedWeight, 1200, (settings.rateLimitSafetyCap || 95) / 100)
+          );
+        }
+
         if (data.success && data.balance) {
           const b = data.balance;
 
           setBinanceAccount((prev) => {
-            // Immutable starting balance: once captured from Binance, it never changes
             const lockedStarting =
               prev.startingBalance > 0
                 ? prev.startingBalance
-                : (b.totalWalletBalance || b.currentEquity || 0);
+                : b.totalWalletBalance || b.currentEquity || 0;
 
-            // Also persist starting balance separately to ensure it is never altered
             localStorage.setItem(STORAGE_KEYS.STARTING_BALANCE, String(lockedStarting));
 
             return {
@@ -280,12 +349,57 @@ export default function HomePage() {
               isSynced: true,
             };
           });
+
+          // Reconcile open positions markPrice & unrealizedPnl with live Binance positions
+          if (Array.isArray(data.positions) && data.positions.length > 0) {
+            setPositions((prevPositions) => {
+              const liveBySymbol = new Map<
+                string,
+                {
+                  symbol: string;
+                  side: 'LONG' | 'SHORT';
+                  quantity: number;
+                  entryPrice: number;
+                  markPrice: number;
+                  unrealizedProfit: number;
+                  leverage: number;
+                  margin: number;
+                }
+              >();
+              for (const lp of data.positions) {
+                liveBySymbol.set(lp.symbol, lp);
+              }
+
+              return prevPositions.map((pos) => {
+                const liveMatch = liveBySymbol.get(pos.symbol);
+                if (!liveMatch) return pos;
+                const markPrice = liveMatch.markPrice > 0 ? liveMatch.markPrice : pos.markPrice;
+                const entryPrice = liveMatch.entryPrice > 0 ? liveMatch.entryPrice : pos.entryPrice;
+                const margin = liveMatch.margin > 0 ? liveMatch.margin : pos.margin;
+                const leverage = liveMatch.leverage > 0 ? liveMatch.leverage : pos.leverage;
+                const unrealizedPnl = Number(liveMatch.unrealizedProfit.toFixed(2));
+                const unrealizedPnlPercent =
+                  margin > 0 ? Number(((unrealizedPnl / margin) * 100).toFixed(2)) : pos.unrealizedPnlPercent;
+
+                return {
+                  ...pos,
+                  entryPrice,
+                  markPrice,
+                  margin,
+                  leverage,
+                  quantity: liveMatch.quantity > 0 ? liveMatch.quantity : pos.quantity,
+                  unrealizedPnl,
+                  unrealizedPnlPercent,
+                };
+              });
+            });
+          }
         }
       }
     } catch {
       // Background sync silent fail
     }
-  }, [settings.apiKey, settings.apiSecret]);
+  }, [settings.apiKey, settings.apiSecret, settings.isTestnet, settings.rateLimitSafetyCap]);
 
   // Auto-sync account immediately on valid credentials and every 30s
   useEffect(() => {
@@ -301,21 +415,137 @@ export default function HomePage() {
     }
   }, [settings.apiKey, settings.apiSecret, syncBinanceAccount]);
 
+  // Execute a position close on Binance and record trade history + compounding
+  const finalizePositionClose = useCallback(
+    async (
+      pos: TradePosition,
+      exitPrice: number,
+      reason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'MANUAL_CLOSE'
+    ) => {
+      if (closingIdsRef.current.has(pos.id)) return;
+      closingIdsRef.current.add(pos.id);
+      setClosingPositionId(pos.id);
+
+      let finalExitPrice = exitPrice;
+
+      // Submit real close order to Binance Futures API if credentials are set
+      if (settings.apiKey && settings.apiSecret) {
+        try {
+          const closeRes = await fetch('/api/binance/execute', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              apiKey: settings.apiKey,
+              apiSecret: settings.apiSecret,
+              isTestnet: settings.isTestnet,
+              action: 'CLOSE',
+              symbol: pos.symbol,
+              side: pos.side,
+              quantity: pos.quantity,
+              price: exitPrice,
+            }),
+          });
+          if (closeRes.ok) {
+            const closeData = await closeRes.json();
+            if (closeData.avgPrice && Number(closeData.avgPrice) > 0) {
+              finalExitPrice = Number(closeData.avgPrice);
+            }
+          }
+        } catch {
+          // Proceed with local close state update if exchange already closed via TP/SL order
+        }
+      }
+
+      const priceDiff =
+        pos.side === 'LONG' ? finalExitPrice - pos.entryPrice : pos.entryPrice - finalExitPrice;
+      const notional = pos.margin * pos.leverage;
+      const grossPnl = pos.entryPrice > 0 ? (priceDiff / pos.entryPrice) * notional : 0;
+      // Deduct Binance Futures round-trip taker commission (0.05% per side = 0.10% of notional)
+      const roundTripFee = notional * 0.001;
+      const realizedPnl = Number((grossPnl - roundTripFee).toFixed(2));
+      const realizedPnlPercent =
+        pos.margin > 0 ? Number(((realizedPnl / pos.margin) * 100).toFixed(2)) : 0;
+
+      const isWin = realizedPnl > 0;
+
+      setCompoundingState((prevComp) => {
+        const compoundingResult = calculateNextTradeMargin(prevComp, {
+          isWin,
+          profit: realizedPnl,
+        });
+
+        const closedTradeRecord: ClosedTrade = {
+          id: generateUniqueId('trade'),
+          symbol: pos.symbol,
+          side: pos.side,
+          entryPrice: pos.entryPrice,
+          exitPrice: roundCryptoPrice(finalExitPrice),
+          margin: pos.margin,
+          leverage: pos.leverage,
+          pnl: realizedPnl,
+          pnlPercent: realizedPnlPercent,
+          entryTime: pos.entryTime,
+          exitTime: Date.now(),
+          reason,
+          isWin,
+          compoundingBonusGenerated: compoundingResult.bonusAdded,
+        };
+
+        setClosedTrades((prev) => {
+          const map = new Map<string, ClosedTrade>();
+          map.set(closedTradeRecord.id, closedTradeRecord);
+          for (const item of prev) {
+            if (!map.has(item.id)) {
+              map.set(item.id, item);
+            }
+          }
+          return Array.from(map.values());
+        });
+
+        setTradeResultModal({
+          isOpen: true,
+          isProfit: closedTradeRecord.isWin,
+          pnl: closedTradeRecord.pnl,
+          pnlPercent: closedTradeRecord.pnlPercent,
+          symbol: closedTradeRecord.symbol,
+          side: closedTradeRecord.side,
+          entryPrice: closedTradeRecord.entryPrice,
+          exitPrice: closedTradeRecord.exitPrice,
+          reason: closedTradeRecord.reason,
+          compoundingBonus: closedTradeRecord.compoundingBonusGenerated,
+        });
+
+        appendLog(
+          'ORDER',
+          isWin ? 'SUCCESS' : 'WARN',
+          `${reason.replace('_', ' ')} executed on ${pos.symbol} at $${roundCryptoPrice(finalExitPrice)}. Net PnL (after fees): ${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)} (${realizedPnlPercent.toFixed(2)}%). Next trade margin: $${compoundingResult.nextMargin.toFixed(2)}`
+        );
+
+        return compoundingResult.newState;
+      });
+
+      setPositions((prev) => prev.filter((p) => p.id !== pos.id));
+      closingIdsRef.current.delete(pos.id);
+      setClosingPositionId(null);
+      syncBinanceAccount();
+    },
+    [appendLog, settings.apiKey, settings.apiSecret, settings.isTestnet, syncBinanceAccount]
+  );
+
   // Scan Market Pairs
   const runMarketScan = useCallback(async () => {
-    // Require Binance API Credentials: without API key, market scanner does not run
     if (!settings.apiKey || !settings.apiSecret) {
       setSignals([]);
       setIsScanning(false);
       return;
     }
 
-    // Strict Rate Limit Shield: Pause scanning immediately if API usage reaches or exceeds 95%
-    if (rateLimitStatus.isThrottled || rateLimitStatus.usagePercent >= 95) {
+    const safetyCap = settings.rateLimitSafetyCap || 95;
+    if (rateLimitStatus.isThrottled || rateLimitStatus.usagePercent >= safetyCap) {
       appendLog(
         'RATE_LIMIT',
         'WARN',
-        `API rate limit reached ${rateLimitStatus.usagePercent.toFixed(1)}% (>=95% safety cap). Halting scan cycle and waiting for cooldown.`
+        `API rate limit reached ${rateLimitStatus.usagePercent.toFixed(1)}% (>=${safetyCap}% safety cap). Halting scan cycle and waiting for cooldown.`
       );
       setIsScanning(false);
       return;
@@ -323,7 +553,9 @@ export default function HomePage() {
 
     setIsScanning(true);
     try {
-      const res = await fetch('/api/binance/scan');
+      const res = await fetch(
+        `/api/binance/scan?testnet=${settings.isTestnet}&safetyCap=${safetyCap}`
+      );
       if (res.ok) {
         const data = await res.json();
         if (data.signals && Array.isArray(data.signals)) {
@@ -341,7 +573,7 @@ export default function HomePage() {
             appendLog(
               'SCAN',
               'INFO',
-              `Market scan evaluated ${data.signals.length} Binance pairs. Top setup: ${topScore?.symbol || 'None'} (${topScore?.signal || 'NEUTRAL'}, Score: ${topScore?.score || 0}%, Volatility: ${topScore?.volatilityPercent?.toFixed(2) || '0'}%).`
+              `Market scan evaluated ${data.signals.length} Binance 5m pairs. Top setup: ${topScore?.symbol || 'None'} (${topScore?.signal || 'NEUTRAL'}, Score: ${topScore?.score || 0}%, Volatility: ${topScore?.volatilityPercent?.toFixed(2) || '0'}%).`
             );
 
             const openLimit = canOpenNewTrade(positions.length, settings.maxOpenTrades);
@@ -360,12 +592,11 @@ export default function HomePage() {
                 appendLog(
                   'SIGNAL',
                   'SUCCESS',
-                  `HIGH-PROBABILITY CONVERGENCE: ${topCandidate.signal} on ${topCandidate.symbol} (Score: ${topCandidate.score}%). Order Flow: ${topCandidate.hvnProfile.priceRelation}, Absorption ${topCandidate.absorption.type}, Imbalance ${topCandidate.imbalance.type}. Submitting real order to Binance...`
+                  `HIGH-PROBABILITY 3-INDICATOR CONVERGENCE: ${topCandidate.signal} on ${topCandidate.symbol} (Score: ${topCandidate.score}%). HVN: ${topCandidate.hvnProfile.priceRelation} (POC $${topCandidate.hvnProfile.pocPrice}), Absorption: ${topCandidate.absorption.type}, Imbalance: ${topCandidate.imbalance.type}. Submitting order to Binance...`
                 );
 
-                // Execute real trade on Binance API
                 const tradeMargin = compoundingState.currentMargin;
-                const leverage = settings.leverage;
+                const leverage = Math.min(15, Math.max(10, settings.leverage || 10));
                 const entryPrice = topCandidate.currentPrice;
 
                 try {
@@ -375,9 +606,10 @@ export default function HomePage() {
                     body: JSON.stringify({
                       apiKey: settings.apiKey,
                       apiSecret: settings.apiSecret,
-                      isTestnet: false,
+                      isTestnet: settings.isTestnet,
+                      action: 'OPEN',
                       symbol: topCandidate.symbol,
-                      side: topCandidate.action,
+                      side: topCandidate.action, // mapped to BUY/SELL in execute route
                       margin: tradeMargin,
                       leverage,
                       price: entryPrice,
@@ -388,27 +620,36 @@ export default function HomePage() {
 
                   const execData = await execRes.json();
                   if (!execRes.ok || !execData.success) {
-                    appendLog('ERROR', 'ERROR', `Binance Live Order Failed: ${execData.error || 'API Rejected Order'}`);
+                    appendLog(
+                      'ERROR',
+                      'ERROR',
+                      `Binance Live Order Failed: ${execData.error || 'API Rejected Order'}`
+                    );
                     return;
                   }
 
+                  const fillPrice = parseFloat(execData.avgPrice) || entryPrice;
                   const notional = tradeMargin * leverage;
-                  const quantity = Number((notional / entryPrice).toFixed(4));
+                  const quantity =
+                    parseFloat(execData.executedQty) ||
+                    Number((notional / fillPrice).toFixed(4));
 
                   const newPosition: TradePosition = {
                     id: String(execData.orderId || generateUniqueId('pos')),
                     symbol: topCandidate.symbol,
                     side: topCandidate.action as 'LONG' | 'SHORT',
-                    entryPrice: parseFloat(execData.avgPrice) || entryPrice,
-                    markPrice: parseFloat(execData.avgPrice) || entryPrice,
+                    entryPrice: fillPrice,
+                    markPrice: fillPrice,
                     margin: tradeMargin,
                     leverage,
-                    quantity: quantity > 0 ? quantity : 0.01,
+                    quantity: quantity > 0 ? quantity : 0.001,
                     stopLoss: topCandidate.slPrice,
                     takeProfit: topCandidate.tpPrice,
                     unrealizedPnl: 0,
                     unrealizedPnlPercent: 0,
                     entryTime: Date.now(),
+                    slOrderId: execData.slOrderId,
+                    tpOrderId: execData.tpOrderId,
                   };
 
                   let didAdd = false;
@@ -423,14 +664,13 @@ export default function HomePage() {
                     appendLog(
                       'ORDER',
                       'SUCCESS',
-                      `LIVE BINANCE ORDER EXECUTED: ${topCandidate.action} on ${topCandidate.symbol} at $${newPosition.entryPrice}. Margin: $${tradeMargin} (${leverage}x Lev). Order ID: ${execData.orderId}`,
+                      `LIVE BINANCE ORDER EXECUTED: ${topCandidate.action} (${execData.orderSide || (topCandidate.action === 'LONG' ? 'BUY' : 'SELL')}) on ${topCandidate.symbol} at $${newPosition.entryPrice}. Margin: $${tradeMargin.toFixed(2)} (${leverage}x Isolated). Indicator TP: $${topCandidate.tpPrice} / SL: $${topCandidate.slPrice}. Order ID: ${execData.orderId}`,
                       {
                         signal: topCandidate.signal,
                         score: topCandidate.score,
                         reasons: topCandidate.reasons,
                       }
                     );
-                    // Refresh balance
                     syncBinanceAccount();
                   }
                 } catch (apiErr: unknown) {
@@ -441,14 +681,14 @@ export default function HomePage() {
                 appendLog(
                   'SCAN',
                   'INFO',
-                  `No pairs met entry threshold (>=65% score or STRONG signal) in this cycle. Standing by for next 15s scan.`
+                  `No pairs met entry threshold (>=65% score or STRONG signal) in this cycle. Standing by for next ${settings.scanIntervalSeconds || 15}s scan.`
                 );
               }
             } else {
               appendLog(
                 'SYSTEM',
                 'INFO',
-                `Max positions capacity reached (${positions.length}/${settings.maxOpenTrades}). Monitoring open trades for TP/SL.`
+                `Max positions capacity reached (${positions.length}/${settings.maxOpenTrades}). Monitoring open trades for Indicator TP/SL.`
               );
             }
           }
@@ -459,7 +699,7 @@ export default function HomePage() {
       appendLog('ERROR', 'ERROR', `Scan error: ${error.message}`);
     } finally {
       setIsScanning(false);
-      setScanCountdown(settings.scanIntervalSeconds);
+      setScanCountdown(settings.scanIntervalSeconds || 15);
     }
   }, [
     botActive,
@@ -469,8 +709,10 @@ export default function HomePage() {
     rateLimitStatus.usagePercent,
     settings.apiKey,
     settings.apiSecret,
+    settings.isTestnet,
     settings.leverage,
     settings.maxOpenTrades,
+    settings.rateLimitSafetyCap,
     settings.scanIntervalSeconds,
     appendLog,
     syncBinanceAccount,
@@ -481,7 +723,7 @@ export default function HomePage() {
     runMarketScanRef.current = runMarketScan;
   }, [runMarketScan]);
 
-  // Automated 15-second Scan Loop (Stabilized, never gets stuck or cancelled mid-cycle)
+  // Automated Scan Loop
   useEffect(() => {
     if (!botActive) return;
 
@@ -501,189 +743,80 @@ export default function HomePage() {
     return () => clearInterval(timer);
   }, [botActive, settings.scanIntervalSeconds]);
 
-  // Position Price Update & Dynamic TP/SL Engine
+  // Position Real-Price Update & Indicator-Driven Dynamic TP/SL Engine (0% Simulation)
   useEffect(() => {
     if (positions.length === 0) return;
 
     const updateInterval = setInterval(() => {
-      setPositions((prevPositions) => {
-        const updated: TradePosition[] = [];
-        const closed: ClosedTrade[] = [];
+      const toClose: {
+        pos: TradePosition;
+        exitPrice: number;
+        reason: 'TAKE_PROFIT' | 'STOP_LOSS';
+      }[] = [];
 
-        for (const pos of prevPositions) {
+      setPositions((prevPositions) =>
+        prevPositions.map((pos) => {
           const liveCandles = candlesMap[pos.symbol];
-          let currentPrice = pos.markPrice;
+          // Use real Binance kline close or keep synced Binance markPrice (no Math.random() simulation)
+          const currentPrice =
+            liveCandles && liveCandles.length > 0
+              ? roundCryptoPrice(liveCandles[liveCandles.length - 1].close)
+              : pos.markPrice;
 
-          if (liveCandles && liveCandles.length > 0) {
-            currentPrice = liveCandles[liveCandles.length - 1].close;
-          } else {
-            const deltaPercent = (Math.random() - 0.495) * 0.003;
-            currentPrice = Number((pos.markPrice * (1 + deltaPercent)).toFixed(4));
-          }
-
-          let unrealizedPnl = 0;
-          let unrealizedPnlPercent = 0;
-
-          if (pos.side === 'LONG') {
-            const priceDiff = currentPrice - pos.entryPrice;
-            unrealizedPnl = Number(((priceDiff / pos.entryPrice) * (pos.margin * pos.leverage)).toFixed(2));
-            unrealizedPnlPercent = Number(((priceDiff / pos.entryPrice) * pos.leverage * 100).toFixed(2));
-          } else {
-            const priceDiff = pos.entryPrice - currentPrice;
-            unrealizedPnl = Number(((priceDiff / pos.entryPrice) * (pos.margin * pos.leverage)).toFixed(2));
-            unrealizedPnlPercent = Number(((priceDiff / pos.entryPrice) * pos.leverage * 100).toFixed(2));
-          }
+          const priceDiff =
+            pos.side === 'LONG' ? currentPrice - pos.entryPrice : pos.entryPrice - currentPrice;
+          const notional = pos.margin * pos.leverage;
+          const grossPnl = pos.entryPrice > 0 ? (priceDiff / pos.entryPrice) * notional : 0;
+          const unrealizedPnl = Number(grossPnl.toFixed(2));
+          const unrealizedPnlPercent =
+            pos.margin > 0 ? Number(((unrealizedPnl / pos.margin) * 100).toFixed(2)) : 0;
 
           let isHitTP = false;
           let isHitSL = false;
 
-          if (pos.side === 'LONG') {
-            if (currentPrice >= pos.takeProfit) isHitTP = true;
-            if (currentPrice <= pos.stopLoss) isHitSL = true;
-          } else {
-            if (currentPrice <= pos.takeProfit) isHitTP = true;
-            if (currentPrice >= pos.stopLoss) isHitSL = true;
-          }
-
-          if (isHitTP || isHitSL) {
-            const reason = isHitTP ? 'TAKE_PROFIT' : 'STOP_LOSS';
-            const isWin = isHitTP;
-            const compoundingResult = calculateNextTradeMargin(compoundingState, {
-              isWin,
-              profit: unrealizedPnl,
-            });
-
-            const closedTradeRecord: ClosedTrade = {
-              id: generateUniqueId('trade'),
-              symbol: pos.symbol,
-              side: pos.side,
-              entryPrice: pos.entryPrice,
-              exitPrice: currentPrice,
-              margin: pos.margin,
-              leverage: pos.leverage,
-              pnl: unrealizedPnl,
-              pnlPercent: unrealizedPnlPercent,
-              entryTime: pos.entryTime,
-              exitTime: Date.now(),
-              reason,
-              isWin,
-              compoundingBonusGenerated: compoundingResult.bonusAdded,
-            };
-
-            closed.push(closedTradeRecord);
-            setCompoundingState(compoundingResult.newState);
-
-            appendLog(
-              'ORDER',
-              isWin ? 'SUCCESS' : 'WARN',
-              `Dynamic ${reason} hit on ${pos.symbol} at $${currentPrice}! Net PnL: ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(2)} (${unrealizedPnlPercent.toFixed(2)}%). Next trade margin: $${compoundingResult.nextMargin.toFixed(2)}`
-            );
-          } else {
-            updated.push({
-              ...pos,
-              markPrice: currentPrice,
-              unrealizedPnl,
-              unrealizedPnlPercent,
-            });
-          }
-        }
-
-        if (closed.length > 0) {
-          const lastClosed = closed[closed.length - 1];
-          setTradeResultModal({
-            isOpen: true,
-            isProfit: lastClosed.isWin,
-            pnl: lastClosed.pnl,
-            pnlPercent: lastClosed.pnlPercent,
-            symbol: lastClosed.symbol,
-            side: lastClosed.side,
-            entryPrice: lastClosed.entryPrice,
-            exitPrice: lastClosed.exitPrice,
-            reason: lastClosed.reason,
-            compoundingBonus: lastClosed.compoundingBonusGenerated,
-          });
-
-          setClosedTrades((prev) => {
-            const map = new Map<string, ClosedTrade>();
-            for (const item of [...closed, ...prev]) {
-              map.set(item.id, item);
+          if (pos.takeProfit > 0 && pos.stopLoss > 0) {
+            if (pos.side === 'LONG') {
+              if (currentPrice >= pos.takeProfit) isHitTP = true;
+              if (currentPrice <= pos.stopLoss) isHitSL = true;
+            } else {
+              if (currentPrice <= pos.takeProfit) isHitTP = true;
+              if (currentPrice >= pos.stopLoss) isHitSL = true;
             }
-            return Array.from(map.values());
-          });
-          syncBinanceAccount();
-        }
+          }
 
-        return updated;
-      });
+          if ((isHitTP || isHitSL) && !closingIdsRef.current.has(pos.id)) {
+            toClose.push({
+              pos: { ...pos, markPrice: currentPrice, unrealizedPnl, unrealizedPnlPercent },
+              exitPrice: currentPrice,
+              reason: isHitTP ? 'TAKE_PROFIT' : 'STOP_LOSS',
+            });
+          }
+
+          return {
+            ...pos,
+            markPrice: currentPrice,
+            unrealizedPnl,
+            unrealizedPnlPercent,
+          };
+        })
+      );
+
+      for (const item of toClose) {
+        finalizePositionClose(item.pos, item.exitPrice, item.reason);
+      }
     }, 2000);
 
     return () => clearInterval(updateInterval);
-  }, [candlesMap, compoundingState, positions.length, appendLog, syncBinanceAccount]);
+  }, [candlesMap, positions.length, finalizePositionClose]);
 
-  // Close Position Manually
+  // Close Position Manually on Binance & Local State
   const handleClosePosition = useCallback(
     (posId: string) => {
       const pos = positions.find((p) => p.id === posId);
       if (!pos) return;
-
-      const isWin = pos.unrealizedPnl > 0;
-      const compoundingResult = calculateNextTradeMargin(compoundingState, {
-        isWin,
-        profit: pos.unrealizedPnl,
-      });
-
-      const closed: ClosedTrade = {
-        id: generateUniqueId('trade'),
-        symbol: pos.symbol,
-        side: pos.side,
-        entryPrice: pos.entryPrice,
-        exitPrice: pos.markPrice,
-        margin: pos.margin,
-        leverage: pos.leverage,
-        pnl: pos.unrealizedPnl,
-        pnlPercent: pos.unrealizedPnlPercent,
-        entryTime: pos.entryTime,
-        exitTime: Date.now(),
-        reason: 'MANUAL_CLOSE',
-        isWin,
-        compoundingBonusGenerated: compoundingResult.bonusAdded,
-      };
-
-      setPositions((prev) => prev.filter((p) => p.id !== posId));
-      setClosedTrades((prev) => {
-        const map = new Map<string, ClosedTrade>();
-        map.set(closed.id, closed);
-        for (const item of prev) {
-          if (!map.has(item.id)) {
-            map.set(item.id, item);
-          }
-        }
-        return Array.from(map.values());
-      });
-      setCompoundingState(compoundingResult.newState);
-
-      // Trigger full display celebration or sad mode modal
-      setTradeResultModal({
-        isOpen: true,
-        isProfit: closed.isWin,
-        pnl: closed.pnl,
-        pnlPercent: closed.pnlPercent,
-        symbol: closed.symbol,
-        side: closed.side,
-        entryPrice: closed.entryPrice,
-        exitPrice: closed.exitPrice,
-        reason: 'MANUAL_CLOSE',
-        compoundingBonus: closed.compoundingBonusGenerated,
-      });
-
-      appendLog(
-        'ORDER',
-        isWin ? 'SUCCESS' : 'WARN',
-        `Manually closed ${pos.side} position on ${pos.symbol} at $${pos.markPrice}. Net PnL: ${closed.pnl >= 0 ? '+' : ''}$${closed.pnl.toFixed(2)} (${closed.pnlPercent.toFixed(2)}%)`
-      );
-      syncBinanceAccount();
+      finalizePositionClose(pos, pos.markPrice, 'MANUAL_CLOSE');
     },
-    [appendLog, compoundingState, positions, syncBinanceAccount]
+    [positions, finalizePositionClose]
   );
 
   // Manual Trade Execution from Scanner
@@ -696,7 +829,7 @@ export default function HomePage() {
       }
 
       const tradeMargin = compoundingState.currentMargin;
-      const leverage = settings.leverage;
+      const leverage = Math.min(15, Math.max(10, settings.leverage || 10));
 
       try {
         const execRes = await fetch('/api/binance/execute', {
@@ -705,7 +838,8 @@ export default function HomePage() {
           body: JSON.stringify({
             apiKey: settings.apiKey,
             apiSecret: settings.apiSecret,
-            isTestnet: false,
+            isTestnet: settings.isTestnet,
+            action: 'OPEN',
             symbol: sig.symbol,
             side: sig.action,
             margin: tradeMargin,
@@ -718,13 +852,18 @@ export default function HomePage() {
 
         const execData = await execRes.json();
         if (!execRes.ok || !execData.success) {
-          appendLog('ERROR', 'ERROR', `Binance Live Order Failed: ${execData.error || 'API Rejected Order'}`);
+          appendLog(
+            'ERROR',
+            'ERROR',
+            `Binance Live Order Failed: ${execData.error || 'API Rejected Order'}`
+          );
           return;
         }
 
-        const notional = tradeMargin * leverage;
         const entryPrice = parseFloat(execData.avgPrice) || sig.currentPrice;
-        const quantity = Number((notional / entryPrice).toFixed(4));
+        const notional = tradeMargin * leverage;
+        const quantity =
+          parseFloat(execData.executedQty) || Number((notional / entryPrice).toFixed(4));
 
         const newPos: TradePosition = {
           id: String(execData.orderId || generateUniqueId('pos')),
@@ -734,12 +873,14 @@ export default function HomePage() {
           markPrice: entryPrice,
           margin: tradeMargin,
           leverage,
-          quantity: quantity > 0 ? quantity : 0.01,
+          quantity: quantity > 0 ? quantity : 0.001,
           stopLoss: sig.slPrice,
           takeProfit: sig.tpPrice,
           unrealizedPnl: 0,
           unrealizedPnlPercent: 0,
           entryTime: Date.now(),
+          slOrderId: execData.slOrderId,
+          tpOrderId: execData.tpOrderId,
         };
 
         let didAdd = false;
@@ -754,7 +895,7 @@ export default function HomePage() {
           appendLog(
             'ORDER',
             'SUCCESS',
-            `LIVE BINANCE MANUAL ORDER EXECUTED: ${sig.action} on ${sig.symbol} at $${entryPrice}. Margin: $${tradeMargin} (${leverage}x Lev). Order ID: ${execData.orderId}`
+            `LIVE BINANCE MANUAL ORDER EXECUTED: ${sig.action} on ${sig.symbol} at $${entryPrice}. Margin: $${tradeMargin.toFixed(2)} (${leverage}x Isolated). Indicator TP: $${sig.tpPrice} / SL: $${sig.slPrice}. Order ID: ${execData.orderId}`
           );
           syncBinanceAccount();
         }
@@ -763,41 +904,58 @@ export default function HomePage() {
         appendLog('ERROR', 'ERROR', `Live API execution exception: ${err.message}`);
       }
     },
-    [appendLog, compoundingState.currentMargin, positions.length, settings.apiKey, settings.apiSecret, settings.leverage, settings.maxOpenTrades, syncBinanceAccount]
+    [
+      appendLog,
+      compoundingState.currentMargin,
+      positions.length,
+      settings.apiKey,
+      settings.apiSecret,
+      settings.isTestnet,
+      settings.leverage,
+      settings.maxOpenTrades,
+      syncBinanceAccount,
+    ]
   );
 
   // Test Binance Connection
-  const handleTestConnection = async () => {
+  const handleTestConnection = async (overrideSettings?: BotSettings) => {
+    const active = overrideSettings || settings;
     setIsTestingConnection(true);
     try {
       const res = await fetch('/api/binance/test-connection', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          apiKey: settings.apiKey,
-          apiSecret: settings.apiSecret,
-          isTestnet: settings.isTestnet,
+          apiKey: active.apiKey,
+          apiSecret: active.apiSecret,
+          isTestnet: active.isTestnet,
         }),
       });
 
       const data = await res.json();
       if (res.ok) {
+        const isOk = Boolean(data.auth?.valid);
         setConnectionResult({
           tested: true,
-          success: data.auth.valid || data.ping.status === 'ONLINE',
-          message: data.auth.message || 'Connected to Binance Futures successfully',
-          latencyMs: data.ping.latencyMs,
-          balance: data.auth.balance,
+          success: isOk,
+          message:
+            data.auth?.message ||
+            (isOk
+              ? 'Connected to Binance Futures successfully'
+              : 'Binance ping succeeded, but API key authentication failed'),
+          latencyMs: data.ping?.latencyMs,
+          balance: data.auth?.balance,
         });
 
         appendLog(
           'SYSTEM',
-          'SUCCESS',
-          `Binance connection verified. Latency: ${data.ping.latencyMs}ms. Status: ${data.ping.status}`
+          isOk ? 'SUCCESS' : 'WARN',
+          `Binance connection test: ${data.auth?.message || data.ping?.status}. Latency: ${data.ping?.latencyMs ?? 0}ms.`
         );
 
-        // Sync full balance & fees
-        syncBinanceAccount();
+        if (isOk) {
+          syncBinanceAccount();
+        }
       } else {
         setConnectionResult({
           tested: true,
@@ -824,7 +982,8 @@ export default function HomePage() {
   const winningTrades = closedTrades.filter((t) => t.isWin).length;
   const losingTrades = closedTrades.length - winningTrades;
   const winRate = closedTrades.length > 0 ? (winningTrades / closedTrades.length) * 100 : 0;
-  const baseStartingCapital = binanceAccount.startingBalance > 0 ? binanceAccount.startingBalance : 100.0;
+  const baseStartingCapital =
+    binanceAccount.startingBalance > 0 ? binanceAccount.startingBalance : 100.0;
   const totalPnlPercent = (totalPnl / baseStartingCapital) * 100;
 
   // Bot Start/Pause handlers
@@ -842,20 +1001,20 @@ export default function HomePage() {
       }
 
       if (updatedSettings) {
-        setSettings(updatedSettings);
+        applyUpdatedSettings(updatedSettings);
       }
       setBotActive(true);
       setActiveTab('positions');
-      setScanCountdown(settings.scanIntervalSeconds || 15);
+      setScanCountdown(activeSettings.scanIntervalSeconds || 15);
       runMarketScan();
       syncBinanceAccount();
       appendLog(
         'SYSTEM',
         'SUCCESS',
-        `Trade Master bot STARTED! Scanning 5m pairs on ${settings.scanIntervalSeconds || 15}s cycle with $${settings.baseMargin.toFixed(2)} base margin (${settings.leverage}x isolated).`
+        `Trade Master bot STARTED! Scanning 5m pairs on ${activeSettings.scanIntervalSeconds || 15}s cycle with $${activeSettings.baseMargin.toFixed(2)} base margin (${activeSettings.leverage}x isolated).`
       );
     },
-    [settings, runMarketScan, appendLog, syncBinanceAccount]
+    [settings, runMarketScan, appendLog, syncBinanceAccount, applyUpdatedSettings]
   );
 
   const handlePauseBot = useCallback(() => {
@@ -881,8 +1040,14 @@ export default function HomePage() {
     }
   }, [botActive, handlePauseBot, handleStartBot, settings.apiKey, settings.apiSecret, appendLog]);
 
+  const selectedSignal = signals.find((s) => s.symbol === selectedSymbol) || signals[0];
+  const activeSymbolForChart = selectedSignal?.symbol || selectedSymbol;
+  const selectedCandles = candlesMap[activeSymbolForChart] || [];
+  const selectedActivePosition = positions.find((p) => p.symbol === activeSymbolForChart);
+  const availableSymbols = signals.map((s) => s.symbol);
+
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
+    <div className="min-h-screen w-full max-w-full overflow-x-hidden bg-slate-950 text-slate-100 flex flex-col font-sans">
       {/* 1. Header (Top Bar Contract) */}
       <Header
         activeTab={activeTab}
@@ -890,12 +1055,13 @@ export default function HomePage() {
         botActive={botActive}
         onToggleBot={handleToggleBot}
         openPositionsCount={positions.length}
+        maxOpenPositions={settings.maxOpenTrades}
         hasApiKey={Boolean(settings.apiKey && settings.apiSecret)}
       />
 
       {/* 2. Main Terminal Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6">
-        {/* KPI Performance Strip (With auto-synced Starting Balance, Equity, Platform Fees & Funding Fees) */}
+        {/* KPI Performance Strip */}
         <KpiMetricsStrip
           totalPnl={totalPnl}
           totalPnlPercent={totalPnlPercent}
@@ -908,12 +1074,13 @@ export default function HomePage() {
           compoundingState={compoundingState}
           rateLimitStatus={rateLimitStatus}
           scanCountdown={scanCountdown}
+          scanIntervalSeconds={settings.scanIntervalSeconds}
           isScanning={isScanning}
           botActive={botActive}
           binanceAccount={binanceAccount}
         />
 
-        {/* Tab 1: Active Positions Dashboard & PnL Chart */}
+        {/* Tab 1: Active Positions Dashboard, PnL Chart & Selected Symbol Order Flow Chart */}
         {activeTab === 'positions' && (
           <div className="space-y-6">
             <PnlChartWidget
@@ -921,26 +1088,59 @@ export default function HomePage() {
               totalPnl={totalPnl}
               startingBalance={binanceAccount.startingBalance}
               currentEquity={binanceAccount.currentEquity}
+              winRate={winRate}
+              compoundingMargin={compoundingState.currentMargin}
+              apiSafetyPercent={Math.max(0, 100 - rateLimitStatus.usagePercent)}
             />
             <ActivePositions
               positions={positions}
               onClosePosition={handleClosePosition}
               onSelectSymbol={(sym) => setSelectedSymbol(sym)}
+              selectedSymbol={activeSymbolForChart}
+              maxOpenPositions={settings.maxOpenTrades}
+              leverage={settings.leverage}
+              closingPositionId={closingPositionId}
             />
+            {selectedCandles.length > 0 && (
+              <InteractiveChart
+                symbol={activeSymbolForChart}
+                candles={selectedCandles}
+                signal={selectedSignal}
+                activePosition={selectedActivePosition}
+                availableSymbols={availableSymbols}
+                onSelectSymbol={(sym) => setSelectedSymbol(sym)}
+                leverage={settings.leverage}
+                scanIntervalSeconds={settings.scanIntervalSeconds}
+              />
+            )}
           </div>
         )}
 
-        {/* Tab 2: Dedicated Market Scanner Page */}
+        {/* Tab 2: Dedicated Market Scanner Page + Interactive 5m Order Flow Chart */}
         {activeTab === 'scanner' && (
           <div className="space-y-6">
+            {Boolean(settings.apiKey && settings.apiSecret) && (
+              <InteractiveChart
+                symbol={activeSymbolForChart}
+                candles={selectedCandles}
+                signal={selectedSignal}
+                activePosition={selectedActivePosition}
+                availableSymbols={availableSymbols}
+                onSelectSymbol={(sym) => setSelectedSymbol(sym)}
+                leverage={settings.leverage}
+                scanIntervalSeconds={settings.scanIntervalSeconds}
+              />
+            )}
             <ScannerTable
               signals={signals}
-              selectedSymbol={selectedSymbol}
+              selectedSymbol={activeSymbolForChart}
               onSelectSymbol={(sym) => setSelectedSymbol(sym)}
               onManualExecute={handleManualExecute}
               isMaxPositionsReached={positions.length >= settings.maxOpenTrades}
               botActive={botActive}
               scanCountdown={scanCountdown}
+              scanIntervalSeconds={settings.scanIntervalSeconds}
+              leverage={settings.leverage}
               isScanning={isScanning}
               hasApiKey={Boolean(settings.apiKey && settings.apiSecret)}
               onGoToSettings={() => setActiveTab('settings')}
@@ -961,10 +1161,15 @@ export default function HomePage() {
         {/* Tab 5: Settings */}
         {activeTab === 'settings' && (
           <SettingsView
+            key={`${settings.apiKey}-${settings.baseMargin}-${settings.leverage}-${settings.compoundingPercent}`}
             settings={settings}
             onUpdateSettings={(newSet) => {
-              setSettings(newSet);
-              appendLog('SYSTEM', 'INFO', 'Bot settings updated.');
+              applyUpdatedSettings(newSet);
+              appendLog(
+                'SYSTEM',
+                'INFO',
+                `Bot settings updated ($${newSet.baseMargin.toFixed(2)} Base Margin · ${newSet.leverage}x Isolated · ${newSet.compoundingPercent}% Compounding).`
+              );
               syncBinanceAccount();
             }}
             onTestConnection={handleTestConnection}
@@ -979,7 +1184,7 @@ export default function HomePage() {
 
       {/* Footer */}
       <footer className="border-t border-slate-900 bg-slate-950 py-4 px-6 text-center text-xs text-slate-500 font-mono">
-        Trade Master · Binance Futures Terminal · 10x Isolated
+        Trade Master · Binance Futures Terminal · ${settings.baseMargin.toFixed(2)} Base Margin · {settings.leverage}x Isolated (10x–15x)
       </footer>
 
       {/* Full-Screen Trade Result Celebration / Sad Mode Overlay */}

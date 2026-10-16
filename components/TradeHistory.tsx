@@ -37,7 +37,7 @@ export function TradeHistory({ trades, compoundingState }: TradeHistoryProps) {
                 </span>
               </span>
               <span className="text-slate-500">·</span>
-              <span className="text-slate-400">10x Leverage</span>
+              <span className="text-slate-400">10x–15x Isolated</span>
             </div>
           </div>
 
@@ -157,7 +157,7 @@ export function TradeHistory({ trades, compoundingState }: TradeHistoryProps) {
                             </div>
                           ) : (
                             <div className="text-slate-400 text-xs">
-                              Base reset ($2.00)
+                              Base reset (${compoundingState.baseMargin.toFixed(2)})
                             </div>
                           )}
                         </td>

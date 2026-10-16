@@ -8,35 +8,41 @@ import {
   calculateHeavyAbsorption,
   calculateImbalanceLevels,
   evaluate3IndicatorSignal,
+  roundCryptoPrice,
   type CompoundingState,
   type Candle,
 } from './trading-engine.ts';
 
-function generateTestCandles(count: number, basePrice: number, scenario: 'HVN_BULL' | 'ABSORPTION' | 'IMBALANCE'): Candle[] {
+function generateTestCandles(
+  count: number,
+  basePrice: number,
+  scenario: 'HVN_BULL' | 'ABSORPTION' | 'IMBALANCE'
+): Candle[] {
   const candles: Candle[] = [];
   let price = basePrice;
   const now = Date.now();
+  const stepUnit = basePrice * 0.005;
 
   for (let i = 0; i < count; i++) {
     const time = now - (count - i) * 5 * 60 * 1000;
     const open = price;
-    let high = open + 0.5;
-    let low = open - 0.5;
-    let close = open + 0.2;
+    let high = open + stepUnit;
+    let low = open - stepUnit;
+    let close = open + stepUnit * 0.4;
     let volume = 1000;
 
     if (scenario === 'ABSORPTION' && i === count - 1) {
       // Create lower wick with heavy volume for Bullish Absorption
-      low = open - 2.5;
-      close = open + 0.1;
+      low = open - stepUnit * 5.0;
+      close = open + stepUnit * 0.2;
       volume = 8000; // heavy volume surge
     } else if (scenario === 'IMBALANCE' && i === count - 1) {
       // High volume upward surge creating 3:1 buying imbalance
-      close = open + 2.0;
-      high = close + 0.2;
+      close = open + stepUnit * 4.0;
+      high = close + stepUnit * 0.4;
       volume = 5000;
     } else {
-      price += (Math.random() - 0.48) * 0.4;
+      price += (Math.random() - 0.48) * (stepUnit * 0.8);
     }
 
     candles.push({ time, open, high, low, close, volume });
@@ -71,6 +77,7 @@ test('Indicator 3 - Imbalance Levels: Identifies 3:1 Stacked Buying/Selling Imba
   assert.equal(imbalance.type, 'BUY_IMBALANCE');
   assert.ok(imbalance.stackedImbalanceCount >= 2);
   assert.ok(imbalance.maxImbalanceRatio >= 2.5);
+  assert.ok(imbalance.maxImbalanceRatio <= 12.0, 'Ratio is bounded to realistic footprint scale');
 });
 
 test('3-Indicator Signal Engine: Evaluates HVN + Absorption + Imbalances with TP/SL targets', () => {
@@ -81,10 +88,22 @@ test('3-Indicator Signal Engine: Evaluates HVN + Absorption + Imbalances with TP
   assert.ok(['STRONG_BUY', 'BUY', 'NEUTRAL', 'SELL', 'STRONG_SELL'].includes(signal.signal));
   assert.ok(signal.tpPrice > 0);
   assert.ok(signal.slPrice > 0);
+  assert.ok(signal.riskRewardRatio >= 1.2);
   assert.ok(signal.reasons.length > 0);
 });
 
-test('Compounding Engine: Adds 20% of profit to next trade margin on win, resets on loss', () => {
+test('Micro-Cap Precision: PEPEUSDT at $0.00001021 preserves full 8-decimal TP/SL precision', () => {
+  const candles = generateTestCandles(30, 0.00001021, 'IMBALANCE');
+  const signal = evaluate3IndicatorSignal('PEPEUSDT', candles);
+
+  assert.ok(signal.currentPrice > 0, 'Current price must not round to 0');
+  assert.ok(signal.tpPrice > 0, 'TP price must not round to 0');
+  assert.ok(signal.slPrice > 0, 'SL price must not round to 0');
+  assert.notEqual(signal.tpPrice, signal.slPrice, 'TP and SL must be distinct');
+  assert.equal(roundCryptoPrice(0.00001021), 0.00001021);
+});
+
+test('Compounding Engine: Adds 20% of profit to next trade margin on win, accumulates streak, resets on loss', () => {
   const state: CompoundingState = {
     baseMargin: 2.0,
     currentMargin: 2.0,
@@ -94,18 +113,23 @@ test('Compounding Engine: Adds 20% of profit to next trade margin on win, resets
     totalCompoundedProfitPool: 0,
   };
 
-  // Win $2.00 profit -> +0.40 bonus
+  // Win #1: $2.00 profit -> +0.40 bonus -> $2.40 next margin
   const winResult = calculateNextTradeMargin(state, { isWin: true, profit: 2.0 });
   assert.equal(winResult.nextMargin, 2.4);
   assert.equal(winResult.bonusAdded, 0.4);
 
+  // Win #2: $1.50 profit -> +0.30 bonus -> $2.70 next margin
+  const winResult2 = calculateNextTradeMargin(winResult.newState, { isWin: true, profit: 1.5 });
+  assert.equal(winResult2.nextMargin, 2.7);
+  assert.equal(winResult2.bonusAdded, 0.3);
+
   // Loss -> Reset to base $2.00
-  const lossResult = calculateNextTradeMargin(winResult.newState, { isWin: false, profit: -1.0 });
+  const lossResult = calculateNextTradeMargin(winResult2.newState, { isWin: false, profit: -1.0 });
   assert.equal(lossResult.nextMargin, 2.0);
   assert.equal(lossResult.bonusAdded, 0);
 });
 
-test('Position Constraints & Rate Limit Shield: Enforces 5 positions and 95% threshold', () => {
+test('Position Constraints & Rate Limit Shield: Enforces 5 positions and custom/95% threshold', () => {
   assert.equal(canOpenNewTrade(4, 5).allowed, true);
   assert.equal(canOpenNewTrade(5, 5).allowed, false);
 
