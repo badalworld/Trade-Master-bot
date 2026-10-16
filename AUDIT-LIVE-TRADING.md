@@ -1,15 +1,108 @@
 # Pre-Live Audit — Trade Master (Binance Futures Bot)
 
-**Date:** 2026-10-16 · **Branch:** `arena/97c3f97b-trade-master-bot` @ `8579160`
-**Audit verdict:** ❌ NOT CLEARED for live trading with real funds.
-**Remediation status:** ✅ all 5 blockers + 4 high-severity items fixed in code, verified by 23 new
-unit tests and live endpoint probes. **Still not cleared for real money** — the strategy itself has
-no backtest and no track record, so it must earn that on testnet first.
+**Date:** 2026-10-16 (round 2) · **Branch:** `arena/900be1ec-trade-master-bot`
+**Audit verdict:** ❌ still NOT CLEARED for live trading with real funds.
+**Remediation status:** round-1 items (B1–B5, H1–H4) fixed and re-verified; round-2 items
+(R2-1 … R2-9) fixed in code, verified by `tsc`, `eslint`, **63/63 unit tests**, a production build
+and live route probes. **Still not cleared for real money** — the strategy has no backtest and no
+track record, so it must earn that on testnet first.
 
-The app builds clean and the strategy math is well-tested, but the order-execution path has
-nine defects that can lose real money — two of which can leave an **unprotected leveraged
-position on the exchange with no stop-loss and no monitoring process**. Fix the BLOCKER tier
-before funding an account.
+The app builds clean and the strategy math is well-tested, but the order-execution path had
+nine defects that could lose real money — two of which could leave an **unprotected leveraged
+position on the exchange with no stop-loss and no monitoring process**.
+
+> **Corrections to round 1 in this file.** The round-1 text claimed "23 new unit tests" (the suite is
+> now 63 and covers the money paths directly), described `npm install` as clean (the committed
+> `package-lock.json` was out of sync, so `npm ci` — which both Docker stages run — failed outright),
+> and told operators that a no-session probe must return 401/403 (with server-side keys it returned
+> the *policy* answer instead, because the endpoints were never authenticated). All three are fixed
+> below; the round-1 narrative is kept for history and its claims about the current code should be
+> read through this header.
+
+---
+
+## Round 2 — findings and fixes (implementation branch `arena/900be1ec-trade-master-bot`)
+
+### R2-1 · BLOCKER — every money endpoint was unauthenticated (verified live)
+`X-TM-Request: 1` is a CSRF guard, not authentication: any HTTP client can send it. Proven against
+the built server with `BINANCE_API_KEY/SECRET` set — an anonymous caller (no cookie, no Origin) got
+through the credential gate on `POST /api/binance/execute` (the request reached Binance's
+`positionRisk` call), could `CLOSE` a symbol, could arm autopilot via `/api/engine/control`
+(`200`, persisted to the ledger as `autopilot.serverEntries:true`), and could `flatten-all` with the
+published confirm string. `DEPLOYMENT.md` recommended exactly that configuration
+(`--allow-unauthenticated` + env keys).
+**Fix:** `lib/operator-auth.ts` + `/api/operator/{status,login,logout}`. A stateless HMAC-signed
+httpOnly cookie (`tm_op`, 12 h, `Secure` on https, `SameSite=Lax`) keyed by `TM_OPERATOR_TOKEN`;
+every order/account/engine route calls `requireOperator()`. `TM_OPERATOR_AUTH=auto` (default) turns
+the wall on precisely when server keys exist; `off` exists for deployments already behind
+IAP/IAM/VPN. Fail-closed: keys present without a token ⇒ **503 `OPERATOR_AUTH_NOT_CONFIGURED`**;
+no cookie ⇒ **401 `OPERATOR_AUTH_REQUIRED`**. Login is throttled (5 failures ⇒ 5 min lock) and the
+token is compared in constant time. UI: `components/OperatorGate.tsx` blocks the terminal until
+signed in, and Settings can sign out.
+
+### R2-2 · BLOCKER (deployment) — the container image could not be built
+`npm ci` failed: `EUSAGE … Invalid: lock file's ajv@6.15.0 does not satisfy ajv@8.20.0` (same for
+`ajv-formats`, `json-schema-traverse`). Both Docker stages run `npm ci`, so no image was produced.
+**Fix:** regenerate `package-lock.json` (3 hoisted versions + nested ajv placements change; the diff
+is limited to those). Verified: `npm ci --dry-run` now resolves 1031 packages; `Dockerfile` and
+`DEPLOYMENT.md` document the rule.
+
+### R2-3 · HIGH — `GET /api/binance/credentials` leaked the key hint to anyone
+Anonymous `200` with `keyHint: "dumm…1234"`, the credential source and the full risk policy.
+**Fix:** operator-gated (no-op when no session is required); the UI reads it only after sign-in.
+
+### R2-4 · HIGH — ambiguous entries were protected but forgotten
+When an entry threw *after* submission and the position was found (stop re-attached ⇒
+`RECOVERED_STOP_ATTACHED`, HTTP 502), the engine logged `ENTRY_SKIPPED`; next cycle it adopted the
+position as `foreign`, so it was never re-armed, never settled and never recorded. **Fix:**
+`RecoveryBody` now carries `side`/`entryPrice`/`quantity`/`stopLoss`; `lib/engine.ts` adopts the
+position into the ledger (`ENTRY_RECOVERED`) and halts new entries until an operator looks
+(`ENTRY_UNRESOLVED` when nothing could be adopted).
+
+### R2-5 · HIGH — the daily-loss breaker failed *open* and under-counted
+`getRealizedPnlToday()` returned `NaN` on any error and the order path coerced it to `0`, i.e. "no
+losses today"; it also summed only `REALIZED_PNL`, ignoring commission and funding.
+**Fix:** the same call now returns realized + commission + funding, and `dailyLossGate()` blocks
+with `DAILY_LOSS_UNKNOWN` when the number cannot be read (only when a breaker is configured) and
+`DAILY_LOSS_BREAKER` when the day's net loss exceeds the cap.
+
+### R2-6 · MEDIUM — a whole-number close could be sent as the invalid quantity `"2."`
+`Math.abs(amt).toFixed(8).replace(/0+$/, '')` produced `"2."`, which Binance rejects — after the
+exchange brackets had already been cancelled. **Fix:** `formatQtyFallback()` trims the separator
+too; used by the close path when no filters are available.
+
+### R2-7 · MEDIUM — the builtin filter table was a *guess* presented as exchange truth
+With `exchangeInfo` unreachable, `resolveSpec()` returned `known: true, source: 'builtin'` for the 12
+default symbols, so tick sizes and min-notional came from a frozen copy — the same class of bug as
+B1/B2. **Fix:** builtin specs are now `known: false` (display hint only); sizing and stop alignment
+refuse with `SPEC_UNKNOWN` until real filters load.
+
+### R2-8 · MEDIUM — hedge-mode accounts failed only at the exchange
+No `positionSide`, `reduceOnly` closes — Hedge Mode rejects both. **Fix:** `getPositionMode()`
+(5-min cache) + `positionModeViolation()` refuse entries up front with an actionable message; an
+undeterminable mode is left to the exchange rather than blocking trading on a metadata blip.
+
+### R2-9 · MEDIUM/LOW — two books that could diverge, plus clickjacking and cookie hygiene
+The browser still books closes on a flat 0.1% fee estimate into its own localStorage compounding
+ladder (the engine books settled income), so the two ladders can drift; the browser TP/SL monitor
+triggers on the last 5m candle close rather than mark price. The page was also framable by any site
+(clickjacking a START/CLOSE button) — **fixed** with `X-Frame-Options: DENY` +
+`frame-ancestors 'none'` — and the Binance session cookie still lacks `Secure` (**not** changed in
+this round). Still open: no backtest, no alerting, browser-side PnL estimates, and the strategy's
+record is zero.
+
+### Verification run for this round
+`npx tsc --noEmit` clean · `npm run lint` clean · `npm test` **63/63** · `NODE_ENV=production next
+build` OK (14 routes, incl. the 3 new operator routes) · `npm ci --dry-run` OK ·
+live probes: anonymous `POST /execute` → 401 `OPERATOR_AUTH_REQUIRED` (was: reached Binance),
+anonymous `/api/engine/control` → 401 (was: 200 + persisted), `/api/operator/status` → `required:
+true, configured: true, authenticated: false`, signed-in request → 409 `POLICY_BLOCKED` with the
+three cap violations.
+
+### Not verified here (unchanged from round 1)
+No order was ever placed against a real exchange in this environment (egress is allowlisted), so
+bracket acceptance — in particular whether Binance accepts `timeInForce` on `STOP_MARKET` with
+`closePosition=true` — still has exactly one way to be proven: a live testnet run.
 
 ---
 

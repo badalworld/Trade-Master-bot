@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAccount, publicGet, TESTNET_BASE, MAINNET_BASE } from '@/lib/binance-client';
 import { loadRiskPolicy, policySummary } from '@/lib/risk-policy';
+import { requireOperator } from '@/lib/operator-auth';
 import {
   checkRequestIntegrity,
   envCredentials,
@@ -24,6 +25,12 @@ export async function POST(req: NextRequest) {
   try {
     const integrity = checkRequestIntegrity(req);
     if (!integrity.ok) return NextResponse.json({ success: false, error: integrity.error }, { status: 403 });
+
+    // Minting a credential session is an operator action: gate it exactly like an order.
+    const operator = requireOperator(req);
+    if (!operator.ok) {
+      return NextResponse.json({ success: false, code: operator.code, error: operator.error }, { status: operator.httpStatus });
+    }
 
     if (envCredentials()) {
       return NextResponse.json(
@@ -98,6 +105,13 @@ export async function POST(req: NextRequest) {
 }
 
 export async function GET(req: NextRequest) {
+  // Reading session state leaks the key hint and the live policy, so it is operator-gated too.
+  // (No-op when this deployment needs no operator session — see `requireOperator`.)
+  const operator = requireOperator(req);
+  if (!operator.ok) {
+    return NextResponse.json({ success: false, code: operator.code, error: operator.error }, { status: operator.httpStatus });
+  }
+
   const status = sessionStatus(req);
   const policy = loadRiskPolicy();
   const ping = await publicGet(req.nextUrl.searchParams.get('testnet') === 'false' ? false : status.isTestnet, '/fapi/v1/ping', '', 4000)
@@ -119,6 +133,11 @@ export async function GET(req: NextRequest) {
 export async function DELETE(req: NextRequest) {
   const integrity = checkRequestIntegrity(req);
   if (!integrity.ok) return NextResponse.json({ success: false, error: integrity.error }, { status: 403 });
+
+  const operator = requireOperator(req);
+  if (!operator.ok) {
+    return NextResponse.json({ success: false, code: operator.code, error: operator.error }, { status: operator.httpStatus });
+  }
 
   const token = readSessionToken(req);
   const had = Boolean(token);

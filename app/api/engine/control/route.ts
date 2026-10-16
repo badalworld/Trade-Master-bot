@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { engine } from '@/lib/engine';
 import { checkRequestIntegrity } from '@/lib/trade-guard';
+import { requireOperator } from '@/lib/operator-auth';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,6 +15,12 @@ type Action = 'start' | 'stop' | 'halt-entries' | 'resume-entries' | 'flatten-al
 export async function POST(req: NextRequest) {
   const integrity = checkRequestIntegrity(req);
   if (!integrity.ok) return NextResponse.json({ success: false, error: integrity.error, code: 'ORIGIN_REJECTED' }, { status: 403 });
+
+  // Engine controls can flatten real positions and arm unattended entries — operator-only.
+  const operator = requireOperator(req);
+  if (!operator.ok) {
+    return NextResponse.json({ success: false, code: operator.code, error: operator.error }, { status: operator.httpStatus });
+  }
 
   const body = (await req.json().catch(() => ({}))) as {
     action?: string;

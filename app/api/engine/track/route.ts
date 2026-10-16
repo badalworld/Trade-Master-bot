@@ -3,6 +3,7 @@ import { getLivePositions } from '@/lib/binance-client';
 import { ledger } from '@/lib/position-ledger';
 import { roundCryptoPrice } from '@/lib/trading-engine';
 import { checkRequestIntegrity, envCredentials } from '@/lib/trade-guard';
+import { requireOperator } from '@/lib/operator-auth';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -31,6 +32,12 @@ export async function POST(req: NextRequest) {
   try {
     const integrity = checkRequestIntegrity(req);
     if (!integrity.ok) return NextResponse.json({ success: false, error: integrity.error }, { status: 403 });
+
+    // Registering a position changes what the guardian will protect/settle — operator-only.
+    const operator = requireOperator(req);
+    if (!operator.ok) {
+      return NextResponse.json({ success: false, code: operator.code, error: operator.error }, { status: operator.httpStatus });
+    }
 
     const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
     const symbol = String(body.symbol ?? '').toUpperCase();
@@ -103,6 +110,11 @@ export async function POST(req: NextRequest) {
 export async function DELETE(req: NextRequest) {
   const integrity = checkRequestIntegrity(req);
   if (!integrity.ok) return NextResponse.json({ success: false, error: integrity.error }, { status: 403 });
+
+  const operator = requireOperator(req);
+  if (!operator.ok) {
+    return NextResponse.json({ success: false, code: operator.code, error: operator.error }, { status: operator.httpStatus });
+  }
 
   const symbol = (req.nextUrl.searchParams.get('symbol') ?? '').toUpperCase();
   if (!symbol) return NextResponse.json({ success: false, error: 'symbol query param is required' }, { status: 400 });

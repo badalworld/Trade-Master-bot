@@ -213,24 +213,79 @@ export async function getLivePositions(creds: BinanceCreds): Promise<LivePositio
 }
 
 /**
- * Realized PnL for the current UTC day straight from /fapi/v1/income. This is what the daily loss
- * breaker keys on, so it cannot be reset by clearing browser storage or restarting the process.
+ * Net realized PnL for the current UTC day straight from /fapi/v1/income: realized PnL **plus
+ * commission plus funding**, because those are real money that the day's P&L has to include — a
+ * breaker that ignores fees under-reports losses on exactly the leveraged scalps this bot takes.
+ * Keys on the exchange, so it cannot be reset by clearing browser storage or restarting a process.
+ *
+ * Returns `NaN` when the exchange cannot be asked; `dailyLossGate` treats that as a hard stop
+ * (fail closed) rather than as "no losses today".
  */
 export async function getRealizedPnlToday(creds: BinanceCreds): Promise<number> {
   const startUtcDay = Math.floor(Date.now() / 86400000) * 86400000;
   try {
     const { data } = await signedRequest<Json[]>(creds, 'GET', '/fapi/v1/income', {
       startTime: startUtcDay,
-      incomeType: 'REALIZED_PNL',
       limit: 1000,
     });
-    if (!Array.isArray(data)) return 0;
-    return data.reduce((acc, row) => acc + (parseFloat(String(row.income ?? '0')) || 0), 0);
+    if (!Array.isArray(data)) return NaN;
+    let total = 0;
+    for (const row of data) {
+      const type = String(row.incomeType ?? '');
+      if (type === 'REALIZED_PNL' || type === 'COMMISSION' || type === 'FUNDING_FEE') {
+        total += parseFloat(String(row.income ?? '0')) || 0;
+      }
+    }
+    return total;
   } catch {
-    // If the income endpoint is unavailable we must NOT invent a number; callers treat
-    // `null` as "unknown" and skip the breaker rather than trusting a fake 0.
+    // Never invent a number here: the caller decides what "unknown" means (and must fail closed).
     return NaN;
   }
+}
+
+export interface PositionMode {
+  /** True = Hedge Mode (LONG/SHORT held separately) — unsupported by this bot. */
+  dualSidePosition: boolean;
+}
+
+let positionModeCache: { at: number; value: boolean | null } = { at: 0, value: null };
+const POSITION_MODE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * One-Way vs Hedge mode for the account. Cached briefly because it changes only when an operator
+ * changes it in the Binance UI, and the endpoint costs weight on every call.
+ *
+ * Returns `null` when the mode cannot be determined: callers must decide (entries treat an
+ * unknown mode as "let the exchange reject the order" — a rejected order is loud and safe, while
+ * refusing to trade during an API blip is not always better). `__resetPositionModeCache` is a test
+ * seam.
+ */
+export async function getPositionMode(creds: BinanceCreds): Promise<boolean | null> {
+  const now = Date.now();
+  if (positionModeCache.value !== null && now - positionModeCache.at < POSITION_MODE_TTL_MS) {
+    return positionModeCache.value;
+  }
+  try {
+    const { data } = await signedRequest<Json>(creds, 'GET', '/fapi/v1/positionSide/dual', {});
+    const dual = data?.dualSidePosition;
+    if (typeof dual === 'boolean') {
+      positionModeCache = { at: now, value: dual };
+      return dual;
+    }
+    if (typeof dual === 'string') {
+      const parsed = dual.trim().toLowerCase() === 'true';
+      positionModeCache = { at: now, value: parsed };
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Test seam: forget the cached position mode. */
+export function __resetPositionModeCache(): void {
+  positionModeCache = { at: 0, value: null };
 }
 
 export interface OrderAck {

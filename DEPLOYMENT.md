@@ -3,29 +3,59 @@
 The build is container-ready (`output: 'standalone'`, `Dockerfile`). Deploying it is fine.
 **Wiring mainnet keys to it is not, until the checklist below is complete.**
 
+> **Operator authentication is mandatory as soon as server keys are configured.** Round-1 hardening
+> left the order endpoints reachable by any HTTP client that sent `X-TM-Request: 1`; that header is a
+> CSRF guard, not authentication. If `BINANCE_API_KEY`/`BINANCE_API_SECRET` are set and
+> `TM_OPERATOR_TOKEN` is not, every money endpoint now refuses with **503
+> `OPERATOR_AUTH_NOT_CONFIGURED`** — locked is better than an open order relay. Set the token (and
+> then sign in from the operator screen) before funding anything.
+
 ---
+
+## 0. Build prerequisites
+
+- The committed `package-lock.json` must stay in sync with `package.json`, or `npm ci` (used by both
+  Docker stages) fails with `EUSAGE` and no image is produced. After changing dependencies run
+  `npm install` and commit the lock file. Verify with `npm ci --dry-run`.
+- `npm test` runs on Node's native TypeScript support, so the builder needs **Node ≥ 22.18**
+  (`node:22-alpine` is fine) or the `test` stage of the Dockerfile will fail the build.
 
 ## 1. Phase one — testnet only (recommended first deploy)
 
 ```bash
-# Build + push
-gcloud builds submit --tag gcloudbuild/region/trade-master:0.1.0
+# Build + push (REGION and PROJECT are real values, not placeholders)
+gcloud builds submit --tag REGION-docker.pkg.dev/PROJECT/trade-master/trade-master:0.1.0
 gcloud run deploy trade-master \
-  --image gcloudbuild/region/trade-master:0.1.0 \
-  --platform managed --region region \
+  --image REGION-docker.pkg.dev/PROJECT/trade-master/trade-master:0.1.0 \
+  --platform managed --region REGION \
   --allow-unauthenticated \
   --min-instances=1 --max-instances=1 \
   --port=8080 \
   --memory=512Mi \
+  --set-secrets="BINANCE_API_KEY=binance-key:latest,BINANCE_API_SECRET=binance-secret:latest,TM_OPERATOR_TOKEN=operator-token:latest" \
   --set-env-vars="BINANCE_TESTNET=true,TRADE_ALLOW_MAINNET=false,TRADE_MAX_MARGIN_USDT=25,TRADE_MAX_NOTIONAL_USDT=500"
 ```
 
-Two ways to supply credentials:
+Generate the operator token once and store it as a secret:
+
+```bash
+openssl rand -hex 32 | gcloud secrets create operator-token --data-file=-
+```
+
+`--allow-unauthenticated` is then acceptable: the app authenticates you itself, and the operator
+cookie is a signed httpOnly cookie (12 h). Alternatives, if you prefer to keep the URL private too:
+
+- `--no-allow-unauthenticated` + IAM/IAP (the browser needs an identity-aware proxy; plain IAM alone
+  cannot log a browser in), or
+- keep `--allow-unauthenticated` and set `TM_OPERATOR_AUTH=off` **only** behind your own
+  authenticating reverse proxy.
+
+Two ways to supply Binance credentials:
 
 | Method | How | Notes |
 |---|---|---|
-| **Server secret (preferred)** | `--set-secrets="BINANCE_API_KEY=binance-key:latest,BINANCE_API_SECRET=binance-secret:latest"` | Keys never touch a browser. Safe to scale past 1 instance. |
-| Browser session | Settings → Verify & open session | Keys held in **server memory** behind an 8h httpOnly cookie. Requires `--max-instances=1`, or a session lands on an instance that doesn't have it. |
+| **Server secret (preferred)** | `--set-secrets="BINANCE_API_KEY=binance-key:latest,BINANCE_API_SECRET=binance-secret:latest"` | Keys never touch a browser. Safe to scale past 1 instance. Requires `TM_OPERATOR_TOKEN`. |
+| Browser session | Settings → Verify & open session (after operator sign-in) | Keys held in **server memory** behind an 8h httpOnly cookie. Requires `--max-instances=1`, or a session lands on an instance that doesn't have it. |
 
 Either way the keys are **never** written to `localStorage`, never returned to the client, and never
 logged. Older builds did all three; on first launch the app now scrubs any leftover key from
@@ -71,6 +101,7 @@ will additionally require typing `I UNDERSTAND` before it accepts mainnet keys.
 | Stop new entries now | `gcloud run services update trade-master --region=... --set-env-vars="TRADE_HALT=true"` (closes still work, so you can unwind) |
 | Flatten + stop everything | Pause the bot in the UI, then close each row in **Positions**; verify in the Binance app |
 | Key possibly leaked | Delete the key on Binance first (kills the money path), then revoke the session in Settings |
+| Operator token or session possibly exposed | Rotate `TM_OPERATOR_TOKEN` (every signed operator cookie stops verifying at once — the token itself is never stored in a browser), then set a fresh secret and redeploy. `TM_OPERATOR_AUTH=off` should only ever be used behind platform auth |
 
 ## 5. Unattended operation: the server-side engine
 
@@ -149,20 +180,45 @@ acceptance and income settlement still have exactly one source of truth: a real 
 
 ## 6. Verifying a deploy
 
-```bash
-curl -s https://<service>/api/binance/credentials | jq '{active, source, isTestnet, policy}'
-curl -s https://<service>/api/network/ip | jq '{ipv4, verified, warnings}'
-curl -s -X POST https://<service>/api/binance/execute \
-  -H 'Content-Type: application/json' -H 'X-TM-Request: 1' \
-  -d '{"action":"OPEN","symbol":"BTCUSDT","side":"LONG","margin":99999,"leverage":50,"price":111000,"stopLoss":110000,"takeProfit":113000}' | jq
-# expect 409 POLICY_BLOCKED with LEVERAGE_OUT_OF_RANGE + MARGIN_TOO_LARGE + NOTIONAL_TOO_LARGE
+Run these in order. The first block is the one that matters: a stranger must not be able to trade.
 
-# Engine state (needs the app header; a bare browser visit must be 403):
-curl -s -H 'X-TM-Request: 1' https://<service>/api/engine/status | jq '{engine: .engine | {running, enabled: .config.enabled, cycles, credentialSource, network, ledgerDurable, ownedPositions, lastError}, ledger: .ledger.network}'
+```bash
+# 1. Does this deployment demand an operator session?
+curl -s https://<service>/api/operator/status | jq
+# expect {"required":true,"configured":true,"mode":"auto","authenticated":false}
+
+# 2. Anonymous order attempt — must be refused by AUTH, not by policy or by the network:
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<service>/api/binance/execute \
+  -H 'Content-Type: application/json' -H 'X-TM-Request: 1' \
+  -d '{"action":"OPEN","symbol":"BTCUSDT","side":"LONG","margin":2,"leverage":10,"price":111000,"stopLoss":110000,"takeProfit":113000}'
+# expect 401  (503 OPERATOR_AUTH_NOT_CONFIGURED means TM_OPERATOR_TOKEN is missing; 200/409 means EXPOSED)
+
+# 3. Anonymous engine control — must also be refused:
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<service>/api/engine/control \
+  -H 'Content-Type: application/json' -H 'X-TM-Request: 1' -d '{"action":"set-auto-entry","enabled":true}'
+# expect 401
+
+# 4. Sign in and confirm policy still blocks absurd sizes (cookie jar keeps the session):
+curl -s -c /tmp/tm.jar -X POST https://<service>/api/operator/login \
+  -H 'Content-Type: application/json' -H 'X-TM-Request: 1' -d '{"token":"<TM_OPERATOR_TOKEN>"}' | jq '{success, expiresAt}'
+curl -s -b /tmp/tm.jar -X POST https://<service>/api/binance/execute \
+  -H 'Content-Type: application/json' -H 'X-TM-Request: 1' \
+  -d '{"action":"OPEN","symbol":"BTCUSDT","side":"LONG","margin":99999,"leverage":50,"price":111000,"stopLoss":110000,"takeProfit":113000}' | jq '.code, .violations[].code'
+# expect 409 POLICY_BLOCKED with LEVERAGE_OUT_OF_RANGE + MARGIN_TOO_LARGE + NOTIONAL_TOO_LARGE
+# (the order is still never submitted — the caps are independent of the session)
+
+# 5. Session state + engine:
+curl -s -b /tmp/tm.jar https://<service>/api/binance/credentials | jq '{active, source, isTestnet, policy}'
+curl -s -b /tmp/tm.jar -H 'X-TM-Request: 1' https://<service>/api/engine/status \
+  | jq '{engine: .engine | {running, enabled: .config.enabled, cycles, credentialSource, network, ledgerDurable, ownedPositions, lastError}, ledger: .ledger.network}'
 # With TRADE_ENGINE_ENABLED=true and env credentials you must see running:true, credentialSource:"env",
 # cycles increasing every interval, and ledgerDurable:true. With the flag off, running:false is correct.
-# A stray visitor gets: curl -s https://<service>/api/engine/status  ->  {"code":"ORIGIN_REJECTED"} (403)
+
+# 6. Egress IP for the Binance key whitelist (never whitelist anything it did not verify):
+curl -s https://<service>/api/network/ip | jq '{ipv4, verified, warnings}'
 ```
 
-That last probe is the important one: with no session it must be **401/403**, and with a session it
-must be **409 POLICY_BLOCKED**. Any other answer means this deployment is exposed — do not fund it.
+Rules of thumb: **401 is the correct answer for every anonymous money call.** If step 2 or 3 returns
+anything else, do not fund the deployment. Clickjacking is blocked by `X-Frame-Options: DENY` +
+`frame-ancestors 'none'`, so this page cannot be embedded in another site (if you *need* it embedded
+in an applet shell, that trade-off has to be made deliberately in `next.config.ts`).

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { BinanceApiError, getAccount, getIncome, getLivePositions } from '@/lib/binance-client';
 import { checkRequestIntegrity, resolveCredentials } from '@/lib/trade-guard';
+import { requireOperator } from '@/lib/operator-auth';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -13,6 +14,11 @@ export async function POST(req: NextRequest) {
   try {
     const integrity = checkRequestIntegrity(req);
     if (!integrity.ok) return NextResponse.json({ success: false, error: integrity.error }, { status: 403 });
+
+    const operator = requireOperator(req);
+    if (!operator.ok) {
+      return NextResponse.json({ success: false, code: operator.code, error: operator.error }, { status: operator.httpStatus });
+    }
 
     const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
     for (const forbidden of ['apiKey', 'apiSecret']) {

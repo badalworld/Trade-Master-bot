@@ -4,12 +4,13 @@ import {
   alignPriceToTick,
   buildSpecMap,
   computeOrderQuantity,
+  formatQtyFallback,
   formatToStep,
   resolveSpec,
   validateEntryBracket,
   type SymbolFilters,
 } from './exchange-specs.ts';
-import { loadRiskPolicy, validateOpenRequest } from './risk-policy.ts';
+import { dailyLossGate, loadRiskPolicy, positionModeViolation, validateOpenRequest } from './risk-policy.ts';
 
 const BTC: SymbolFilters = {
   stepSize: 0.001,
@@ -269,6 +270,78 @@ test('B4: position cap and symbol allowlist are enforced server-side', () => {
   assert.equal(offlist.ok, false);
   if (offlist.ok) return;
   assert.ok(offlist.violations.some((v) => v.code === 'SYMBOL_NOT_ALLOWED'));
+});
+
+// ---------------------------------------------------------------------------
+// Round 2 fixes
+// ---------------------------------------------------------------------------
+
+test('F7 regression: the builtin filter table is a hint, never an authority for live sizing', () => {
+  // exchangeInfo unreachable => specMap null. The old code returned known:true from BUILTIN and
+  // sized a real order on a frozen copy of Binance's filters.
+  const fallback = resolveSpec('BTCUSDT', null);
+  assert.equal(fallback.known, false);
+  assert.equal(fallback.source, 'builtin');
+
+  const sized = computeOrderQuantity({ requestedNotional: 150, price: 111000, spec: fallback });
+  assert.equal(sized.ok, false);
+  if (sized.ok) return;
+  assert.equal(sized.code, 'SPEC_UNKNOWN');
+
+  // Stops cannot be aligned either, so no stop order is built from a guessed tick.
+  assert.equal(alignPriceToTick(110000, fallback, 'stopLoss').ok, false);
+
+  // Real exchangeInfo still works exactly as before.
+  const real = resolveSpec('BTCUSDT', { BTCUSDT: BTC });
+  assert.equal(real.known, true);
+  assert.equal(real.source, 'exchangeInfo');
+});
+
+test('F6 regression: a whole-number close quantity is never rendered as "2."', () => {
+  assert.equal(formatQtyFallback(2), '2');
+  assert.equal(formatQtyFallback(2.5), '2.5');
+  assert.equal(formatQtyFallback(0.000001), '0.000001');
+  assert.equal(formatQtyFallback(1234), '1234');
+  assert.equal(formatQtyFallback(1.23000001), '1.23000001');
+  // Never exponent notation, never a trailing separator, never negative.
+  assert.equal(formatQtyFallback(0), '0');
+  assert.equal(formatQtyFallback(-5), '0');
+  assert.equal(formatQtyFallback(Number.NaN), '0');
+  for (const value of [2, 2.5, 0.5, 10, 0.000001, 100]) {
+    const out = formatQtyFallback(value);
+    assert.doesNotMatch(out, /\.$/, `${out} must not end with a decimal point`);
+    assert.doesNotMatch(out, /e/i, `${out} must be a plain decimal`);
+  }
+});
+
+test('F5 regression: the daily loss breaker fails closed when PnL cannot be read', () => {
+  const policy = loadRiskPolicy({ TRADE_MAX_DAILY_LOSS_USDT: '50' });
+
+  // Unknown (income endpoint unreachable) is NOT "no loss today".
+  const unknown = dailyLossGate(policy, null);
+  assert.equal(unknown.ok, false);
+  if (unknown.ok) return;
+  assert.equal(unknown.code, 'DAILY_LOSS_UNKNOWN');
+  assert.match(unknown.message, /could not be read/);
+
+  const breached = dailyLossGate(policy, -50.01);
+  assert.equal(breached.ok, false);
+  if (breached.ok) return;
+  assert.equal(breached.code, 'DAILY_LOSS_BREAKER');
+
+  assert.equal(dailyLossGate(policy, -49.99).ok, true);
+  assert.equal(dailyLossGate(policy, 0).ok, true);
+
+  // A deliberately disabled breaker (0) still tolerates an unreadable number.
+  assert.equal(dailyLossGate(loadRiskPolicy({ TRADE_MAX_DAILY_LOSS_USDT: '0' }), null).ok, true);
+});
+
+test('F9 regression: hedge mode is refused with an actionable message before any order is sent', () => {
+  const violation = positionModeViolation(true);
+  assert.ok(violation);
+  assert.equal(violation?.code, 'HEDGE_MODE_UNSUPPORTED');
+  assert.match(violation?.message ?? '', /One-Way Mode/);
+  assert.equal(positionModeViolation(false), null);
 });
 
 test('B4: env overrides tighten policy and defaults are never looser than the strategy intends', () => {

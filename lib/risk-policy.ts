@@ -187,6 +187,53 @@ export function validateOpenRequest(
   return { ok: true };
 }
 
+/**
+ * Daily-loss breaker, kept as its own decision so the "unknown PnL" case cannot be silently
+ * treated as "no loss". `realizedPnlTodayUsdt === null` means the exchange could not be asked
+ * (network/limit failure) — with a breaker configured that must FAIL CLOSED, because the whole
+ * point of the breaker is to stop trading after a bad day, and a bot that keeps trading whenever
+ * the income endpoint hiccups is not a breaker at all.
+ */
+export function dailyLossGate(
+  policy: RiskPolicy,
+  realizedPnlTodayUsdt: number | null
+): { ok: true } | { ok: false; code: 'DAILY_LOSS_BREAKER' | 'DAILY_LOSS_UNKNOWN'; message: string } {
+  if (policy.maxDailyLossUsdt <= 0) return { ok: true };
+
+  if (realizedPnlTodayUsdt === null || !Number.isFinite(realizedPnlTodayUsdt)) {
+    return {
+      ok: false,
+      code: 'DAILY_LOSS_UNKNOWN',
+      message: `Today's realized PnL could not be read from Binance (/fapi/v1/income), so the $${policy.maxDailyLossUsdt.toFixed(2)} daily-loss breaker cannot be evaluated. Entries are locked until the exchange answers — retry in a moment.`,
+    };
+  }
+
+  if (realizedPnlTodayUsdt <= -policy.maxDailyLossUsdt) {
+    return {
+      ok: false,
+      code: 'DAILY_LOSS_BREAKER',
+      message: `Daily loss breaker tripped: net realized PnL today is $${realizedPnlTodayUsdt.toFixed(2)}, beyond the $${policy.maxDailyLossUsdt.toFixed(2)} limit (TRADE_MAX_DAILY_LOSS_USDT). Entries locked for the rest of the UTC day.`,
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * USDT-M futures accounts come in two position modes. This bot is written for One-Way mode:
+ * orders carry no `positionSide`, and closes use `reduceOnly`, which Hedge Mode rejects. Nothing
+ * here switches the mode (that is an account-wide change that fails while positions are open), so
+ * entries are refused with an actionable message instead of failing at the exchange.
+ */
+export function positionModeViolation(dualSidePosition: boolean): Violation | null {
+  if (!dualSidePosition) return null;
+  return {
+    code: 'HEDGE_MODE_UNSUPPORTED',
+    message:
+      'This Binance account is in Hedge Mode, but the bot places One-Way orders (no positionSide, reduceOnly closes). Switch the Futures account to One-Way Mode in the Binance UI before trading. No order was sent.',
+  };
+}
+
 /** Public-safe summary for the UI (never exposes secrets). */
 export function policySummary(policy: RiskPolicy) {
   return {

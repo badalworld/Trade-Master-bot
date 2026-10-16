@@ -13,6 +13,7 @@ import { SettingsView, type BotSettings } from '@/components/SettingsView';
 import { PnlChartWidget } from '@/components/PnlChartWidget';
 import { TradeResultOverlay, type TradeResultPayload } from '@/components/TradeResultOverlay';
 import { EngineStatusPanel, type EngineStatusPayload } from '@/components/EngineStatusPanel';
+import { OperatorGate, signOutOperator } from '@/components/OperatorGate';
 import { generateUniqueId } from '@/lib/utils';
 import type { CredentialSession } from '@/components/SettingsView';
 import {
@@ -57,6 +58,9 @@ const SESSION_NONE: CredentialSession = {
   isTestnet: true,
 };
 
+/** Fired when a money endpoint answers "operator session required" so the UI can re-lock itself. */
+const OPERATOR_LOCK_EVENT = 'tm-operator-locked';
+
 /**
  * Every mutating call carries `X-TM-Request` so the cookie-authenticated endpoints reject anything
  * a cross-site form or fetch could reproduce, and no call ever carries API keys.
@@ -72,6 +76,10 @@ async function apiPost<T extends Record<string, unknown>>(
     body: JSON.stringify(payload),
   });
   const data = (await res.json().catch(() => ({}))) as T;
+  const code = String((data as { code?: unknown }).code ?? '');
+  if ((res.status === 401 || res.status === 503) && code.startsWith('OPERATOR_')) {
+    if (typeof window !== 'undefined') window.dispatchEvent(new Event(OPERATOR_LOCK_EVENT));
+  }
   return { ok: res.ok, status: res.status, data };
 }
 
@@ -147,6 +155,14 @@ export default function HomePage() {
     remainingWeight: 1116,
   });
   const [logs, setLogs] = useState<LogEntry[]>(INITIAL_LOGS);
+
+  // Operator session: when this deployment holds server-side Binance keys, the money endpoints
+  // require a signed operator cookie — the CSRF header alone is not authentication.
+  const [operator, setOperator] = useState<{
+    required: boolean;
+    configured: boolean;
+    authenticated: boolean;
+  } | null>(null);
 
   // Server-side guardian: authoritative position protection + ledger, alive without this tab.
   const [engineState, setEngineState] = useState<EngineStatusPayload | null>(null);
@@ -530,6 +546,40 @@ export default function HomePage() {
       clearInterval(interval);
     };
   }, []);
+
+  // Operator session state (public endpoint: it only reports *whether* a session is required).
+  const refreshOperator = useCallback(async () => {
+    try {
+      const res = await fetch('/api/operator/status', { credentials: 'same-origin', cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      setOperator({
+        required: Boolean(data.required),
+        configured: Boolean(data.configured),
+        authenticated: Boolean(data.authenticated),
+      });
+    } catch {
+      /* server unreachable — leave the current view alone */
+    }
+  }, []);
+
+  useEffect(() => {
+    // Scheduled rather than called inline so the effect body performs no state update itself.
+    const kick = setTimeout(() => void refreshOperator(), 250);
+    const interval = setInterval(() => void refreshOperator(), 60000);
+    const onLocked = () =>
+      setOperator((prev) => ({
+        required: true,
+        configured: prev ? prev.configured : true,
+        authenticated: false,
+      }));
+    window.addEventListener(OPERATOR_LOCK_EVENT, onLocked);
+    return () => {
+      clearTimeout(kick);
+      clearInterval(interval);
+      window.removeEventListener(OPERATOR_LOCK_EVENT, onLocked);
+    };
+  }, [refreshOperator]);
 
   // Auto-sync account whenever a server session exists, every 30s.
   useEffect(() => {
@@ -1440,6 +1490,12 @@ export default function HomePage() {
   const selectedActivePosition = positions.find((p) => p.symbol === activeSymbolForChart);
   const availableSymbols = signals.map((s) => s.symbol);
 
+  // Nothing on this page is reachable before the operator signs in — every money endpoint behind it
+  // answers 401 until then, so rendering the terminal would only show a broken shell.
+  if (operator && operator.required && !operator.authenticated) {
+    return <OperatorGate configured={operator.configured} onAuthenticated={() => void refreshOperator()} />;
+  }
+
   return (
     <div className="min-h-screen w-full max-w-full overflow-x-hidden bg-slate-950 text-slate-100 flex flex-col font-sans">
       {/* 1. Header (Top Bar Contract) */}
@@ -1596,6 +1652,13 @@ export default function HomePage() {
             botActive={botActive}
             onStartBot={handleStartBot}
             onPauseBot={handlePauseBot}
+            operator={operator ? { required: operator.required, authenticated: operator.authenticated } : null}
+            onOperatorSignOut={() => {
+              void (async () => {
+                await signOutOperator();
+                await refreshOperator();
+              })();
+            }}
           />
         )}
       </main>

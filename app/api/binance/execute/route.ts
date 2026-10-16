@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { closePosition, openPosition, type OpenIntent } from '@/lib/order-executor';
 import { checkRequestIntegrity, resolveCredentials } from '@/lib/trade-guard';
+import { requireOperator } from '@/lib/operator-auth';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -16,6 +17,13 @@ export async function POST(req: NextRequest) {
     const integrity = checkRequestIntegrity(req);
     if (!integrity.ok) {
       return NextResponse.json({ success: false, error: integrity.error, code: 'ORIGIN_REJECTED' }, { status: 403 });
+    }
+
+    // Authentication, not just CSRF: `X-TM-Request` is a header any HTTP client can set, so without
+    // this an anonymous caller could submit orders against server-side keys.
+    const operator = requireOperator(req);
+    if (!operator.ok) {
+      return NextResponse.json({ success: false, code: operator.code, error: operator.error }, { status: operator.httpStatus });
     }
 
     const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
