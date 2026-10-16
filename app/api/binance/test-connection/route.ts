@@ -1,108 +1,95 @@
 import { NextRequest, NextResponse } from 'next/server';
-import crypto from 'crypto';
+import { baseUrlFor, getAccount, publicGet } from '@/lib/binance-client';
+import { loadRiskPolicy, policySummary } from '@/lib/risk-policy';
+import { checkRequestIntegrity, envCredentials, resolveCredentials, sessionStatus } from '@/lib/trade-guard';
 
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+/**
+ * Connectivity + credential preflight. Deliberately accepts no keys in the body; it reports on
+ * whatever credential the server currently resolves (env or session).
+ */
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const { apiKey, apiSecret, isTestnet = false } = body;
+    const integrity = checkRequestIntegrity(req);
+    if (!integrity.ok) return NextResponse.json({ success: false, error: integrity.error }, { status: 403 });
 
-    const baseUrl = isTestnet
-      ? 'https://testnet.binancefuture.com'
-      : 'https://fapi.binance.com';
-
-    // 1. Test basic connectivity (Ping)
-    const startTime = Date.now();
-    let pingSuccess = false;
-    let pingLatency = 0;
-
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 4000);
-      const pingRes = await fetch(`${baseUrl}/fapi/v1/ping`, {
-        signal: controller.signal,
-        cache: 'no-store',
-      });
-      clearTimeout(timeout);
-      pingLatency = Date.now() - startTime;
-      pingSuccess = pingRes.ok;
-    } catch {
-      pingLatency = Date.now() - startTime;
-      pingSuccess = false;
+    const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+    if (body.apiKey !== undefined || body.apiSecret !== undefined) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: 'CREDENTIALS_IN_BODY',
+          error: 'Keys are no longer passed per-request. Save them once via /api/binance/credentials (or server env).',
+        },
+        { status: 400 }
+      );
     }
 
-    // 2. If credentials provided, attempt authenticated account balance query
+    const status = sessionStatus(req);
+    const isTestnet = status.active ? status.isTestnet : envCredentials()?.isTestnet ?? true;
+    const baseUrl = baseUrlFor(isTestnet);
+
+    const started = Date.now();
+    let pingOk = false;
+    let pingError: string | null = null;
+    try {
+      await publicGet(isTestnet, '/fapi/v1/ping', '', 5000);
+      pingOk = true;
+    } catch (err) {
+      pingError = (err as Error).message;
+    }
+    const latencyMs = Date.now() - started;
+
+    const resolution = resolveCredentials(req);
+    const policy = loadRiskPolicy();
+
     let authValid = false;
     let balanceInfo = null;
-    let errorMessage: string | null = null;
+    let errorMessage: string | null = resolution.ok ? null : resolution.error;
 
-    if (apiKey && apiSecret) {
+    if (resolution.ok) {
       try {
-        const timestamp = Date.now();
-        const queryString = `timestamp=${timestamp}&recvWindow=5000`;
-        const signature = crypto
-          .createHmac('sha256', apiSecret)
-          .update(queryString)
-          .digest('hex');
-
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
-        const accountRes = await fetch(
-          `${baseUrl}/fapi/v2/account?${queryString}&signature=${signature}`,
-          {
-            headers: {
-              'X-MBX-APIKEY': apiKey,
-            },
-            signal: controller.signal,
-            cache: 'no-store',
-          }
-        );
-        clearTimeout(timeout);
-
-        if (accountRes.ok) {
-          const accData = await accountRes.json();
-          authValid = true;
-          pingSuccess = true;
-          balanceInfo = {
-            totalWalletBalance: parseFloat(accData.totalWalletBalance || '0'),
-            totalUnrealizedProfit: parseFloat(accData.totalUnrealizedProfit || '0'),
-            availableBalance: parseFloat(accData.availableBalance || '0'),
-            canTrade: accData.canTrade ?? true,
-          };
-        } else {
-          const errData = await accountRes.json().catch(() => ({}));
-          errorMessage =
-            errData.msg || `Binance API rejected credentials (HTTP ${accountRes.status})`;
-        }
-      } catch (err: unknown) {
-        const error = err as Error;
-        errorMessage = error.message || 'Network error reaching Binance Futures API';
+        const account = await getAccount(resolution.creds);
+        authValid = true;
+        pingOk = true;
+        balanceInfo = {
+          totalWalletBalance: account.totalWalletBalance,
+          availableBalance: account.availableBalance,
+          totalUnrealizedProfit: account.totalUnrealizedProfit,
+          canTrade: account.canTrade,
+        };
+      } catch (err) {
+        errorMessage = (err as Error).message || 'Binance rejected the credentials';
       }
-    } else {
-      errorMessage = 'Please provide both Binance API Key and Secret Key.';
     }
 
+    // A connection test must also say whether this deployment is *allowed* to send orders.
+    const mainnetBlocked = !isTestnet && !policy.allowMainnet;
+
     return NextResponse.json({
-      success: authValid || pingSuccess,
+      success: pingOk && authValid && !mainnetBlocked,
       endpoint: baseUrl,
-      ping: {
-        status: pingSuccess ? 'ONLINE' : 'UNREACHABLE',
-        latencyMs: pingLatency,
-      },
+      network: isTestnet ? 'testnet' : 'mainnet',
+      credentialSource: resolution.ok ? resolution.creds.source : 'none',
+      ping: { status: pingOk ? 'ONLINE' : 'UNREACHABLE', latencyMs, error: pingError },
       auth: {
-        provided: Boolean(apiKey && apiSecret),
+        provided: resolution.ok,
         valid: authValid,
-        message: authValid
-          ? 'API Key & Secret verified on Binance Futures'
-          : errorMessage || 'Unable to verify Binance Futures credentials.',
+        message: mainnetBlocked
+          ? 'Credentials valid, but mainnet order placement is locked (set TRADE_ALLOW_MAINNET=true after a clean testnet run).'
+          : authValid
+            ? `Authenticated against ${isTestnet ? 'testnet' : 'MAINNET'} — trading enabled for this session`
+            : errorMessage || 'No usable credentials resolved on the server.',
         balance: balanceInfo,
       },
+      orderPlacementAllowed: !policy.halted && !mainnetBlocked,
+      policy: policySummary(policy),
       timestamp: new Date().toISOString(),
     });
-  } catch (err: unknown) {
-    const error = err as Error;
-    return NextResponse.json(
-      { success: false, error: error.message || 'Invalid request' },
-      { status: 400 }
-    );
+  } catch (err) {
+    const e = err as Error;
+    return NextResponse.json({ success: false, error: e.message || 'Invalid request' }, { status: 400 });
   }
 }

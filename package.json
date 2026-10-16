@@ -7,7 +7,9 @@
     "build": "NODE_ENV=production next build",
     "start": "next start",
     "lint": "eslint .",
-    "clean": "next clean"
+    "clean": "next clean",
+    "test": "node --test lib/*.test.ts",
+    "test:watch": "node --test --watch lib/*.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

@@ -98,6 +98,8 @@ export interface TradePosition {
   entryTime: number;
   tpOrderId?: string | number;
   slOrderId?: string | number;
+  /** True when the position was discovered on Binance rather than opened by this browser. */
+  adoptedFromExchange?: boolean;
 }
 
 export interface ClosedTrade {

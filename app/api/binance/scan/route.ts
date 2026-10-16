@@ -5,131 +5,155 @@ import {
   type Candle,
   type SignalEvaluation,
 } from '@/lib/trading-engine';
+import { publicGet } from '@/lib/binance-client';
+import { buildSpecMap } from '@/lib/exchange-specs';
+import { DEFAULT_SCANNED_SYMBOLS, loadRiskPolicy } from '@/lib/risk-policy';
+import { sessionStatus } from '@/lib/trade-guard';
 
-const DEFAULT_PAIRS = [
-  'BTCUSDT',
-  'ETHUSDT',
-  'SOLUSDT',
-  'BNBUSDT',
-  'DOGEUSDT',
-  'XRPUSDT',
-  'ADAUSDT',
-  'AVAXUSDT',
-  'SUIUSDT',
-  'LINKUSDT',
-  'NEARUSDT',
-  'PEPEUSDT',
-];
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-async function fetchPairCandles(
-  baseUrl: string,
-  pair: string
-): Promise<{ pair: string; candles: Candle[]; weight: number }> {
-  const symbolsToTry = pair === 'PEPEUSDT' ? ['PEPEUSDT', '1000PEPEUSDT'] : [pair];
+const MAX_PAIRS = 12;
+
+interface PairOutcome {
+  pair: string;
+  candles: Candle[];
+  weight: number;
+  error?: string;
+}
+
+async function fetchPairCandles(isTestnet: boolean, pair: string): Promise<PairOutcome> {
+  // A delisted/renamed ticker (PEPE vs 1000PEPE) is a data problem, not a strategy signal.
+  const symbolsToTry = pair === 'PEPEUSDT' ? ['1000PEPEUSDT', 'PEPEUSDT'] : [pair];
   let highestWeight = 0;
+  let lastError = 'no data';
 
   for (const sym of symbolsToTry) {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3000);
-
-      const res = await fetch(
-        `${baseUrl}/fapi/v1/klines?symbol=${sym}&interval=5m&limit=40`,
-        {
-          signal: controller.signal,
-          headers: { 'User-Agent': 'TradeMaster-LiveScanner/1.0' },
-          cache: 'no-store',
-        }
+      const { data, usedWeight } = await publicGet<unknown[]>(
+        isTestnet,
+        '/fapi/v1/klines',
+        `?symbol=${encodeURIComponent(sym)}&interval=5m&limit=40`,
+        4000
       );
-      clearTimeout(timeout);
+      if (typeof usedWeight === 'number' && usedWeight > highestWeight) highestWeight = usedWeight;
 
-      const weightHeader = res.headers.get('x-mbx-used-weight-1m');
-      if (weightHeader) {
-        const parsedWeight = parseInt(weightHeader, 10);
-        if (!isNaN(parsedWeight) && parsedWeight > highestWeight) {
-          highestWeight = parsedWeight;
-        }
+      if (!Array.isArray(data) || data.length < 25) {
+        lastError = `only ${Array.isArray(data) ? data.length : 0} candles returned`;
+        continue;
+      }
+      const now = Date.now();
+      const candles: Candle[] = data.map((item) => {
+        const row = item as (number | string)[];
+        return {
+          time: Number(row[0]),
+          open: parseFloat(String(row[1])),
+          high: parseFloat(String(row[2])),
+          low: parseFloat(String(row[3])),
+          close: parseFloat(String(row[4])),
+          volume: parseFloat(String(row[5])),
+          takerBuyVolume: row[9] !== undefined ? parseFloat(String(row[9])) : undefined,
+          isClosed: row[6] !== undefined ? now >= Number(row[6]) : true,
+        };
+      });
+
+      const usable = candles.filter((c) =>
+        [c.open, c.high, c.low, c.close, c.volume].every((v) => Number.isFinite(v))
+      );
+      if (usable.length < 25) {
+        lastError = `${usable.length}/${candles.length} candles passed numeric validation`;
+        continue;
       }
 
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data) && data.length >= 25) {
-          const now = Date.now();
-          const candles: Candle[] = data.map((item: (number | string)[]) => ({
-            time: Number(item[0]),
-            open: parseFloat(String(item[1])),
-            high: parseFloat(String(item[2])),
-            low: parseFloat(String(item[3])),
-            close: parseFloat(String(item[4])),
-            volume: parseFloat(String(item[5])),
-            takerBuyVolume: item[9] !== undefined ? parseFloat(String(item[9])) : undefined,
-            isClosed: item[6] !== undefined ? now >= Number(item[6]) : true,
-          }));
-          return { pair, candles, weight: highestWeight };
-        }
-      }
-    } catch {
-      // Try fallback symbol or return empty
+      return { pair, candles: usable, weight: highestWeight };
+    } catch (err) {
+      lastError = (err as Error).message || 'fetch failed';
     }
   }
 
-  return { pair, candles: [], weight: highestWeight };
+  return { pair, candles: [], weight: highestWeight, error: lastError };
 }
 
 export async function GET(req: NextRequest) {
-  const url = new URL(req.url);
-  const requestedPairs = url.searchParams.get('pairs')?.split(',') || DEFAULT_PAIRS;
-  const isTestnet = url.searchParams.get('testnet') === 'true';
-  const safetyCapParam = parseFloat(url.searchParams.get('safetyCap') || '95');
+  const policy = loadRiskPolicy();
+  const status = sessionStatus(req);
+
+  // Market data needs no key, but the scanner must evaluate the *same* market the executor trades.
+  const isTestnet = status.active ? status.isTestnet : req.nextUrl.searchParams.get('testnet') !== 'false';
+  const safetyCapParam = parseFloat(req.nextUrl.searchParams.get('safetyCap') || '95');
   const safetyCapRatio = !isNaN(safetyCapParam) && safetyCapParam > 0 ? safetyCapParam / 100 : 0.95;
 
-  const baseUrl = isTestnet
-    ? 'https://testnet.binancefuture.com'
-    : 'https://fapi.binance.com';
+  const requested = req.nextUrl.searchParams.get('pairs')?.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+  const allowlist = policy.symbolAllowlist.length > 0 ? policy.symbolAllowlist : [...DEFAULT_SCANNED_SYMBOLS];
+  // Never propose a symbol the executor would refuse, and never scan beyond the policy allowlist.
+  const targetPairs = (requested && requested.length ? requested : allowlist)
+    .filter((p) => policy.symbolAllowlist.length === 0 || allowlist.includes(p))
+    .slice(0, Math.min(MAX_PAIRS, policy.maxOpenPositions * 8));
 
-  const maxScanCount = Math.min(requestedPairs.length, 12);
-  const targetPairs = requestedPairs.slice(0, maxScanCount);
+  const results = await Promise.allSettled(targetPairs.map((pair) => fetchPairCandles(isTestnet, pair)));
 
-  let usedWeight = 24;
-  const evaluatedSignals: SignalEvaluation[] = [];
-  const rawCandlesMap: Record<string, Candle[]> = {};
-
-  // Parallelized kline fetching across all target pairs for low latency
-  const results = await Promise.allSettled(
-    targetPairs.map((pair) => fetchPairCandles(baseUrl, pair.trim().toUpperCase()))
+  const outcomes: PairOutcome[] = results.map((r, i) =>
+    r.status === 'fulfilled' ? r.value : { pair: targetPairs[i], candles: [], weight: 0, error: String(r.reason) }
   );
 
-  for (const res of results) {
-    if (res.status === 'fulfilled') {
-      const { pair, candles, weight } = res.value;
-      if (weight > usedWeight) {
-        usedWeight = weight;
-      }
-      if (candles.length >= 25) {
-        rawCandlesMap[pair] = candles;
-        const signal = evaluate3IndicatorSignal(pair, candles);
-        evaluatedSignals.push(signal);
-      }
+  let usedWeight = 0;
+  const evaluatedSignals: SignalEvaluation[] = [];
+  const rawCandlesMap: Record<string, Candle[]> = {};
+  const failures: { pair: string; error: string }[] = [];
+
+  for (const { pair, candles, weight, error } of outcomes) {
+    if (weight > usedWeight) usedWeight = weight;
+    if (candles.length >= 25) {
+      rawCandlesMap[pair] = candles;
+      evaluatedSignals.push(evaluate3IndicatorSignal(pair, candles));
+    } else {
+      failures.push({ pair, error: error || 'insufficient candles' });
     }
   }
 
-  // Sort by high volatility (with tie-breaking on signal score)
+  // Binance reports IP weight per key/IP bucket; if the header is missing we must not pretend the
+  // budget is healthy, so fall back to a conservative accumulated estimate.
+  const weightSource = usedWeight > 0 ? 'header' : 'estimated';
+  if (usedWeight === 0) usedWeight = 5 * targetPairs.length + 1;
+
   evaluatedSignals.sort((a, b) => {
-    if (Math.abs(b.volatilityPercent - a.volatilityPercent) > 0.05) {
-      return b.volatilityPercent - a.volatilityPercent;
-    }
+    if (Math.abs(b.volatilityPercent - a.volatilityPercent) > 0.05) return b.volatilityPercent - a.volatilityPercent;
     return b.score - a.score;
   });
 
+  // Exchange filters decide whether a signal is even *tradeable* at the configured size.
+  let tradeable: Record<string, boolean> = {};
+  try {
+    const info = await publicGet<unknown>(isTestnet, '/fapi/v1/exchangeInfo', '', 6000);
+    const map = buildSpecMap(info);
+    for (const sig of evaluatedSignals) {
+      tradeable[sig.symbol] = Boolean(map?.[sig.symbol]);
+    }
+  } catch {
+    for (const sig of evaluatedSignals) tradeable[sig.symbol] = true;
+  }
+
   const rateLimitStatus = checkRateLimit(usedWeight, 1200, safetyCapRatio);
 
-  return NextResponse.json({
-    timestamp: Date.now(),
-    scanIntervalSeconds: 15,
-    timeframe: '5m',
-    signalsCount: evaluatedSignals.length,
-    rateLimitStatus,
-    signals: evaluatedSignals,
-    candles: rawCandlesMap,
-  });
+  return NextResponse.json(
+    {
+      timestamp: Date.now(),
+      ok: evaluatedSignals.length > 0,
+      network: isTestnet ? 'testnet' : 'mainnet',
+      scanIntervalSeconds: 15,
+      timeframe: '5m',
+      requestedPairs: targetPairs,
+      signalsCount: evaluatedSignals.length,
+      failures,
+      weightSource,
+      tradeable,
+      rateLimitStatus,
+      signals: evaluatedSignals,
+      candles: rawCandlesMap,
+    },
+    {
+      status: evaluatedSignals.length > 0 ? 200 : 503,
+      headers: { 'Cache-Control': 'no-store, max-age=0' },
+    }
+  );
 }
