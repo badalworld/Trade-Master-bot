@@ -68,7 +68,15 @@ export function readSessionToken(req: Request): string | undefined {
   return parseCookies(req.headers.get('cookie'))[SESSION_COOKIE];
 }
 
-export function issueSession(creds: Omit<StoredCreds, 'createdAt' | 'expiresAt'>): {
+/**
+ * `secure` must be true on any https deployment: without it the browser would also hand this
+ * credential-bearing cookie to a plaintext http request on the same host (cookie tossing).
+ * Callers pass `isSecureRequest(req)`; plain-http local development keeps working.
+ */
+export function issueSession(
+  creds: Omit<StoredCreds, 'createdAt' | 'expiresAt'>,
+  opts: { secure?: boolean } = {}
+): {
   token: string;
   cookie: string;
 } {
@@ -79,8 +87,13 @@ export function issueSession(creds: Omit<StoredCreds, 'createdAt' | 'expiresAt'>
   // httpOnly keeps keys out of reach of page JS; SameSite=Lax plus the Origin check blocks CSRF.
   const cookie = `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(
     SESSION_TTL_MS / 1000
-  )}`;
+  )}${opts.secure ? '; Secure' : ''}`;
   return { token, cookie };
+}
+
+/** Matching clear-cookie header, with the same attributes so the browser actually removes it. */
+export function clearSessionCookie(secure: boolean): string {
+  return `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`;
 }
 
 export function revokeSession(token: string | undefined): void {

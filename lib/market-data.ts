@@ -26,6 +26,8 @@ export interface PairScan {
 export interface ScanResult {
   timestamp: number;
   ok: boolean;
+  /** Pairs this scan actually attempted (after allowlist + skip filtering), for honest reporting. */
+  requestedPairs: string[];
   signals: SignalEvaluation[];
   candles: Record<string, Candle[]>;
   failures: { pair: string; error: string }[];
@@ -144,7 +146,16 @@ export async function scanUniverse(opts: ScanOptions): Promise<ScanResult> {
 
   const tradeable = await resolveTradeable(isTestnet, signals.map((s) => s.symbol));
 
-  return { timestamp: Date.now(), ok: signals.length > 0, signals, candles, failures, usedWeight, tradeable };
+  return {
+    timestamp: Date.now(),
+    ok: signals.length > 0,
+    requestedPairs: targetPairs,
+    signals,
+    candles,
+    failures,
+    usedWeight,
+    tradeable,
+  };
 }
 
 /** Entry threshold shared by the UI copy and the engine so "what counts as a signal" has one answer. */

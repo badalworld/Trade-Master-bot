@@ -1,11 +1,12 @@
 # Pre-Live Audit — Trade Master (Binance Futures Bot)
 
-**Date:** 2026-10-16 (round 2) · **Branch:** `arena/900be1ec-trade-master-bot`
+**Date:** 2026-10-16 (round 3 — full-codebase pass) · **Branch:** `arena/76447d6f-trade-master-bot`
 **Audit verdict:** ❌ still NOT CLEARED for live trading with real funds.
-**Remediation status:** round-1 items (B1–B5, H1–H4) fixed and re-verified; round-2 items
-(R2-1 … R2-9) fixed in code, verified by `tsc`, `eslint`, **63/63 unit tests**, a production build
-and live route probes. **Still not cleared for real money** — the strategy has no backtest and no
-track record, so it must earn that on testnet first.
+**Remediation status:** round-1 (B1–B5, H1–H4) and round-2 (R2-1 … R2-9) items fixed; round-3 items
+(R3-1 … R3-7) fixed in code, verified by `tsc`, `eslint`, **70/70 unit tests**, a production build
+(14 routes) and live route probes. `README.md` added as the operator-facing entry point.
+**Still not cleared for real money** — the strategy has no backtest and no track record, so it must
+earn that on testnet first.
 
 The app builds clean and the strategy math is well-tested, but the order-execution path had
 nine defects that could lose real money — two of which could leave an **unprotected leveraged
@@ -18,6 +19,87 @@ position on the exchange with no stop-loss and no monitoring process**.
 > the *policy* answer instead, because the endpoints were never authenticated). All three are fixed
 > below; the round-1 narrative is kept for history and its claims about the current code should be
 > read through this header.
+
+---
+
+## Round 3 — full-codebase pass (branch `arena/76447d6f-trade-master-bot`)
+
+Every route, component, library module and test file was re-read end to end, then the built app was
+exercised route by route. Seven real defects were found and fixed; all were in code paths that
+report or reconcile money rather than in the order path itself.
+
+### R3-1 · HIGH — the UI's engine payload contract did not match the server (controls were dead)
+`components/EngineStatusPanel.tsx` declared `engine.enabled`, but the server sends
+`engine.config.enabled` (verified live against `/api/engine/status`: the payload has no top-level
+`enabled`). Because the response is typed on the client only, TypeScript could not catch it, and the
+**Start guardian** button and the **Autopilot** toggle read `undefined` — so on a deployment that had
+set `TRADE_ENGINE_ENABLED=true`, both controls stayed permanently disabled. **Fix:** read
+`config.enabled` (typed) and derive one `engineEnabled` flag used by all three call sites.
+
+### R3-2 · HIGH — a failed close was booked as a completed trade
+`finalizePositionClose` handled `401/403` ("Local bookkeeping only") and the generic `!ok` case by
+*falling through* to the local booking block. So an unauthorized or failed close still recorded a
+closed trade at an estimated price, deducted an estimated fee, mutated the compounding ladder, and
+removed the row — hiding a position that was very likely still open on Binance.
+**Fix:** `abortClose()` keeps the row on every failure path and says what is actually known
+(operator lockout, session rejection, exchange error, thrown transport error). Only a confirmed
+close books a trade.
+
+### R3-3 · HIGH — open positions were never reconciled away when Binance went flat
+Nothing ever removed or booked a local position whose exchange counterpart had gone (bracket fired
+while the tab was closed, closed by hand, or settled elsewhere): the row stayed "open" in the UI
+forever, and the 2 s monitor would eventually book it at a candle price whenever the mark crossed the
+old bracket. **Fix:** the account sync now reconciles both directions using
+`data.balance.positionsVerified` — a new field that distinguishes *"Binance says the account is
+flat"* from *"the positionRisk call failed and returned an empty list"* (the latter must never be
+read as flat, which is why the field exists rather than reusing `positions.length`). Vanished
+positions are booked through the normal close path with `classifyExit()` labelling the reason, so
+telemetry, compounding and history stay consistent.
+
+### R3-4 · MEDIUM — UI close + engine settlement could double-count one trade
+A UI close of a symbol the engine owns could be booked twice: once locally and once by the engine
+from the income ledger (whichever raced first), leaving the browser and engine compounding ladders
+divergent. **Fix:** while the engine is genuinely running (`engine.running`, tracked in
+`engineAuthorityRef`) it is the book of record for positions it owns — the browser stands down, leaves
+the ledger row so the engine can settle from real commission + funding, and logs where to look. When
+the engine is stopped, local booking takes over again.
+
+### R3-5 · MEDIUM — the Binance credential cookie had no `Secure` attribute
+`issueSession` emitted an httpOnly, SameSite=Lax cookie without `Secure`, so on an https deployment
+the browser would also send a credential-bearing cookie over plain http on the same host.
+**Fix:** `issueSession(creds, { secure })` plus a matching `clearSessionCookie(secure)`, both driven
+by the existing `isSecureRequest()` (https-only, so local http development still works).
+
+### R3-6 · MEDIUM — two endpoints still fanned out to third parties, unauthenticated
+`GET /api/binance/scan` (up to 13 outbound Binance calls per hit) and `GET /api/network/ip` (four
+external IP services) were reachable by anyone, making the deployment a free proxy/amplifier.
+**Fix:** both are behind `requireOperator` (a no-op when the deployment requires no session), matching
+the rest of the API.
+
+### R3-7 · LOW — the diagnostics log divided by the wrong number
+The UI logged `data.requestedPairs.length`, but the scan route never returned that field, so
+"N pairs returned no usable candles" printed `5/5` instead of `5/12`. **Fix:** the scan route now
+returns `requestedPairs` (the post-filter pair set it actually attempted) and the log reads it.
+
+### Added in this round
+- `README.md` — operator-facing overview: architecture, safety model, configuration, API reference,
+  troubleshooting and an explicit limitations section.
+- `lib/trade-guard.test.ts` — 7 tests for the guards that previously had **no** unit coverage at all:
+  credential resolution (env vs session, never from a body), cookie attributes, session round-trip,
+  CSRF origin/referer checks, idempotency claims, Binance-safe client order ids. Suite: 63 → **70**.
+
+### Verification run for this round
+`npx tsc --noEmit` clean · `npm run lint` clean · `npm test` **70/70** · `NODE_ENV=production next
+build` clean (14 routes) · `npm ci` (lock file still in sync) · live probes against the built server:
+page 200, `/missing` 404, `/api/operator/status` public, `POST /execute` 401 without a session,
+keys-in-body 400, `/api/engine/status` 403 without the app header and 200 with it, `scan` returns
+`requestedPairs`, `config.enabled` present in the engine payload, and `X-Frame-Options: DENY` +
+`frame-ancestors 'none'` on the document.
+
+### Still unproven (unchanged, and the reason the verdict stands)
+No order has ever been placed against a real exchange from this environment (egress is allowlisted),
+so bracket acceptance, income settlement and every "does Binance accept this" question remain
+**unverified** until a live testnet run. The strategy itself still has no backtest and no track record.
 
 ---
 

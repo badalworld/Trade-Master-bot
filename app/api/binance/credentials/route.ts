@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAccount, publicGet, TESTNET_BASE, MAINNET_BASE } from '@/lib/binance-client';
 import { loadRiskPolicy, policySummary } from '@/lib/risk-policy';
-import { requireOperator } from '@/lib/operator-auth';
+import { isSecureRequest, requireOperator } from '@/lib/operator-auth';
 import {
   checkRequestIntegrity,
+  clearSessionCookie,
   envCredentials,
   issueSession,
   readSessionToken,
@@ -59,7 +60,7 @@ export async function POST(req: NextRequest) {
     // live-money credential.
     try {
       const account = await getAccount({ apiKey, apiSecret, isTestnet });
-      const { cookie } = issueSession({ apiKey, apiSecret, isTestnet });
+      const { cookie } = issueSession({ apiKey, apiSecret, isTestnet }, { secure: isSecureRequest(req) });
       return NextResponse.json(
         {
           success: true,
@@ -146,7 +147,7 @@ export async function DELETE(req: NextRequest) {
     { success: true, revoked: had, message: 'Credential session cleared from server memory.' },
     {
       status: 200,
-      headers: { 'Set-Cookie': `tm_sess=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0` },
+      headers: { 'Set-Cookie': clearSessionCookie(isSecureRequest(req)) },
     }
   );
 }

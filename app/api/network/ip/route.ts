@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { requireOperator } from '@/lib/operator-auth';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -23,6 +24,13 @@ const isPrivateOrLoopback = (ip: string): boolean =>
  * their keys or grant access to someone else's range. Detection failure now reports `null` and says so.
  */
 export async function GET(_req: NextRequest) {
+  // Reaches four third-party IP services on every call, so it is not left open to crawlers; the
+  // app's Settings view is behind the operator gate anyway. No-op when no session is required.
+  const operator = requireOperator(_req);
+  if (!operator.ok) {
+    return NextResponse.json({ success: false, code: operator.code, error: operator.error }, { status: operator.httpStatus });
+  }
+
   const warnings: string[] = [];
   let ipv4: string | null = null;
   let source: 'egress-probe' | 'proxy-header' | 'unknown' = 'unknown';
