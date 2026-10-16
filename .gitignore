@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+.env
+*.egg-info/
+
+# Data & logs (runtime)
+data/config.json
+data/trades.db
+data/*.db
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (if any)
+node_modules/
+dist/
+build/

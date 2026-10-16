@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trade Master - Binance Futures Bot</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        'tm-dark': '#0a0e1a',
+        'tm-card': '#111827',
+        'tm-border': '#1f2937',
+        'tm-green': '#00d395',
+        'tm-red': '#ff4747',
+        'tm-blue': '#3b82f6',
+        'tm-yellow': '#f59e0b'
+      }
+    }
+  }
+}
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700;800&display=swap');
+body { font-family: 'Inter', sans-serif; background: #05080f; }
+.mono { font-family: 'JetBrains Mono', monospace; }
+.scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: #1f2937; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+.glass { backdrop-filter: blur(12px); background: rgba(17, 24, 39, 0.8); }
+@keyframes pulse-green { 0%,100% { box-shadow: 0 0 0 0 rgba(0,211,149,0.4)} 50% {box-shadow:0 0 0 8px rgba(0,211,149,0)}}
+.pulse-green { animation: pulse-green 2s infinite;}
+</style>
+</head>
+<body class="bg-[#05080f] text-white min-h-screen">
+<!-- Header -->
+<header class="sticky top-0 z-50 bg-[#0a0e1a]/90 backdrop-blur-xl border-b border-[#1f2937]">
+  <div class="max-w-[1600px] mx-auto px-4 lg:px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-[#00d395] to-[#00a86b] flex items-center justify-center font-black text-black text-lg">TM</div>
+      <div>
+        <h1 class="font-extrabold text-lg leading-none tracking-tight">Trade Master</h1>
+        <p class="text-xs text-gray-400 -mt-0.5">Binance Futures Bot <span class="text-[#00d395]">• HVN + Absorption + Imbalance L3</span></p>
+      </div>
+      <span class="hidden md:inline-flex ml-3 px-2.5 py-1 rounded-full bg-[#1f2937] text-xs font-semibold border border-[#2d3a4e]">5m • 15s Scan • 10x</span>
+    </div>
+    <div class="flex items-center gap-2 lg:gap-3">
+      <div id="connectionDot" class="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-full bg-[#111827] border border-[#1f2937] text-xs">
+        <span class="w-2 h-2 rounded-full bg-gray-500" id="connIndicator"></span>
+        <span id="connText">Checking...</span>
+        <span id="rateText" class="ml-2 mono text-[11px] text-gray-400">0 / 2280</span>
+      </div>
+      <div class="flex items-center gap-2 bg-[#111827] rounded-full p-1 border border-[#1f2937]">
+        <span class="text-xs font-bold px-2 hidden sm:inline" id="botStatusLabel">BOT OFF</span>
+        <button id="botToggle" onclick="toggleBot()" class="w-14 h-7 rounded-full bg-gray-700 relative transition-colors duration-300 flex items-center px-1">
+          <span id="toggleKnob" class="w-5 h-5 rounded-full bg-white shadow transform transition-transform duration-300 translate-x-0"></span>
+        </button>
+      </div>
+      <button onclick="openSettings()" class="w-9 h-9 rounded-xl bg-[#1f2937] hover:bg-[#2d3a4e] border border-[#374151] flex items-center justify-center transition">
+        <i class="fa-solid fa-gear text-gray-300"></i>
+      </button>
+    </div>
+  </div>
+</header>
+
+<!-- Top Stats -->
+<div class="max-w-[1600px] mx-auto px-4 lg:px-6 py-4 grid grid-cols-2 lg:grid-cols-5 gap-3 lg:gap-4">
+  <div class="bg-gradient-to-br from-[#111827] to-[#0f1a1a] rounded-2xl p-4 border border-[#1f2937] relative overflow-hidden">
+    <div class="absolute top-0 right-0 w-20 h-20 bg-[#00d395]/10 rounded-full blur-2xl"></div>
+    <p class="text-xs text-gray-400 font-semibold tracking-widest">BALANCE (USDT)</p>
+    <p class="text-2xl font-black mono mt-1" id="statBalance">$100.00</p>
+    <p class="text-xs mt-1 flex items-center gap-1"><span id="statBalanceSub" class="text-gray-400">Paper • Compounding ON</span> <span id="pnlBadge" class="px-1.5 py-0.5 rounded bg-[#00d395]/15 text-[#00d395] font-bold text-[11px]">+ $0.00</span></p>
+  </div>
+  <div class="bg-[#111827] rounded-2xl p-4 border border-[#1f2937]">
+    <p class="text-xs text-gray-400 font-semibold tracking-widest">TODAY PnL</p>
+    <p class="text-2xl font-black mono mt-1" id="statTodayPnL">+$0.00</p>
+    <p class="text-xs text-gray-500 mt-1"><span class="text-[#00d395]" id="statWinRate">0%</span> win rate • <span id="statTotalTrades">0</span> trades</p>
+  </div>
+  <div class="bg-[#111827] rounded-2xl p-4 border border-[#1f2937]">
+    <p class="text-xs text-gray-400 font-semibold tracking-widest">ACTIVE POSITIONS</p>
+    <p class="text-2xl font-black mono mt-1"><span id="statOpen">0</span> <span class="text-sm font-bold text-gray-500">/ 5</span></p>
+    <div class="mt-2 w-full h-1.5 bg-[#1f2937] rounded-full overflow-hidden flex">
+      <div id="openProgress" class="h-full bg-[#3b82f6] transition-all" style="width:0%"></div>
+    </div>
+  </div>
+  <div class="bg-[#111827] rounded-2xl p-4 border border-[#1f2937]">
+    <p class="text-xs text-gray-400 font-semibold tracking-widest">NEXT MARGIN</p>
+    <p class="text-2xl font-black mono mt-1 text-[#f59e0b]" id="statNextMargin">$2.00</p>
+    <p class="text-xs text-gray-500 mt-1 truncate" id="statMarginExplain">Base $2.00 • Win +20% profit</p>
+  </div>
+  <div class="col-span-2 lg:col-span-1 bg-[#111827] rounded-2xl p-4 border border-[#1f2937] flex flex-col justify-between">
+    <p class="text-xs text-gray-400 font-semibold tracking-widest">SCANNER • VOLATILITY SORT</p>
+    <div class="flex items-end justify-between mt-1">
+      <p class="text-lg font-black"><span id="statScanCount">0</span> <span class="text-xs font-semibold text-gray-400">pairs / 15s</span></p>
+      <span class="text-xs px-2 py-1 rounded-full bg-[#00d395]/15 text-[#00d395] font-bold" id="scanTime">--:--:--</span>
+    </div>
+    <button onclick="triggerScan()" class="mt-2 w-full py-1.5 rounded-xl bg-[#1f2937] hover:bg-[#2d3a4e] border border-[#374151] text-xs font-bold transition">SCAN NOW <i class="fa-solid fa-bolt ml-1 text-[#f59e0b]"></i></button>
+  </div>
+</div>
+
+<!-- Main Grid -->
+<div class="max-w-[1600px] mx-auto px-4 lg:px-6 pb-6 grid grid-cols-12 gap-4 lg:gap-5">
+  <!-- Left: Volatility + Signals -->
+  <div class="col-span-12 lg:col-span-4 xl:col-span-3 space-y-4">
+    <!-- Volatility Rank -->
+    <div class="bg-[#111827] rounded-2xl border border-[#1f2937] overflow-hidden">
+      <div class="px-4 py-3 border-b border-[#1f2937] flex items-center justify-between">
+        <h3 class="font-bold text-sm flex items-center gap-2"><i class="fa-solid fa-fire text-[#ff4747]"></i> Volatility Rank <span class="text-xs font-normal text-gray-400">(High → Fast Profit)</span></h3>
+        <span class="text-xs mono bg-[#1f2937] px-2 py-1 rounded-full" id="volCount">0</span>
+      </div>
+      <div class="max-h-[380px] overflow-auto scrollbar-thin" id="volTableWrap">
+        <table class="w-full text-xs">
+          <thead class="sticky top-0 bg-[#0f141f] text-gray-400 text-[11px] uppercase tracking-widest">
+            <tr><th class="text-left px-3 py-2">#</th><th class="text-left">Symbol</th><th class="text-right">24h%</th><th class="text-right px-3">Score</th></tr>
+          </thead>
+          <tbody id="volTable" class="divide-y divide-[#1f2937]/50"></tbody>
+        </table>
+      </div>
+      <div class="px-3 py-2 bg-[#0f141f] border-t border-[#1f2937] flex items-center justify-between text-xs">
+        <span class="text-gray-500">Auto-refresh every 15s</span>
+        <span class="mono text-gray-400">95% limit <span class="text-[#00d395]">2280/min</span></span>
+      </div>
+    </div>
+
+    <!-- Live Signals -->
+    <div class="bg-[#111827] rounded-2xl border border-[#1f2937] overflow-hidden">
+      <div class="px-4 py-3 border-b border-[#1f2937] flex items-center justify-between">
+        <h3 class="font-bold text-sm flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-[#00d395] pulse-green"></span> High-Probability Signals</h3>
+        <span class="text-xs bg-[#00d395] text-black px-2 py-1 rounded-full font-black" id="signalCount">0</span>
+      </div>
+      <div id="signalList" class="max-h-[520px] overflow-auto scrollbar-thin p-2 space-y-2">
+        <div class="py-12 text-center text-gray-500 text-sm">
+          <i class="fa-solid fa-satellite-dish text-2xl mb-2 opacity-50"></i>
+          <p>Scanning futures every 15s...</p>
+          <p class="text-xs mt-1">HVN • Absorption • Imbalance L3</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Center: Chart + Positions -->
+  <div class="col-span-12 lg:col-span-8 xl:col-span-6 space-y-4">
+    <!-- Chart -->
+    <div class="bg-[#111827] rounded-2xl border border-[#1f2937] overflow-hidden">
+      <div class="px-4 py-3 border-b border-[#1f2937] flex flex-wrap items-center justify-between gap-2">
+        <div class="flex items-center gap-3">
+          <h3 class="font-bold text-sm flex items-center gap-2"><i class="fa-solid fa-chart-line text-[#3b82f6]"></i> TradingView • 5m</h3>
+          <select id="chartSymbol" onchange="updateChartSymbol()" class="bg-[#0a0e1a] border border-[#1f2937] rounded-lg px-2 py-1 text-xs font-bold mono">
+            <option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option><option>BNBUSDT</option>
+          </select>
+        </div>
+        <div class="flex items-center gap-1 bg-[#0a0e1a] rounded-full p-1 border border-[#1f2937]">
+          <button class="px-3 py-1 rounded-full bg-[#00d395] text-black text-xs font-black">5m</button>
+          <span class="text-xs text-gray-500 px-2">15s scan</span>
+        </div>
+      </div>
+      <div class="h-[360px] bg-[#05080f] relative" id="tvChart">
+        <div id="tradingview_widget" class="w-full h-full"></div>
+        <div id="chartFallback" class="absolute inset-0 flex flex-col items-center justify-center p-6 text-center hidden">
+          <i class="fa-solid fa-chart-candlestick text-4xl text-gray-600 mb-3"></i>
+          <p class="text-sm text-gray-400">Chart loads for <span class="text-white font-bold mono" id="fallbackSymbol">BTCUSDT</span></p>
+          <div class="mt-3 grid grid-cols-3 gap-2 text-xs w-full max-w-md">
+            <div class="bg-[#111827] rounded-xl p-3 border border-[#1f2937]"><p class="text-gray-400">HVN (POC)</p><p class="mono font-bold" id="fallbackHVN">-</p></div>
+            <div class="bg-[#111827] rounded-xl p-3 border border-[#1f2937]"><p class="text-gray-400">Absorption</p><p class="mono font-bold" id="fallbackAbs">-</p></div>
+            <div class="bg-[#111827] rounded-xl p-3 border border-[#1f2937]"><p class="text-gray-400">Imbalance</p><p class="mono font-bold" id="fallbackImb">-</p></div>
+          </div>
+        </div>
+      </div>
+      <div class="px-4 py-2 bg-[#0f141f] border-t border-[#1f2937] flex flex-wrap gap-2 text-xs">
+        <span class="px-2 py-1 rounded-full bg-[#1f2937] border border-[#374151]"><span class="w-2 h-2 inline-block rounded-full bg-[#00d395] mr-1"></span> HVN Profile</span>
+        <span class="px-2 py-1 rounded-full bg-[#1f2937] border border-[#374151]"><span class="w-2 h-2 inline-block rounded-full bg-[#f59e0b] mr-1"></span> Heavy Absorption</span>
+        <span class="px-2 py-1 rounded-full bg-[#1f2937] border border-[#374151]"><span class="w-2 h-2 inline-block rounded-full bg-[#3b82f6] mr-1"></span> Imbalance L3</span>
+        <span class="ml-auto text-gray-500 mono">TP/SL auto from indicators</span>
+      </div>
+    </div>
+
+    <!-- Open Positions -->
+    <div class="bg-[#111827] rounded-2xl border border-[#1f2937] overflow-hidden">
+      <div class="px-4 py-3 border-b border-[#1f2937] flex items-center justify-between">
+        <h3 class="font-bold text-sm flex items-center gap-2"><i class="fa-solid fa-layer-group text-[#3b82f6]"></i> Open Positions <span class="text-xs font-normal text-gray-400">max 5 • Isolated 10x • $2 margin</span></h3>
+        <span id="openBadge" class="text-xs mono bg-[#1f2937] px-2 py-1 rounded-full border border-[#374151]">0 OPEN</span>
+      </div>
+      <div class="overflow-auto scrollbar-thin">
+        <table class="w-full text-xs">
+          <thead class="bg-[#0f141f] text-gray-400 text-[11px] uppercase tracking-widest">
+            <tr>
+              <th class="text-left px-3 py-2">Symbol</th><th class="text-left">Side</th><th class="text-right">Entry</th><th class="text-right">Price</th><th class="text-right">PNL</th><th class="text-right">TP / SL</th><th class="text-right px-3">Action</th>
+            </tr>
+          </thead>
+          <tbody id="positionsTable" class="divide-y divide-[#1f2937]/50"></tbody>
+        </table>
+        <div id="positionsEmpty" class="py-10 text-center text-gray-500 text-sm">
+          <i class="fa-solid fa-box-open text-xl mb-2 opacity-40"></i>
+          <p>No open positions</p>
+          <p class="text-xs">Bot will open up to 5 high-probability trades automatically</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right: Risk + History + Logs -->
+  <div class="col-span-12 xl:col-span-3 space-y-4">
+    <!-- Risk & Compounding -->
+    <div class="bg-gradient-to-br from-[#111827] to-[#0f1a1f] rounded-2xl border border-[#1f2937] p-4">
+      <h3 class="font-bold text-sm flex items-center gap-2 mb-3"><i class="fa-solid fa-shield-halved text-[#00d395]"></i> Risk & Compounding</h3>
+      <div class="space-y-3 text-xs">
+        <div class="flex justify-between items-center bg-[#0a0e1a] rounded-xl p-3 border border-[#1f2937]">
+          <span class="text-gray-400">Base margin</span><span class="mono font-black">$<span id="riskBase">2.00</span></span>
+        </div>
+        <div class="flex justify-between items-center bg-[#00d395]/10 rounded-xl p-3 border border-[#00d395]/20">
+          <span class="text-[#00d395] font-bold">Next trade margin</span><span class="mono font-black text-[#00d395] text-sm" id="riskNext">$2.00</span>
+        </div>
+        <p class="text-[11px] text-gray-400 leading-relaxed bg-[#0a0e1a] rounded-xl p-3 border border-[#1f2937]" id="riskExplain">No trades yet. Win → next margin = $2.00 + 20% of profit. Loss → reset to $2.00 base.</p>
+        <div class="grid grid-cols-3 gap-2 text-center">
+          <div class="bg-[#0a0e1a] rounded-xl p-2 border border-[#1f2937]"><p class="text-gray-500 text-[11px]">LEVERAGE</p><p class="font-black mono">10x</p></div>
+          <div class="bg-[#0a0e1a] rounded-xl p-2 border border-[#1f2937]"><p class="text-gray-500 text-[11px]">WIN RATE</p><p class="font-black mono" id="riskWinRate">0%</p></div>
+          <div class="bg-[#0a0e1a] rounded-xl p-2 border border-[#1f2937]"><p class="text-gray-500 text-[11px]">TOTAL PN L</p><p class="font-black mono" id="riskTotalPnl">$0.00</p></div>
+        </div>
+        <div class="flex gap-2">
+          <span class="flex-1 text-center py-1.5 rounded-full bg-[#00d395]/15 text-[#00d395] font-bold text-[11px]">TP 1:1.8</span>
+          <span class="flex-1 text-center py-1.5 rounded-full bg-[#ff4747]/15 text-[#ff4747] font-bold text-[11px]">SL ATR 1.5</span>
+          <span class="flex-1 text-center py-1.5 rounded-full bg-[#3b82f6]/15 text-[#3b82f6] font-bold text-[11px]">Isolated</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Trade History -->
+    <div class="bg-[#111827] rounded-2xl border border-[#1f2937] overflow-hidden">
+      <div class="px-4 py-3 border-b border-[#1f2937] flex items-center justify-between">
+        <h3 class="font-bold text-sm"><i class="fa-solid fa-clock-rotate-left text-gray-400 mr-1"></i> Trade History</h3>
+        <button onclick="loadHistory()" class="text-xs px-2 py-1 rounded-full bg-[#1f2937] border border-[#374151]">Refresh</button>
+      </div>
+      <div class="max-h-[260px] overflow-auto scrollbar-thin divide-y divide-[#1f2937]/40" id="historyList">
+        <p class="py-8 text-center text-gray-500 text-xs">No closed trades yet</p>
+      </div>
+    </div>
+
+    <!-- Logs -->
+    <div class="bg-[#0a0e1a] rounded-2xl border border-[#1f2937] overflow-hidden">
+      <div class="px-4 py-3 border-b border-[#1f2937] flex items-center justify-between">
+        <h3 class="font-bold text-xs tracking-widest text-gray-400">BOT LOGS</h3>
+        <span class="text-[11px] mono text-gray-500" id="logCount">0 logs</span>
+      </div>
+      <div id="logList" class="h-[220px] overflow-auto scrollbar-thin p-2 space-y-1 mono text-[11px] leading-relaxed"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Settings Modal -->
+<div id="settingsModal" class="fixed inset-0 z-50 hidden">
+  <div class="absolute inset-0 bg-black/70 backdrop-blur-sm" onclick="closeSettings()"></div>
+  <div class="relative max-w-2xl mx-auto mt-6 lg:mt-10 bg-[#0f141f] rounded-2xl border border-[#1f2937] overflow-hidden max-h-[92vh] overflow-auto scrollbar-thin mx-4">
+    <div class="sticky top-0 bg-[#0f141f] px-6 py-4 border-b border-[#1f2937] flex items-center justify-between">
+      <div>
+        <h2 class="font-black text-lg flex items-center gap-2"><i class="fa-solid fa-gear text-[#3b82f6]"></i> Dashboard Settings</h2>
+        <p class="text-xs text-gray-400">Configure Binance Futures • Risk • Scanner</p>
+      </div>
+      <button onclick="closeSettings()" class="w-8 h-8 rounded-xl bg-[#1f2937] hover:bg-[#2d3a4e] flex items-center justify-center"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="p-6 space-y-6">
+      <!-- IP Whitelist -->
+      <div class="bg-gradient-to-br from-[#111827] to-[#0f1f2a] rounded-2xl p-4 border border-[#1f2937]">
+        <h4 class="font-bold text-sm flex items-center gap-2"><i class="fa-solid fa-shield text-[#00d395]"></i> IP Whitelist for Binance API</h4>
+        <p class="text-xs text-gray-400 mt-1">Add this IPv4 to Binance API Management → IP access restrictions. Keeps your account secure.</p>
+        <div class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div class="bg-[#05080f] rounded-xl p-3 border border-[#1f2937]">
+            <p class="text-[11px] tracking-widest text-gray-500 font-bold">PUBLIC IPv4 (Whitelist this)</p>
+            <p class="mono font-black text-lg text-[#00d395] flex items-center gap-2 mt-1"><span id="settingPublicIp">-</span> <button onclick="copyIp()" class="text-xs px-2 py-1 rounded-full bg-[#1f2937] border">Copy</button></p>
+            <a href="https://www.binance.com/en/my/settings/api-management" target="_blank" class="text-xs text-[#3b82f6] underline mt-1 inline-block">Open Binance API Management →</a>
+          </div>
+          <div class="bg-[#05080f] rounded-xl p-3 border border-[#1f2937]">
+            <p class="text-[11px] tracking-widest text-gray-500 font-bold">LOCAL IP • HOST</p>
+            <p class="mono text-sm mt-1" id="settingLocalIp">-</p>
+            <p class="mono text-xs text-gray-500 mt-1" id="settingHost">-</p>
+            <p class="text-xs text-amber-400 mt-2"><i class="fa-solid fa-triangle-exclamation mr-1"></i> Use Public IP for whitelist.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Binance Keys -->
+      <div class="space-y-3">
+        <h4 class="font-bold text-sm">Binance Futures API Keys</h4>
+        <div class="grid gap-3">
+          <label class="text-xs font-bold text-gray-400">API KEY <span class="font-normal text-gray-500">(Futures permissions: Enable Futures, Enable Trading)</span>
+            <input id="apiKey" type="text" placeholder="Paste Binance API Key" class="mt-1 w-full bg-[#05080f] border border-[#1f2937] rounded-xl px-3 py-2.5 mono text-sm focus:border-[#3b82f6] outline-none">
+          </label>
+          <label class="text-xs font-bold text-gray-400">SECRET KEY
+            <input id="apiSecret" type="password" placeholder="Paste Binance Secret Key" class="mt-1 w-full bg-[#05080f] border border-[#1f2937] rounded-xl px-3 py-2.5 mono text-sm focus:border-[#3b82f6] outline-none">
+          </label>
+          <label class="flex items-center gap-2 text-sm bg-[#05080f] rounded-xl p-3 border border-[#1f2937] cursor-pointer">
+            <input type="checkbox" id="testnetCheck" class="accent-[#00d395] w-4 h-4"> <span class="font-semibold">Testnet mode</span> <span class="text-xs text-gray-500">— test on Binance Futures Testnet first</span>
+            <span class="ml-auto text-xs px-2 py-1 rounded-full bg-[#f59e0b]/20 text-[#f59e0b] font-bold">Recommended</span>
+          </label>
+          <label class="flex items-center gap-2 text-sm bg-[#05080f] rounded-xl p-3 border border-[#1f2937] cursor-pointer">
+            <input type="checkbox" id="paperCheck" class="accent-[#3b82f6] w-4 h-4"> <span class="font-semibold">Paper trading</span> <span class="text-xs text-gray-500">— simulate trades without real funds (when no keys)</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Risk -->
+      <div class="space-y-3">
+        <h4 class="font-bold text-sm">Risk & Compounding</h4>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <label class="text-xs font-bold text-gray-400">Base Margin per trade (USDT)
+            <input id="baseMargin" type="number" step="0.5" min="1" value="2" class="mt-1 w-full bg-[#05080f] border border-[#1f2937] rounded-xl px-3 py-2.5 mono text-sm">
+            <span class="text-[11px] text-gray-500">$2 margin × 10x = $20 notional</span>
+          </label>
+          <label class="text-xs font-bold text-gray-400">Leverage
+            <select id="leverage" class="mt-1 w-full bg-[#05080f] border border-[#1f2937] rounded-xl px-3 py-2.5 mono text-sm">
+              <option value="5">5x</option><option value="10" selected>10x</option><option value="20">20x</option><option value="25">25x</option>
+            </select>
+          </label>
+          <label class="text-xs font-bold text-gray-400">Max open trades
+            <input id="maxOpen" type="number" min="1" max="5" value="5" class="mt-1 w-full bg-[#05080f] border border-[#1f2937] rounded-xl px-3 py-2.5 mono text-sm">
+          </label>
+          <label class="text-xs font-bold text-gray-400">Compounding
+            <div class="flex gap-2 mt-1">
+              <label class="flex items-center gap-1 bg-[#05080f] border border-[#1f2937] rounded-xl px-3 py-2.5 text-xs cursor-pointer flex-1"><input type="checkbox" id="compoundingCheck" checked class="accent-[#00d395]"> Enable</label>
+              <input id="compoundingPct" type="number" value="20" min="5" max="100" class="w-20 bg-[#05080f] border border-[#1f2937] rounded-xl px-2 py-2.5 mono text-sm"> <span class="text-xs self-center">%</span>
+            </div>
+            <span class="text-[11px] text-gray-500">Win → next margin +20% profit, Loss → reset base</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Scanner -->
+      <div class="space-y-3">
+        <h4 class="font-bold text-sm">Scanner</h4>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <label class="text-xs font-bold text-gray-400">Timeframe
+            <input value="5m" disabled class="mt-1 w-full bg-[#1f2937] border border-[#374151] rounded-xl px-3 py-2.5 mono text-sm opacity-60">
+          </label>
+          <label class="text-xs font-bold text-gray-400">Scan interval (sec)
+            <input id="scanInterval" type="number" min="10" max="60" value="15" class="mt-1 w-full bg-[#05080f] border border-[#1f2937] rounded-xl px-3 py-2.5 mono text-sm">
+          </label>
+          <label class="text-xs font-bold text-gray-400">Top volatile N
+            <input id="scanTopN" type="number" min="5" max="50" value="25" class="mt-1 w-full bg-[#05080f] border border-[#1f2937] rounded-xl px-3 py-2.5 mono text-sm">
+          </label>
+        </div>
+        <div class="bg-[#3b82f6]/10 border border-[#3b82f6]/20 rounded-xl p-3 text-xs leading-relaxed">
+          <p class="font-bold text-[#3b82f6]">95% API Limit Protection</p>
+          <p class="text-gray-400">Bot uses max 95% of Binance 2400/min weight (2280). Sorted volatility scan + batched klines with rate limiter to avoid IP ban.</p>
+        </div>
+      </div>
+
+      <div class="flex gap-3 sticky bottom-0 bg-[#0f141f] pt-3 border-t border-[#1f2937]">
+        <button onclick="saveSettings()" class="flex-1 py-3 rounded-xl bg-[#00d395] text-black font-black hover:bg-[#00b87a] transition">SAVE SETTINGS</button>
+        <button onclick="closeSettings()" class="px-6 py-3 rounded-xl bg-[#1f2937] border border-[#374151] font-bold">Cancel</button>
+      </div>
+      <p class="text-xs text-gray-500 text-center">Trade Master logs every action. If any problem, check Logs panel for diagnosis. <br>Need help? Ask us!</p>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast" class="fixed bottom-4 right-4 z-50 hidden">
+  <div class="bg-[#111827] border border-[#1f2937] rounded-xl px-4 py-3 shadow-2xl flex items-center gap-3">
+    <span id="toastIcon" class="w-8 h-8 rounded-full bg-[#00d395] text-black flex items-center justify-center"><i class="fa-solid fa-check"></i></span>
+    <div><p id="toastTitle" class="font-bold text-sm">Saved</p><p id="toastMsg" class="text-xs text-gray-400">Settings updated</p></div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+const API = '';
+let botEnabled = false;
+let currentPrices = {};
+
+// Helpers
+const $ = id => document.getElementById(id);
+function toast(title, msg, ok=true){
+  $('toastTitle').textContent = title;
+  $('toastMsg').textContent = msg;
+  $('toastIcon').className = `w-8 h-8 rounded-full ${ok?'bg-[#00d395] text-black':'bg-[#ff4747] text-white'} flex items-center justify-center`;
+  $('toastIcon').innerHTML = ok?'<i class="fa-solid fa-check"></i>':'<i class="fa-solid fa-xmark"></i>';
+  $('toast').classList.remove('hidden');
+  setTimeout(()=> $('toast').classList.add('hidden'), 3000);
+}
+function fmt(n,d=2){ return Number(n).toLocaleString(undefined,{minimumFractionDigits:d, maximumFractionDigits:d}); }
+
+// IP
+async function loadIp(){
+  try{
+    const r = await fetch(`${API}/api/ip`);
+    const j = await r.json();
+    $('settingPublicIp').textContent = j.public_ip || '-';
+    $('settingLocalIp').textContent = j.local_ip || '-';
+    $('settingHost').textContent = j.hostname || '-';
+  }catch(e){ console.log(e)}
+}
+function copyIp(){
+  const ip = $('settingPublicIp').textContent;
+  if(ip && ip!='-'){ navigator.clipboard.writeText(ip); toast('Copied', ip + ' — paste in Binance whitelist'); }
+}
+
+// Settings
+function openSettings(){ $('settingsModal').classList.remove('hidden'); loadIp(); loadSettings(); }
+function closeSettings(){ $('settingsModal').classList.add('hidden'); }
+async function loadSettings(){
+  try{
+    const r = await fetch(`${API}/api/settings`);
+    const c = await r.json();
+    $('apiKey').value = c.binance_api_key || '';
+    // keep secret blank for security, unless masked
+    // Do not fill secret from masked
+    $('testnetCheck').checked = !!c.testnet;
+    $('paperCheck').checked = !!c.paper_trading;
+    $('baseMargin').value = c.base_margin ?? 2;
+    $('leverage').value = c.leverage ?? 10;
+    $('maxOpen').value = c.max_open_trades ?? 5;
+    $('scanInterval').value = c.scan_interval_seconds ?? 15;
+    $('scanTopN').value = c.scan_top_n ?? 25;
+    $('compoundingCheck').checked = !!c.compounding_enabled;
+    $('compoundingPct').value = c.compounding_percent ?? 20;
+  }catch(e){}
+}
+async function saveSettings(){
+  const body = {
+    binance_api_key: $('apiKey').value.trim(),
+    binance_api_secret: $('apiSecret').value.trim(),
+    testnet: $('testnetCheck').checked,
+    paper_trading: $('paperCheck').checked,
+    base_margin: parseFloat($('baseMargin').value)||2,
+    leverage: parseInt($('leverage').value)||10,
+    max_open_trades: parseInt($('maxOpen').value)||5,
+    scan_interval_seconds: parseInt($('scanInterval').value)||15,
+    scan_top_n: parseInt($('scanTopN').value)||25,
+    compounding_enabled: $('compoundingCheck').checked,
+    compounding_percent: parseFloat($('compoundingPct').value)||20
+  };
+  try{
+    const r = await fetch(`${API}/api/settings`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.detail || 'Failed');
+    toast('Saved', 'Settings updated & Binance credentials reloaded');
+    closeSettings();
+    refreshAll();
+  }catch(e){ toast('Error', e.message, false)}
+}
+
+// Bot toggle
+async function refreshStatus(){
+  try{
+    const r = await fetch(`${API}/api/status`);
+    const j = await r.json();
+    botEnabled = !!j.bot_enabled;
+    // toggle UI
+    $('botStatusLabel').textContent = botEnabled ? 'BOT ON' : 'BOT OFF';
+    const knob = $('toggleKnob');
+    const btn = $('botToggle');
+    if(botEnabled){
+      btn.classList.remove('bg-gray-700'); btn.classList.add('bg-[#00d395]');
+      knob.classList.add('translate-x-7'); knob.classList.remove('translate-x-0');
+    } else {
+      btn.classList.add('bg-gray-700'); btn.classList.remove('bg-[#00d395]');
+      knob.classList.remove('translate-x-7'); knob.classList.add('translate-x-0');
+    }
+    // connection
+    const usage = j.rate_limit_usage || 0;
+    $('rateText').textContent = `${usage} / 2280`;
+    $('connIndicator').className = `w-2 h-2 rounded-full ${usage < 1800 ? 'bg-[#00d395] pulse-green' : usage < 2280 ? 'bg-[#f59e0b]' : 'bg-[#ff4747]'}`;
+    $('connText').textContent = j.paper_trading ? 'Paper mode' : (j.testnet ? 'Testnet' : 'Live');
+    // stats
+    $('statBalance').textContent = j.balance != null ? `$${fmt(j.balance)}` : (j.paper_trading ? `$${fmt(100 + (j.total_pnl||0))}` : '$--');
+    $('statBalanceSub').textContent = j.paper_trading ? 'Paper' : (j.testnet ? 'Testnet USDT' : 'Live');
+    $('pnlBadge').textContent = `${(j.total_pnl||0) >=0 ? '+' : ''} $${fmt(j.total_pnl||0)}`;
+    $('pnlBadge').className = `px-1.5 py-0.5 rounded font-bold text-[11px] ${(j.total_pnl||0) >=0 ? 'bg-[#00d395]/15 text-[#00d395]' : 'bg-[#ff4747]/15 text-[#ff4747]'}`;
+    $('statOpen').textContent = j.open_trades;
+    $('openProgress').style.width = `${(j.open_trades/5*100)}%`;
+    $('openBadge').textContent = `${j.open_trades} OPEN`;
+    if(j.last_scan) $('scanTime').textContent = new Date(j.last_scan).toLocaleTimeString();
+
+    // risk panel handled via /api/risk
+  }catch(e){ $('connText').textContent='Offline'; }
+}
+async function toggleBot(){
+  const wantOn = !botEnabled;
+  const url = wantOn ? `${API}/api/bot/start` : `${API}/api/bot/stop`;
+  try{
+    const r = await fetch(url, {method:'POST'});
+    const j = await r.json();
+    toast(wantOn?'Bot Started':'Bot Stopped', wantOn?'Scanning every 15s on 5m TF':'Paused, positions still monitored');
+    refreshStatus();
+  }catch(e){ toast('Error', 'Toggle failed', false)}
+}
+async function triggerScan(){
+  $('signalList').innerHTML = '<p class="py-6 text-center text-gray-400 text-sm"><i class="fa-solid fa-spinner fa-spin mr-2"></i>Scanning volatility-sorted pairs...</p>';
+  try{
+    const r = await fetch(`${API}/api/scanner/scan-now`, {method:'POST'});
+    const j = await r.json();
+    renderSignals(j.results||[]);
+  }catch(e){ toast('Scan failed', e.message, false)}
+}
+
+// Volatility
+async function loadVolatility(){
+  try{
+    const r = await fetch(`${API}/api/scanner/volatility`);
+    const j = await r.json();
+    $('volCount').textContent = j.count;
+    $('statScanCount').textContent = j.count;
+    const tbody = $('volTable');
+    tbody.innerHTML = '';
+    // populate chart symbol select
+    const sel = $('chartSymbol');
+    const currentSel = sel.value;
+    // keep but also update options if new volatiles?
+    (j.data||[]).slice(0,25).forEach((row, i)=>{
+      const tr = document.createElement('tr');
+      tr.className = 'hover:bg-[#1f2937]/40 cursor-pointer';
+      tr.onclick = ()=> { sel.value = row.symbol; updateChartSymbol(row.symbol); };
+      const chg = row.priceChangePercent || 0;
+      const badge = chg >=0 ? 'text-[#00d395] bg-[#00d395]/10' : 'text-[#ff4747] bg-[#ff4747]/10';
+      tr.innerHTML = `<td class="px-3 py-1.5 mono text-gray-500">${i+1}</td>
+        <td class="py-1.5 font-bold mono">${row.symbol}<span class="block text-[10px] text-gray-500 font-normal">$${fmt(row.price, row.price>10?2:4)}</span></td>
+        <td class="text-right py-1.5"><span class="px-1.5 py-0.5 rounded text-xs font-bold mono ${badge}">${chg>=0?'+':''}${fmt(chg,2)}%</span></td>
+        <td class="text-right px-3 py-1.5 mono text-[#f59e0b]">${fmt(row.volatility_score,1)}</td>`;
+      tbody.appendChild(tr);
+    });
+    // update chart fallback data if needed
+  }catch(e){}
+}
+
+// Signals
+function renderSignals(results){
+  const container = $('signalList');
+  const count = results.length;
+  $('signalCount').textContent = results.filter(r=>r.is_high_prob).length;
+  if(!count){
+    container.innerHTML = `<div class="py-12 text-center text-gray-500 text-sm"><i class="fa-solid fa-satellite-dish text-2xl mb-2 opacity-50"></i><p>No signals this scan</p><p class="text-xs">Bot sorts high volatility for fast moves</p></div>`;
+    return;
+  }
+  container.innerHTML = '';
+  results.forEach(sig=>{
+    const high = sig.is_high_prob;
+    const dir = sig.direction || 'WAIT';
+    const dirColor = dir==='LONG'? 'bg-[#00d395] text-black' : dir==='SHORT'? 'bg-[#ff4747] text-white' : 'bg-gray-700 text-gray-300';
+    const scoreColor = sig.score>=75 ? 'text-[#00d395] border-[#00d395]' : sig.score>=68 ? 'text-[#f59e0b] border-[#f59e0b]' : 'text-gray-500 border-gray-700';
+    const el = document.createElement('div');
+    el.className = `rounded-xl border ${high?'border-[#00d395]/30 bg-[#00d395]/5':'border-[#1f2937] bg-[#0a0e1a]'} p-3 cursor-pointer hover:border-[#2d3a4e] transition`;
+    el.onclick = ()=> { $('chartSymbol').value = sig.symbol; updateChartSymbol(sig.symbol, sig); };
+    el.innerHTML = `
+      <div class="flex items-start justify-between gap-2">
+        <div>
+          <p class="font-black mono text-sm flex items-center gap-2">${sig.symbol} <span class="px-2 py-0.5 rounded-full text-[11px] font-black ${dirColor}">${dir}</span> ${high?'<span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[#00d395] text-black font-black">HIGH PROB</span>':''}</p>
+          <p class="text-xs text-gray-400 mono">$${fmt(sig.price, sig.price>10?2:4)} • Vol ${fmt(sig.volatility,2)}% • Rank ${fmt(sig.volatility_score||0,1)}</p>
+        </div>
+        <div class="text-right">
+          <p class="w-10 h-10 rounded-full border-2 ${scoreColor} flex items-center justify-center font-black mono text-sm">${Math.round(sig.score)}</p>
+          <p class="text-[10px] text-gray-500 text-center">score</p>
+        </div>
+      </div>
+      <div class="mt-2 grid grid-cols-3 gap-1.5 text-[11px]">
+        <div class="bg-[#111827] rounded-lg px-2 py-1.5 border border-[#1f2937]"><span class="text-gray-500">HVN</span><br><span class="mono font-bold">${sig.hvn ? '$'+fmt(sig.hvn, sig.hvn>10?2:4):'-'} <span class="text-[10px] ${sig.hvn_strength>2?'text-[#00d395]':''}">${sig.hvn_strength?fmt(sig.hvn_strength,1)+'x':''}</span></span></div>
+        <div class="bg-[#111827] rounded-lg px-2 py-1.5 border border-[#1f2937]"><span class="text-gray-500">Absorption</span><br><span class="mono font-bold ${sig.absorption_score>50?'text-[#f59e0b]':''}">${fmt(sig.absorption_score,0)} <span class="text-[10px]">${sig.absorption_type||''}</span></span></div>
+        <div class="bg-[#111827] rounded-lg px-2 py-1.5 border border-[#1f2937]"><span class="text-gray-500">Imbalance L3</span><br><span class="mono font-bold">${fmt(sig.imbalance_score,0)} (${sig.analysis?.imbalance?.count||0})</span></div>
+      </div>
+      <div class="mt-2 flex items-center justify-between text-xs">
+        <span class="text-gray-400 truncate flex-1 mr-2">${(sig.reasons||[]).slice(0,2).join(' • ')}</span>
+        <span class="mono text-[11px]"><span class="text-[#00d395]">TP ${sig.tp? '$'+fmt(sig.tp,2):'-'}</span> <span class="text-[#ff4747]">SL ${sig.sl? '$'+fmt(sig.sl,2):'-'}</span></span>
+      </div>`;
+    container.appendChild(el);
+  });
+}
+async function loadScannerResults(){
+  try{
+    const r = await fetch(`${API}/api/scanner/results`);
+    const j = await r.json();
+    if(j.results) renderSignals(j.results);
+    if(j.last_scan) $('scanTime').textContent = new Date(j.last_scan).toLocaleTimeString();
+  }catch(e){}
+}
+
+// Positions
+async function loadPositions(){
+  try{
+    const r = await fetch(`${API}/api/positions`);
+    const j = await r.json();
+    const tbody = $('positionsTable');
+    const empty = $('positionsEmpty');
+    if(!j.data || j.data.length===0){
+      tbody.innerHTML='';
+      empty.style.display='block';
+      return;
+    }
+    empty.style.display='none';
+    tbody.innerHTML='';
+    j.data.forEach(pos=>{
+      const isLong = pos.side==='LONG';
+      const pnl = pos.unrealized_pnl ?? 0;
+      const pnlClass = pnl>=0 ? 'text-[#00d395]' : 'text-[#ff4747]';
+      const tr=document.createElement('tr');
+      tr.className='hover:bg-[#1f2937]/30';
+      tr.innerHTML=`
+        <td class="px-3 py-2"><span class="font-black mono">${pos.symbol}</span><br><span class="text-[11px] text-gray-500 mono">${fmt(pos.quantity,3)} • ${pos.leverage}x</span></td>
+        <td class="py-2"><span class="px-2 py-1 rounded-full text-xs font-black ${isLong?'bg-[#00d395] text-black':'bg-[#ff4747] text-white'}">${pos.side}</span><br><span class="text-[11px] mono text-gray-500">$${fmt(pos.margin)} margin</span></td>
+        <td class="text-right py-2 mono">$${fmt(pos.entry_price, pos.entry_price>10?2:4)}</td>
+        <td class="text-right py-2 mono">$${fmt(pos.current_price||pos.entry_price, pos.current_price>10?2:4)}</td>
+        <td class="text-right py-2 mono font-bold ${pnlClass}">${pnl>=0?'+':''}$${fmt(pnl,2)}<br><span class="text-[11px]">${pnl>=0?'+':''}${fmt(pos.unrealized_pnl_percent||0,2)}%</span></td>
+        <td class="text-right py-2 mono text-[11px] leading-tight"><span class="text-[#00d395]">${pos.tp_price? '$'+fmt(pos.tp_price,2):'-'}</span><br><span class="text-[#ff4747]">${pos.sl_price? '$'+fmt(pos.sl_price,2):'-'}</span></td>
+        <td class="text-right px-3 py-2"><button onclick="closePos(${pos.id})" class="px-3 py-1.5 rounded-full bg-[#ff4747] text-white text-xs font-bold hover:bg-red-600">Close</button></td>`;
+      tbody.appendChild(tr);
+    });
+  }catch(e){}
+}
+async function closePos(id){
+  if(!confirm('Close this position at market?')) return;
+  try{
+    const r= await fetch(`${API}/api/trades/${id}`, {method:'DELETE'});
+    const j= await r.json();
+    toast('Closed', `PnL $${fmt(j.pnl||0,2)}`);
+    loadPositions(); loadHistory(); loadRisk();
+  }catch(e){ toast('Error', 'Close failed', false)}
+}
+
+// History
+async function loadHistory(){
+  try{
+    const r= await fetch(`${API}/api/history?limit=30`);
+    const j= await r.json();
+    const wrap=$('historyList');
+    if(!j.data || j.data.length===0){ wrap.innerHTML='<p class="py-8 text-center text-gray-500 text-xs">No closed trades yet</p>'; return; }
+    wrap.innerHTML='';
+    j.data.forEach(t=>{
+      const win = t.is_win===1;
+      const el=document.createElement('div');
+      el.className='px-3 py-2 flex items-center justify-between hover:bg-[#1f2937]/30';
+      el.innerHTML=`
+        <div>
+          <p class="mono font-bold text-xs flex items-center gap-1">${t.symbol} <span class="px-1.5 py-0.5 rounded text-[10px] font-black ${t.side==='LONG'?'bg-[#00d395] text-black':'bg-[#ff4747] text-white'}">${t.side}</span> ${win?'<span class="w-2 h-2 rounded-full bg-[#00d395]"></span>':'<span class="w-2 h-2 rounded-full bg-[#ff4747]"></span>'}</p>
+          <p class="text-[11px] text-gray-500 mono">$${fmt(t.entry_price)} → $${fmt(t.exit_price||0)} • ${t.quantity} • ${t.leverage}x</p>
+        </div>
+        <div class="text-right">
+          <p class="mono font-black text-xs ${win?'text-[#00d395]':'text-[#ff4747]'}">${win?'+':''}$${fmt(t.pnl||0,2)}</p>
+          <p class="text-[11px] mono ${win?'text-[#00d395]':'text-[#ff4747]'}">${fmt(t.pnl_percent||0,2)}% • ${t.tp_price?'TP ':''}${t.exit_price && t.tp_price && Math.abs(t.exit_price-t.tp_price)<0.01?'✓':''}</p>
+        </div>`;
+      wrap.appendChild(el);
+    });
+  }catch(e){}
+}
+
+// Logs
+async function loadLogs(){
+  try{
+    const r= await fetch(`${API}/api/logs?limit=80`);
+    const j= await r.json();
+    const wrap=$('logList');
+    $('logCount').textContent = `${j.count} logs`;
+    wrap.innerHTML='';
+    (j.data||[]).slice().reverse().forEach(log=>{
+      const time = new Date(log.timestamp).toLocaleTimeString();
+      const color = log.level==='ERROR'?'text-[#ff4747]': log.level==='WARNING'?'text-[#f59e0b]':'text-gray-400';
+      const el=document.createElement('div');
+      el.className=`flex gap-2 ${color}`;
+      el.innerHTML=`<span class="text-gray-600">${time}</span><span class="font-bold">[${log.module}]</span><span class="text-gray-300">${log.message}</span>`;
+      wrap.appendChild(el);
+    });
+    wrap.scrollTop = wrap.scrollHeight;
+  }catch(e){}
+}
+
+// Risk
+async function loadRisk(){
+  try{
+    const r= await fetch(`${API}/api/risk`);
+    const j= await r.json();
+    $('riskBase').textContent = fmt(j.base_margin||2,2);
+    $('riskNext').textContent = '$'+fmt(j.next_margin||2,2);
+    $('statNextMargin').textContent = '$'+fmt(j.next_margin||2,2);
+    $('statMarginExplain').textContent = j.last_trade || '';
+    $('riskExplain').textContent = j.last_trade || 'No trades yet';
+    $('riskWinRate').textContent = (j.win_rate||0)+'%';
+    $('statWinRate').textContent = (j.win_rate||0)+'%';
+    $('statTotalTrades').textContent = j.total_trades||0;
+    $('riskTotalPnl').textContent = '$'+fmt(j.total_pnl||0,2);
+    $('statTodayPnL').textContent = `${(j.total_pnl||0)>=0?'+':''}$${fmt(j.total_pnl||0,2)}`;
+    $('statTodayPnL').className = `text-2xl font-black mono mt-1 ${(j.total_pnl||0)>=0?'text-[#00d395]':'text-[#ff4747]'}`;
+  }catch(e){}
+}
+
+// Chart
+let chart, candleSeries, currentSymbol='BTCUSDT';
+function initChart(){
+  const container = document.getElementById('tradingview_widget');
+  if(!container) return;
+  // Try TradingView widget if lightweightCharts not found fallback to lightweight
+  try{
+    if(typeof LightweightCharts !== 'undefined'){
+      const chartContainer = container;
+      chart = LightweightCharts.createChart(chartContainer, {
+        layout: { background:{color:'#05080f'}, textColor:'#9ca3af'},
+        grid:{ vertLines:{color:'#1f2937'}, horzLines:{color:'#1f2937'}},
+        crosshair:{ mode:1 },
+        rightPriceScale:{ borderColor:'#1f2937'},
+        timeScale:{ borderColor:'#1f2937', timeVisible:true}
+      });
+      candleSeries = chart.addCandlestickSeries({ upColor:'#00d395', downColor:'#ff4747', borderVisible:false, wickUpColor:'#00d395', wickDownColor:'#ff4747'});
+      window.addEventListener('resize', ()=> chart.applyOptions({ width: chartContainer.clientWidth, height: 360 }));
+      loadChartData(currentSymbol);
+    } else {
+      // fallback iframe TV
+      container.innerHTML = `<iframe src="https://s.tradingview.com/widgetembed/?frameElementId=tradingview_widget&symbol=BINANCE:${currentSymbol}&interval=5&hidesidetoolbar=0&symboledit=1&saveimage=1&toolbarbg=rgba(0,0,0,1)&studies=[]&theme=dark&style=1&timezone=Etc/UTC&studies_overrides={}&overrides={}&enabled_features=[]&disabled_features=[]&locale=en&utm_source=&utm_medium=widget&utm_campaign=chart&utm_term=BINANCE:${currentSymbol}" style="width:100%;height:100%;border:0"></iframe>`;
+    }
+  }catch(e){
+    document.getElementById('chartFallback').classList.remove('hidden');
+  }
+}
+async function loadChartData(symbol){
+  if(!candleSeries) return;
+  try{
+    const r = await fetch(`${API}/api/klines?symbol=${symbol}&interval=5m&limit=150`);
+    const j = await r.json();
+    const data = (j.data||[]).map(k=> ({
+      time: Math.floor(k.open_time/1000),
+      open: k.open, high: k.high, low: k.low, close: k.close
+    }));
+    candleSeries.setData(data);
+    // auto scale
+    chart.timeScale().fitContent();
+    // update fallback infos if chart works
+    document.getElementById('chartFallback').classList.add('hidden');
+  }catch(e){
+    document.getElementById('fallbackSymbol').textContent = symbol;
+  }
+}
+function updateChartSymbol(sym, signal){
+  if(sym) currentSymbol = sym;
+  else sym = $('chartSymbol').value;
+  currentSymbol = sym;
+  $('fallbackSymbol').textContent = sym;
+  if(signal){
+    $('fallbackHVN').textContent = signal.hvn? '$'+fmt(signal.hvn,2):'-';
+    $('fallbackAbs').textContent = fmt(signal.absorption_score,0)+' '+ (signal.absorption_type||'');
+    $('fallbackImb').textContent = fmt(signal.imbalance_score,0);
+    document.getElementById('chartFallback').classList.remove('hidden');
+    setTimeout(()=> document.getElementById('chartFallback').classList.add('hidden'), 2000);
+  }
+  // If using TV iframe, reload
+  const container = document.getElementById('tradingview_widget');
+  if(!candleSeries){
+    container.innerHTML = `<iframe src="https://s.tradingview.com/widgetembed/?frameElementId=tradingview_widget&symbol=BINANCE:${sym}&interval=5&hidesidetoolbar=0&symboledit=1&saveimage=1&toolbarbg=rgba(0,0,0,1)&studies=[]&theme=dark&style=1&timezone=Etc/UTC&studies_overrides={}&overrides={}&enabled_features=[]&disabled_features=[]&locale=en&utm_source=&utm_medium=widget&utm_campaign=chart&utm_term=BINANCE:${sym}" style="width:100%;height:100%;border:0"></iframe>`;
+  } else {
+    loadChartData(sym);
+  }
+}
+
+// Polling
+async function refreshAll(){
+  await Promise.all([refreshStatus(), loadPositions(), loadHistory(), loadLogs(), loadRisk()]);
+}
+async function poll(){
+  await refreshStatus();
+  await loadPositions();
+  await loadRisk();
+}
+setInterval(()=>{ loadScannerResults(); loadVolatility(); }, 15000);
+setInterval(poll, 5000);
+setInterval(loadLogs, 7000);
+
+// Init
+document.addEventListener('DOMContentLoaded', async ()=>{
+  initChart();
+  loadIp();
+  loadVolatility();
+  loadScannerResults();
+  refreshAll();
+  // also load klines for initial chart
+  setTimeout(()=> loadChartData('BTCUSDT'), 500);
+});
+</script>
+</body>
+</html>
