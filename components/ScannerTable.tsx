@@ -24,6 +24,8 @@ interface ScannerTableProps {
   isMaxPositionsReached: boolean;
   botActive: boolean;
   scanCountdown?: number;
+  scanIntervalSeconds?: number;
+  leverage?: number;
   isScanning?: boolean;
   hasApiKey?: boolean;
   onGoToSettings?: () => void;
@@ -37,6 +39,8 @@ export function ScannerTable({
   isMaxPositionsReached,
   botActive,
   scanCountdown = 15,
+  scanIntervalSeconds = 15,
+  leverage = 10,
   isScanning = false,
   hasApiKey = false,
   onGoToSettings,
@@ -98,7 +102,7 @@ export function ScannerTable({
                 ) : (
                   <>
                     <Clock className="w-3 h-3 text-slate-500" />
-                    <span className="text-slate-400">Scan Ready (15s)</span>
+                    <span className="text-slate-400">Scan Ready ({scanIntervalSeconds}s)</span>
                   </>
                 )}
               </span>
@@ -113,7 +117,7 @@ export function ScannerTable({
             </span>
             <button
               onClick={() => setSortBy('volatility')}
-              className={`px-2.5 py-1 rounded font-medium transition-colors flex items-center gap-1 ${
+              className={`interactive-glow-btn px-2.5 py-1 rounded font-medium transition-colors flex items-center gap-1 ${
                 sortBy === 'volatility'
                   ? 'bg-cyan-950/80 text-cyan-300 border border-cyan-800/80 font-bold shadow-[0_0_8px_rgba(0,240,255,0.3)]'
                   : 'bg-slate-800 text-slate-400 hover:text-slate-200'
@@ -125,7 +129,7 @@ export function ScannerTable({
 
             <button
               onClick={() => setSortBy('score')}
-              className={`px-2.5 py-1 rounded font-medium transition-colors ${
+              className={`interactive-glow-btn px-2.5 py-1 rounded font-medium transition-colors ${
                 sortBy === 'score'
                   ? 'bg-cyan-950/80 text-cyan-300 border border-cyan-800/80 font-bold shadow-[0_0_8px_rgba(0,240,255,0.3)]'
                   : 'bg-slate-800 text-slate-400 hover:text-slate-200'
@@ -150,7 +154,7 @@ export function ScannerTable({
               <button
                 type="button"
                 onClick={onGoToSettings}
-                className="mt-2 px-5 py-2.5 bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs rounded-lg transition-all shadow-[0_0_16px_rgba(0,240,255,0.4)]"
+                className="interactive-glow-btn mt-2 px-5 py-2.5 bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs rounded-lg transition-all shadow-[0_0_16px_rgba(0,240,255,0.4)]"
               >
                 Go to Settings & Add API Key
               </button>
@@ -168,7 +172,7 @@ export function ScannerTable({
                   <th className="py-2.5 px-3">Heavy Absorption</th>
                   <th className="py-2.5 px-3">Imbalance 3:1</th>
                   <th className="py-2.5 px-3">Signal & Score</th>
-                  <th className="py-2.5 px-3">Dynamic TP / SL</th>
+                  <th className="py-2.5 px-3">Indicator TP / SL</th>
                   <th className="py-2.5 px-3 text-right">Bot Action</th>
                 </tr>
               </thead>
@@ -193,7 +197,9 @@ export function ScannerTable({
                         key={sig.symbol}
                         onClick={() => onSelectSymbol(sig.symbol)}
                         className={`transition-colors cursor-pointer ${
-                          isSelected ? 'bg-slate-800/80' : 'hover:bg-slate-800/40'
+                          isSelected
+                            ? 'bg-cyan-950/30 border-l-2 border-l-cyan-400'
+                            : 'hover:bg-slate-800/40'
                         }`}
                       >
                         {/* Symbol */}
@@ -248,20 +254,30 @@ export function ScannerTable({
                               {sig.hvnProfile.priceRelation.replace('_', ' ')}
                             </span>
                           </div>
+                          <div className="text-[11px] text-slate-500 tabular-nums mt-0.5">
+                            POC: ${formatCryptoPrice(sig.hvnProfile.pocPrice)}
+                          </div>
                         </td>
 
                         {/* Indicator 2: Heavy Absorption */}
                         <td className="py-3 px-3">
                           <div>
-                            {Boolean(sig.absorption?.isHeavyAbsorption ?? sig.absorption?.isAbsorptionDetected) ? (
+                            {Boolean(
+                              sig.absorption?.isHeavyAbsorption ??
+                                sig.absorption?.isAbsorptionDetected
+                            ) ? (
                               <span
                                 className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-bold ${
-                                  (sig.absorption?.absorptionType === 'BULLISH' || sig.absorption?.type === 'BULLISH_ABSORPTION')
+                                  sig.absorption?.absorptionType === 'BULLISH' ||
+                                  sig.absorption?.type === 'BULLISH_ABSORPTION'
                                     ? 'text-emerald-400 bg-emerald-950/60 border border-emerald-800/40'
                                     : 'text-rose-400 bg-rose-950/60 border border-rose-800/40'
                                 }`}
                               >
-                                {(sig.absorption?.absorptionType === 'BULLISH' || sig.absorption?.type === 'BULLISH_ABSORPTION') ? 'Bull' : 'Bear'}{' '}
+                                {sig.absorption?.absorptionType === 'BULLISH' ||
+                                sig.absorption?.type === 'BULLISH_ABSORPTION'
+                                  ? 'Bull'
+                                  : 'Bear'}{' '}
                                 {sig.absorption?.ratio ?? sig.absorption?.absorptionScore ?? 0}%
                               </span>
                             ) : (
@@ -279,10 +295,14 @@ export function ScannerTable({
                         {/* Indicator 3: Stacked Imbalance 3:1 */}
                         <td className="py-3 px-3">
                           <div>
-                            {Boolean(sig.imbalance?.hasStackedImbalance ?? sig.imbalance?.isImbalanceDetected) ? (
+                            {Boolean(
+                              sig.imbalance?.hasStackedImbalance ??
+                                sig.imbalance?.isImbalanceDetected
+                            ) ? (
                               <span
                                 className={`inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-bold ${
-                                  (sig.imbalance?.imbalanceSide === 'BUY' || sig.imbalance?.type === 'BUY_IMBALANCE')
+                                  sig.imbalance?.imbalanceSide === 'BUY' ||
+                                  sig.imbalance?.type === 'BUY_IMBALANCE'
                                     ? 'text-emerald-400 bg-emerald-950/60'
                                     : 'text-rose-400 bg-rose-950/60'
                                 }`}
@@ -299,7 +319,7 @@ export function ScannerTable({
                         </td>
 
                         {/* Signal & Score */}
-                        <td className="py-3 px-3">
+                        <td className="py-3 px-3" title={sig.reasons.join(' • ')}>
                           <div className="flex items-center gap-1.5">
                             <span
                               className={`inline-flex items-center gap-0.5 px-2 py-0.5 rounded text-[11px] font-bold ${
@@ -321,15 +341,19 @@ export function ScannerTable({
                               {sig.score}%
                             </span>
                           </div>
-                          <div className="text-[10px] text-slate-500 font-sans truncate max-w-[140px] mt-0.5">
+                          <div className="text-[10px] text-slate-500 font-sans truncate max-w-[160px] mt-0.5">
                             {sig.reasons[0] || 'Flow consolidation'}
                           </div>
                         </td>
 
                         {/* Dynamic TP & SL */}
                         <td className="py-3 px-3 tabular-nums">
-                          <div className="text-emerald-400">TP: ${formatCryptoPrice(sig.tpPrice)}</div>
-                          <div className="text-rose-400 text-[11px]">SL: ${formatCryptoPrice(sig.slPrice)}</div>
+                          <div className="text-emerald-400">
+                            TP: ${formatCryptoPrice(sig.tpPrice)}
+                          </div>
+                          <div className="text-rose-400 text-[11px]">
+                            SL: ${formatCryptoPrice(sig.slPrice)}
+                          </div>
                         </td>
 
                         {/* Bot Execution Action */}
@@ -355,8 +379,8 @@ export function ScannerTable({
                               }`}
                               title={
                                 isMaxPositionsReached
-                                  ? 'Maximum 5 positions reached'
-                                  : 'Execute trade with 10x leverage'
+                                  ? 'Maximum open positions reached'
+                                  : `Execute trade with ${leverage}x isolated leverage`
                               }
                             >
                               <Zap className="w-3 h-3" />

@@ -43,12 +43,18 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  // 2. If external services fail, extract from headers
+  // 2. If external services fail, extract public IPv4 from headers (ignore loopback/private IPs)
   if (publicIpv4 === 'Unknown') {
     const forwarded = req.headers.get('x-forwarded-for');
     if (forwarded) {
       const first = forwarded.split(',')[0].trim();
-      if (!first.includes(':')) {
+      const isPrivateOrLoopback =
+        first.includes(':') ||
+        first.startsWith('127.') ||
+        first.startsWith('10.') ||
+        first.startsWith('192.168.') ||
+        first === 'localhost';
+      if (!isPrivateOrLoopback) {
         publicIpv4 = first;
         source = 'request-header';
       }

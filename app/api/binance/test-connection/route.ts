@@ -16,18 +16,24 @@ export async function POST(req: NextRequest) {
     let pingLatency = 0;
 
     try {
-      const pingRes = await fetch(`${baseUrl}/fapi/v1/ping`);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+      const pingRes = await fetch(`${baseUrl}/fapi/v1/ping`, {
+        signal: controller.signal,
+        cache: 'no-store',
+      });
+      clearTimeout(timeout);
       pingLatency = Date.now() - startTime;
       pingSuccess = pingRes.ok;
     } catch {
-      pingLatency = 45;
-      pingSuccess = true; // allow testing in sandboxed environments
+      pingLatency = Date.now() - startTime;
+      pingSuccess = false;
     }
 
     // 2. If credentials provided, attempt authenticated account balance query
     let authValid = false;
     let balanceInfo = null;
-    let errorMessage = null;
+    let errorMessage: string | null = null;
 
     if (apiKey && apiSecret) {
       try {
@@ -38,18 +44,24 @@ export async function POST(req: NextRequest) {
           .update(queryString)
           .digest('hex');
 
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
         const accountRes = await fetch(
           `${baseUrl}/fapi/v2/account?${queryString}&signature=${signature}`,
           {
             headers: {
               'X-MBX-APIKEY': apiKey,
             },
+            signal: controller.signal,
+            cache: 'no-store',
           }
         );
+        clearTimeout(timeout);
 
         if (accountRes.ok) {
           const accData = await accountRes.json();
           authValid = true;
+          pingSuccess = true;
           balanceInfo = {
             totalWalletBalance: parseFloat(accData.totalWalletBalance || '0'),
             totalUnrealizedProfit: parseFloat(accData.totalUnrealizedProfit || '0'),
@@ -59,16 +71,18 @@ export async function POST(req: NextRequest) {
         } else {
           const errData = await accountRes.json().catch(() => ({}));
           errorMessage =
-            errData.msg || `Binance API error HTTP ${accountRes.status}`;
+            errData.msg || `Binance API rejected credentials (HTTP ${accountRes.status})`;
         }
       } catch (err: unknown) {
         const error = err as Error;
         errorMessage = error.message || 'Network error reaching Binance Futures API';
       }
+    } else {
+      errorMessage = 'Please provide both Binance API Key and Secret Key.';
     }
 
     return NextResponse.json({
-      success: true,
+      success: authValid || pingSuccess,
       endpoint: baseUrl,
       ping: {
         status: pingSuccess ? 'ONLINE' : 'UNREACHABLE',
@@ -78,8 +92,8 @@ export async function POST(req: NextRequest) {
         provided: Boolean(apiKey && apiSecret),
         valid: authValid,
         message: authValid
-          ? 'API Key & Secret successfully verified on Binance Futures'
-          : errorMessage || 'Ping succeeded. Ready for trading execution.',
+          ? 'API Key & Secret verified on Binance Futures'
+          : errorMessage || 'Unable to verify Binance Futures credentials.',
         balance: balanceInfo,
       },
       timestamp: new Date().toISOString(),

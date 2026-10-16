@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
 import {
   Key,
@@ -12,6 +12,8 @@ import {
   EyeOff,
   Check,
   AlertCircle,
+  Shield,
+  Copy,
 } from 'lucide-react';
 
 export interface BotSettings {
@@ -19,7 +21,7 @@ export interface BotSettings {
   apiSecret: string;
   isTestnet: boolean;
   baseMargin: number; // default $2.00
-  leverage: number; // default 10x
+  leverage: number; // default 10x (10x - 15x isolated)
   maxOpenTrades: number; // default 5
   compoundingPercent: number; // default 20%
   scanIntervalSeconds: number; // default 15s
@@ -29,7 +31,7 @@ export interface BotSettings {
 interface SettingsViewProps {
   settings: BotSettings;
   onUpdateSettings: (newSettings: BotSettings) => void;
-  onTestConnection: () => Promise<void>;
+  onTestConnection: (overrideSettings?: BotSettings) => Promise<void>;
   isTestingConnection: boolean;
   connectionResult: {
     tested: boolean;
@@ -60,10 +62,43 @@ export function SettingsView({
   const [showSecret, setShowSecret] = useState<boolean>(false);
   const [isSaved, setIsSaved] = useState<boolean>(false);
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [serverIp, setServerIp] = useState<string>('');
+  const [copiedIp, setCopiedIp] = useState<boolean>(false);
+
+  // Fetch server egress IPv4 for Binance API IP Whitelisting
+  useEffect(() => {
+    let active = true;
+    fetch('/api/network/ip')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (active && data?.ipv4) {
+          setServerIp(data.ipv4);
+        }
+      })
+      .catch(() => {
+        // ignore
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleCopyIp = () => {
+    if (!serverIp) return;
+    navigator.clipboard?.writeText(serverIp);
+    setCopiedIp(true);
+    setTimeout(() => setCopiedIp(false), 2000);
+  };
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
-    onUpdateSettings(localSettings);
+    const normalized: BotSettings = {
+      ...localSettings,
+      baseMargin: Math.max(1, Number(localSettings.baseMargin) || 2.0),
+      leverage: Math.min(15, Math.max(10, Math.round(Number(localSettings.leverage) || 10))),
+    };
+    setLocalSettings(normalized);
+    onUpdateSettings(normalized);
     setIsSaved(true);
     setValidationError(null);
     setTimeout(() => setIsSaved(false), 2500);
@@ -74,10 +109,16 @@ export function SettingsView({
       setValidationError('Please input your Binance API Key and Secret Key before starting the bot.');
       return;
     }
+    const normalized: BotSettings = {
+      ...localSettings,
+      baseMargin: Math.max(1, Number(localSettings.baseMargin) || 2.0),
+      leverage: Math.min(15, Math.max(10, Math.round(Number(localSettings.leverage) || 10))),
+    };
     setValidationError(null);
-    onUpdateSettings(localSettings);
+    setLocalSettings(normalized);
+    onUpdateSettings(normalized);
     setIsSaved(true);
-    onStartBot(localSettings);
+    onStartBot(normalized);
   };
 
   const hasCredentials = Boolean(localSettings.apiKey.trim() && localSettings.apiSecret.trim());
@@ -93,7 +134,7 @@ export function SettingsView({
       <div className="neon-section">
         <div className="neon-section-inner p-6 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
           <div className="flex flex-col gap-2">
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-3">
               <span
                 className={`inline-flex items-center gap-2 px-3.5 py-1 rounded-full text-xs font-bold font-mono ${
                   botActive
@@ -107,6 +148,10 @@ export function SettingsView({
                   }`}
                 />
                 {botActive ? 'BOT RUNNING (LIVE BINANCE FUTURES)' : 'READY FOR LIVE PRODUCTION'}
+              </span>
+              <span className="text-xs font-mono text-slate-400">
+                Base Margin: <strong className="text-cyan-300">${localSettings.baseMargin.toFixed(2)}</strong> · Leverage:{' '}
+                <strong className="text-cyan-300">{localSettings.leverage}x Isolated</strong> (10x–15x)
               </span>
             </div>
             {validationError && (
@@ -123,7 +168,7 @@ export function SettingsView({
                 type="button"
                 onClick={onPauseBot}
                 title="Pause Bot"
-                className="w-16 h-16 rounded-2xl flex items-center justify-center text-white bg-rose-600 hover:bg-rose-500 shadow-[0_0_24px_rgba(225,29,72,0.6)] animate-pulse transition-all"
+                className="interactive-glow-btn w-16 h-16 rounded-2xl flex items-center justify-center text-white bg-rose-600 hover:bg-rose-500 shadow-[0_0_24px_rgba(225,29,72,0.6)] transition-all"
               >
                 <Pause className="w-8 h-8 fill-white" />
               </button>
@@ -132,13 +177,13 @@ export function SettingsView({
                 type="button"
                 onClick={handleSaveAndStart}
                 title="Start Real Live Bot Execution"
-                className={`w-20 h-20 rounded-2xl flex items-center justify-center transition-all ${
+                className={`interactive-glow-btn w-16 h-16 rounded-2xl flex items-center justify-center transition-all ${
                   hasCredentials
-                    ? 'text-slate-950 bg-cyan-400 hover:bg-cyan-300 shadow-[0_0_35px_rgba(0,240,255,0.8)] animate-bounce hover:scale-105'
+                    ? 'text-slate-950 bg-cyan-400 hover:bg-cyan-300 shadow-[0_0_28px_rgba(0,240,255,0.65)] hover:scale-105'
                     : 'text-slate-400 bg-slate-800 border border-slate-700 hover:bg-slate-750'
                 }`}
               >
-                <Play className={`w-9 h-9 ml-1 ${hasCredentials ? 'fill-slate-950' : 'fill-slate-400'}`} />
+                <Play className={`w-8 h-8 ml-0.5 ${hasCredentials ? 'fill-slate-950' : 'fill-slate-400'}`} />
               </button>
             )}
           </div>
@@ -149,7 +194,7 @@ export function SettingsView({
         {/* Section A: Binance API Credentials */}
         <div className="neon-section">
           <div className="neon-section-inner p-5 space-y-4">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-800">
               <div className="flex items-center gap-2">
                 <Key className="w-4 h-4 text-cyan-400" />
                 <h4 className="text-sm font-semibold text-slate-100">
@@ -206,13 +251,45 @@ export function SettingsView({
               </div>
             </div>
 
+            {/* Server IP Whitelisting Helper */}
+            {serverIp && (
+              <div className="p-3 rounded-lg bg-slate-950/90 border border-slate-800 flex items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 text-slate-300">
+                  <Shield className="w-4 h-4 text-cyan-400 shrink-0" />
+                  <div>
+                    <span className="text-slate-400 block text-[10px]">
+                      Binance API Trusted Egress IPv4
+                    </span>
+                    <span className="font-mono font-bold text-cyan-300">{serverIp}</span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCopyIp}
+                  className="px-2.5 py-1 rounded text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1 transition-colors"
+                >
+                  {copiedIp ? (
+                    <>
+                      <Check className="w-3 h-3 text-emerald-400" />
+                      Copied
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3 h-3 text-cyan-400" />
+                      Copy IP
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+
             {/* Connection Test Action */}
-            <div className="pt-2">
+            <div className="pt-1">
               <button
                 type="button"
-                onClick={onTestConnection}
+                onClick={() => onTestConnection(localSettings)}
                 disabled={isTestingConnection || !hasCredentials}
-                className="w-full py-2 px-3 text-xs font-medium text-slate-100 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md flex items-center justify-center gap-2 transition-colors disabled:opacity-50"
+                className="interactive-glow-btn w-full py-2 px-3 text-xs font-medium text-slate-100 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md flex items-center justify-center gap-2 transition-colors disabled:opacity-50"
               >
                 <RefreshCw
                   className={`w-3.5 h-3.5 ${isTestingConnection ? 'animate-spin' : ''}`}
@@ -230,7 +307,7 @@ export function SettingsView({
                 >
                   <div className="font-semibold flex items-center justify-between">
                     <span>{connectionResult.message}</span>
-                    {connectionResult.latencyMs && (
+                    {connectionResult.latencyMs !== undefined && (
                       <span className="text-[11px] text-slate-400">
                         {connectionResult.latencyMs}ms
                       </span>
@@ -253,18 +330,32 @@ export function SettingsView({
         {/* Section B: Trading Parameters */}
         <div className="neon-section">
           <div className="neon-section-inner p-5 space-y-4">
-            <div className="flex items-center gap-2 pb-3 border-b border-slate-800">
-              <Sliders className="w-4 h-4 text-cyan-400" />
-              <h4 className="text-sm font-semibold text-slate-100">
-                Bot Parameters
-              </h4>
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-2">
+                <Sliders className="w-4 h-4 text-cyan-400" />
+                <h4 className="text-sm font-semibold text-slate-100">
+                  Bot Parameters ($2 Base · 10x–15x Isolated)
+                </h4>
+              </div>
+              <span className="text-[11px] font-mono text-cyan-400 bg-cyan-950/60 px-2 py-0.5 rounded border border-cyan-800/60">
+                3-Indicator TP/SL
+              </span>
             </div>
 
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">
-                  Base Margin ($)
-                </label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-slate-300">
+                    Base Margin ($)
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setLocalSettings({ ...localSettings, baseMargin: 2.0 })}
+                    className="text-[10px] font-mono text-cyan-400 hover:underline"
+                  >
+                    Default $2.00
+                  </button>
+                </div>
                 <input
                   type="number"
                   step="0.1"
@@ -281,19 +372,40 @@ export function SettingsView({
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">
-                  Leverage (Isolated)
-                </label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-slate-300">
+                    Isolated Leverage (10x–15x)
+                  </label>
+                  <div className="flex items-center gap-1">
+                    {[10, 12, 15].map((lev) => (
+                      <button
+                        key={lev}
+                        type="button"
+                        onClick={() => setLocalSettings({ ...localSettings, leverage: lev })}
+                        className={`px-1.5 py-0.2 rounded text-[10px] font-mono font-bold transition-colors ${
+                          localSettings.leverage === lev
+                            ? 'bg-cyan-500 text-slate-950'
+                            : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {lev}x
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 <div className="flex items-center gap-2">
                   <input
                     type="number"
-                    min="1"
-                    max="50"
+                    min="10"
+                    max="15"
                     value={localSettings.leverage}
                     onChange={(e) =>
                       setLocalSettings({
                         ...localSettings,
-                        leverage: parseInt(e.target.value, 10) || 10,
+                        leverage: Math.min(
+                          15,
+                          Math.max(10, parseInt(e.target.value, 10) || 10)
+                        ),
                       })
                     }
                     className="w-full bg-slate-950 border border-slate-700/80 rounded-md px-3 py-2 text-xs font-mono text-slate-100 focus:outline-none focus:border-cyan-400"
@@ -395,7 +507,7 @@ export function SettingsView({
               <div className="flex items-center gap-3">
                 <button
                   type="submit"
-                  className="px-4 py-2 text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-all"
+                  className="interactive-glow-btn px-4 py-2 text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-all"
                 >
                   Save Settings
                 </button>
@@ -404,7 +516,7 @@ export function SettingsView({
                   <button
                     type="button"
                     onClick={handleSaveAndStart}
-                    className="px-5 py-2 text-xs font-bold text-slate-950 bg-cyan-400 hover:bg-cyan-300 rounded-md transition-all shadow-[0_0_12px_rgba(0,240,255,0.4)] flex items-center gap-1.5"
+                    className="interactive-glow-btn px-5 py-2 text-xs font-bold text-slate-950 bg-cyan-400 hover:bg-cyan-300 rounded-md transition-all shadow-[0_0_12px_rgba(0,240,255,0.4)] flex items-center gap-1.5"
                   >
                     <Play className="w-3.5 h-3.5 fill-slate-950" />
                     Start Bot

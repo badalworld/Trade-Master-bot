@@ -1,13 +1,15 @@
 /**
  * Trade Master - Order Flow & Volume Profile Trading Engine
  * Strategy based on:
- * 1. HVN Profile (High Volume Node / Point of Control Volume Profile)
- * 2. Heavy Absorption (Order Flow Passive Limit Absorption)
+ * 1. HVN Profile (High Volume Node / Point of Control Volume Profile & Value Area)
+ * 2. Heavy Absorption (Order Flow Passive Limit Absorption & Delta Divergence)
  * 3. Imbalance Levels (Stacked 3:1 Volumetric Buying/Selling Imbalances)
- * 
+ *
  * Includes:
- * - Dynamic TP/SL calculation based on ATR & Volume Nodes
- * - Compounding Margin Engine (+20% of profit on win, reset to fixed base on loss)
+ * - Indicator-Driven Dynamic TP/SL calculation (anchored to HVN/POC/VAH/VAL, Absorption Wicks, Imbalance Zones & ATR)
+ * - Dynamic multi-decimal price rounding (supports BTCUSDT down to micro-cap pairs like PEPEUSDT)
+ * - Compounding Margin Engine ($2.00 base margin, +20% of profit compounded on win, reset to base on loss)
+ * - Leverage constraint support (10x - 15x Isolated)
  * - Maximum Open Trades constraint (max 5)
  * - Binance API Rate Limit Shield (95% safety cap)
  */
@@ -19,6 +21,8 @@ export interface Candle {
   low: number;
   close: number;
   volume: number;
+  takerBuyVolume?: number; // Real aggressive buy volume from Binance kline index [9]
+  isClosed?: boolean;
 }
 
 export interface VolumeNode {
@@ -44,7 +48,7 @@ export interface AbsorptionResult {
   absorptionType?: 'BULLISH' | 'BEARISH' | 'NONE';
   absorptionScore: number; // 0 - 100%
   ratio?: number;
-  deltaVolume: number; // estimated buy - sell delta
+  deltaVolume: number; // aggressive buy - aggressive sell volume delta
   absorbedPrice: number;
 }
 
@@ -84,14 +88,16 @@ export interface TradePosition {
   side: 'LONG' | 'SHORT';
   entryPrice: number;
   markPrice: number;
-  margin: number; // in USDT (e.g. 2.00 or compounded)
-  leverage: number; // 10x
+  margin: number; // in USDT (default $2.00 base or compounded)
+  leverage: number; // 10x - 15x isolated
   quantity: number;
   stopLoss: number;
   takeProfit: number;
   unrealizedPnl: number;
   unrealizedPnlPercent: number;
   entryTime: number;
+  tpOrderId?: string | number;
+  slOrderId?: string | number;
 }
 
 export interface ClosedTrade {
@@ -121,12 +127,39 @@ export interface CompoundingState {
 }
 
 // ---------------------------------------------------------------------------
+// 0. Dynamic Multi-Decimal Price Precision Helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Rounds any crypto asset price to appropriate decimal places based on magnitude
+ * so low-priced assets (e.g. PEPEUSDT at $0.00001021) never round to $0.0000.
+ */
+export function roundCryptoPrice(price: number): number {
+  if (!Number.isFinite(price) || price <= 0) return 0;
+  if (price < 0.0001) return Number(price.toFixed(8));
+  if (price < 0.01) return Number(price.toFixed(6));
+  if (price < 1) return Number(price.toFixed(4));
+  if (price < 10) return Number(price.toFixed(3));
+  return Number(price.toFixed(2));
+}
+
+function formatPriceLabel(price: number): string {
+  if (!Number.isFinite(price) || price <= 0) return '0.00';
+  if (price < 0.0001) return price.toFixed(8);
+  if (price < 0.01) return price.toFixed(6);
+  if (price < 1) return price.toFixed(4);
+  if (price < 10) return price.toFixed(3);
+  return price.toFixed(2);
+}
+
+// ---------------------------------------------------------------------------
 // 1. Indicator 1: HVN Profile (High Volume Node & Point of Control)
 // ---------------------------------------------------------------------------
 
 /**
  * Calculates Volume Profile across the recent 5m candle window,
- * determining Point of Control (POC), High Volume Nodes (HVN), and Value Area (VAH/VAL).
+ * distributing each candle's volume across the price bins it traded through
+ * and determining Point of Control (POC), High Volume Nodes (HVN), and Value Area (VAH/VAL).
  */
 export function calculateHVNProfile(candles: Candle[], binCount: number = 14): HVNProfileResult {
   if (candles.length === 0) {
@@ -145,22 +178,36 @@ export function calculateHVNProfile(candles: Candle[], binCount: number = 14): H
   const lows = candles.map((c) => c.low);
   const minP = Math.min(...lows);
   const maxP = Math.max(...highs);
-  const range = maxP - minP || currentPrice * 0.01;
+  const range = maxP - minP || currentPrice * 0.01 || 0.0001;
   const step = range / binCount;
 
   const bins: { priceLevel: number; volume: number }[] = Array.from({ length: binCount }, (_, i) => ({
-    priceLevel: Number((minP + step * i + step / 2).toFixed(6)),
+    priceLevel: roundCryptoPrice(minP + step * i + step / 2),
     volume: 0,
   }));
 
-  // Distribute candle volumes across price bins
+  // Distribute each candle's volume across spanned bins (50% across full range, 50% at typical price)
   candles.forEach((c) => {
-    const avgPrice = (c.high + c.low + c.close) / 3;
-    const binIdx = Math.min(
+    const typicalPrice = (c.high + c.low + c.close) / 3;
+    const typicalIdx = Math.min(
       binCount - 1,
-      Math.max(0, Math.floor((avgPrice - minP) / step))
+      Math.max(0, Math.floor((typicalPrice - minP) / step))
     );
-    bins[binIdx].volume += c.volume;
+    const startIdx = Math.min(
+      binCount - 1,
+      Math.max(0, Math.floor((c.low - minP) / step))
+    );
+    const endIdx = Math.min(
+      binCount - 1,
+      Math.max(startIdx, Math.floor((c.high - minP) / step))
+    );
+
+    const spannedCount = endIdx - startIdx + 1;
+    const rangeWeight = (c.volume * 0.5) / spannedCount;
+    for (let idx = startIdx; idx <= endIdx; idx++) {
+      bins[idx].volume += rangeWeight;
+    }
+    bins[typicalIdx].volume += c.volume * 0.5;
   });
 
   // Find Point of Control (POC) = bin with max volume
@@ -176,11 +223,11 @@ export function calculateHVNProfile(candles: Candle[], binCount: number = 14): H
   const totalVol = bins.reduce((acc, b) => acc + b.volume, 0);
   const avgBinVol = totalVol / (binCount || 1);
 
-  // Identify High Volume Nodes (HVNs) where volume > 1.35x average bin volume
+  // Identify High Volume Nodes (HVNs) where volume >= 1.25x average bin volume
   const hvnLevels: number[] = [];
   const nodes: VolumeNode[] = bins.map((b, idx) => {
     const isPOC = idx === pocIdx;
-    const isHVN = b.volume >= avgBinVol * 1.35;
+    const isHVN = b.volume >= avgBinVol * 1.25;
     if (isHVN) hvnLevels.push(b.priceLevel);
     return {
       priceLevel: b.priceLevel,
@@ -190,7 +237,7 @@ export function calculateHVNProfile(candles: Candle[], binCount: number = 14): H
     };
   });
 
-  const pocPrice = bins[pocIdx]?.priceLevel || currentPrice;
+  const pocPrice = roundCryptoPrice(bins[pocIdx]?.priceLevel || currentPrice);
 
   // Calculate Value Area (70% total volume centered around POC)
   const target70 = totalVol * 0.7;
@@ -199,8 +246,8 @@ export function calculateHVNProfile(candles: Candle[], binCount: number = 14): H
   let upperIdx = pocIdx;
 
   while (accumulated < target70 && (lowerIdx > 0 || upperIdx < binCount - 1)) {
-    const nextLower = lowerIdx > 0 ? bins[lowerIdx - 1].volume : 0;
-    const nextUpper = upperIdx < binCount - 1 ? bins[upperIdx + 1].volume : 0;
+    const nextLower = lowerIdx > 0 ? bins[lowerIdx - 1].volume : -1;
+    const nextUpper = upperIdx < binCount - 1 ? bins[upperIdx + 1].volume : -1;
 
     if (nextUpper >= nextLower && upperIdx < binCount - 1) {
       upperIdx++;
@@ -208,11 +255,13 @@ export function calculateHVNProfile(candles: Candle[], binCount: number = 14): H
     } else if (lowerIdx > 0) {
       lowerIdx--;
       accumulated += bins[lowerIdx].volume;
-    } else break;
+    } else {
+      break;
+    }
   }
 
-  const valueAreaHigh = bins[upperIdx]?.priceLevel || maxP;
-  const valueAreaLow = bins[lowerIdx]?.priceLevel || minP;
+  const valueAreaHigh = roundCryptoPrice(bins[upperIdx]?.priceLevel || maxP);
+  const valueAreaLow = roundCryptoPrice(bins[lowerIdx]?.priceLevel || minP);
 
   let priceRelation: HVNProfileResult['priceRelation'] = 'AT_POC';
   if (currentPrice > pocPrice * 1.001) priceRelation = 'ABOVE_POC';
@@ -233,8 +282,47 @@ export function calculateHVNProfile(candles: Candle[], binCount: number = 14): H
 // ---------------------------------------------------------------------------
 
 /**
+ * Helper to compute true volume delta (Aggressive Buy Volume - Aggressive Sell Volume)
+ * purely in volume units. Uses Binance takerBuyVolume when available, or candle structure fallback.
+ */
+function computeCandleVolumeDelta(c: Candle): { buyVol: number; sellVol: number; delta: number } {
+  if (typeof c.takerBuyVolume === 'number' && c.takerBuyVolume >= 0 && c.takerBuyVolume <= c.volume) {
+    const buyVol = c.takerBuyVolume;
+    const sellVol = Math.max(0, c.volume - buyVol);
+    return {
+      buyVol,
+      sellVol,
+      delta: Number((buyVol - sellVol).toFixed(2)),
+    };
+  }
+
+  const range = c.high - c.low;
+  if (range <= 0) {
+    const isGreen = c.close >= c.open;
+    const buyVol = isGreen ? c.volume * 0.55 : c.volume * 0.45;
+    const sellVol = c.volume - buyVol;
+    return { buyVol, sellVol, delta: Number((buyVol - sellVol).toFixed(2)) };
+  }
+
+  // Close position within range + wick rejection contribution (all normalized 0..1, multiplied by volume)
+  const closeLocation = (c.close - c.low) / range; // 0 at low, 1 at high
+  const lowerWickRatio = (Math.min(c.open, c.close) - c.low) / range;
+  const upperWickRatio = (c.high - Math.max(c.open, c.close)) / range;
+
+  const buyShare = Math.min(0.92, Math.max(0.08, closeLocation * 0.7 + (0.5 + (lowerWickRatio - upperWickRatio) * 0.5) * 0.3));
+  const buyVol = c.volume * buyShare;
+  const sellVol = c.volume * (1 - buyShare);
+
+  return {
+    buyVol,
+    sellVol,
+    delta: Number((buyVol - sellVol).toFixed(2)),
+  };
+}
+
+/**
  * Detects Heavy Absorption where aggressive market orders meet heavy passive limit liquidity.
- * Evaluates high volume combined with small real body / long wicks or delta volume divergence.
+ * Evaluates high relative volume combined with rejection wicks or delta divergence.
  */
 export function calculateHeavyAbsorption(candles: Candle[]): AbsorptionResult {
   if (candles.length < 3) {
@@ -248,42 +336,78 @@ export function calculateHeavyAbsorption(candles: Candle[]): AbsorptionResult {
   }
 
   const latest = candles[candles.length - 1];
-  const prevSlice = candles.slice(-10);
-  const avgVolume = prevSlice.reduce((acc, c) => acc + c.volume, 0) / prevSlice.length;
+  const prev = candles[candles.length - 2];
+  const baselineSlice = candles.slice(-12, -1);
+  const avgVolume =
+    baselineSlice.length > 0
+      ? baselineSlice.reduce((acc, c) => acc + c.volume, 0) / baselineSlice.length
+      : candles.slice(-10).reduce((acc, c) => acc + c.volume, 0) / Math.min(10, candles.length);
 
-  const totalRange = latest.high - latest.low || 0.0001;
-  const bodySize = Math.abs(latest.close - latest.open);
-  const upperWick = latest.high - Math.max(latest.open, latest.close);
-  const lowerWick = Math.min(latest.open, latest.close) - latest.low;
+  // If the latest 5m candle just opened and has very low volume compared to the completed candle,
+  // also inspect the just-completed candle so confirmed absorption isn't lost on bar rollover
+  const target =
+    latest.isClosed === false && latest.volume < avgVolume * 0.35 && prev.volume >= avgVolume * 1.15
+      ? prev
+      : latest;
 
-  // High volume relative to average (> 1.25x)
-  const isHighVolume = latest.volume >= avgVolume * 1.25;
+  const totalRange = target.high - target.low || target.close * 0.0005 || 1e-8;
+  const bodySize = Math.abs(target.close - target.open);
+  const upperWick = target.high - Math.max(target.open, target.close);
+  const lowerWick = Math.min(target.open, target.close) - target.low;
 
-  // Estimate volume delta (buying vs selling)
-  const isGreen = latest.close >= latest.open;
-  const deltaVolume = Number(
-    ((isGreen ? latest.volume * 0.55 : -latest.volume * 0.55) + (lowerWick - upperWick) * 0.1).toFixed(2)
-  );
+  const volRatio = avgVolume > 0 ? target.volume / avgVolume : 1.0;
+  const isHighVolume = volRatio >= 1.2;
+
+  const { delta: deltaVolume } = computeCandleVolumeDelta(target);
 
   let isAbsorptionDetected = false;
   let type: AbsorptionResult['type'] = 'NONE';
   let absorptionScore = 0;
 
-  // Bullish Absorption: High volume, heavy lower wick (buyers absorbing selling pressure at lows)
-  if (isHighVolume && lowerWick >= totalRange * 0.45 && lowerWick > bodySize) {
+  const lowerWickShare = lowerWick / totalRange;
+  const upperWickShare = upperWick / totalRange;
+
+  // Bullish Absorption:
+  // Case A: High volume + strong lower wick rejection (passive limit buyers absorbing aggressive sellers at lows)
+  // Case B: High volume + negative delta (aggressive selling) that fails to close near low (delta divergence)
+  const isBullishWickAbsorption =
+    isHighVolume && lowerWickShare >= 0.42 && lowerWick >= bodySize * 0.85;
+  const isBullishDeltaDivergence =
+    volRatio >= 1.35 && deltaVolume < 0 && target.close >= target.open && lowerWickShare >= 0.3;
+
+  // Bearish Absorption:
+  // Case A: High volume + strong upper wick rejection (passive limit sellers absorbing aggressive buyers at highs)
+  // Case B: High volume + positive delta (aggressive buying) that fails to close near high (delta divergence)
+  const isBearishWickAbsorption =
+    isHighVolume && upperWickShare >= 0.42 && upperWick >= bodySize * 0.85;
+  const isBearishDeltaDivergence =
+    volRatio >= 1.35 && deltaVolume > 0 && target.close <= target.open && upperWickShare >= 0.3;
+
+  if (isBullishWickAbsorption || isBullishDeltaDivergence) {
     isAbsorptionDetected = true;
     type = 'BULLISH_ABSORPTION';
-    absorptionScore = Math.min(98, Math.round((latest.volume / avgVolume) * 45 + (lowerWick / totalRange) * 50));
-  }
-  // Bearish Absorption: High volume, heavy upper wick (sellers absorbing buying pressure at highs)
-  else if (isHighVolume && upperWick >= totalRange * 0.45 && upperWick > bodySize) {
+    absorptionScore = Math.min(
+      98,
+      Math.max(55, Math.round(Math.min(volRatio, 2.5) * 28 + lowerWickShare * 55))
+    );
+  } else if (isBearishWickAbsorption || isBearishDeltaDivergence) {
     isAbsorptionDetected = true;
     type = 'BEARISH_ABSORPTION';
-    absorptionScore = Math.min(98, Math.round((latest.volume / avgVolume) * 45 + (upperWick / totalRange) * 50));
+    absorptionScore = Math.min(
+      98,
+      Math.max(55, Math.round(Math.min(volRatio, 2.5) * 28 + upperWickShare * 55))
+    );
   }
 
   const absorptionType: 'BULLISH' | 'BEARISH' | 'NONE' =
     type === 'BULLISH_ABSORPTION' ? 'BULLISH' : type === 'BEARISH_ABSORPTION' ? 'BEARISH' : 'NONE';
+
+  const rawAbsorbedPrice =
+    type === 'BULLISH_ABSORPTION'
+      ? target.low
+      : type === 'BEARISH_ABSORPTION'
+      ? target.high
+      : target.close;
 
   return {
     isAbsorptionDetected,
@@ -293,7 +417,7 @@ export function calculateHeavyAbsorption(candles: Candle[]): AbsorptionResult {
     absorptionScore,
     ratio: absorptionScore,
     deltaVolume,
-    absorbedPrice: type === 'BULLISH_ABSORPTION' ? latest.low : type === 'BEARISH_ABSORPTION' ? latest.high : latest.close,
+    absorbedPrice: roundCryptoPrice(rawAbsorbedPrice),
   };
 }
 
@@ -303,7 +427,7 @@ export function calculateHeavyAbsorption(candles: Candle[]): AbsorptionResult {
 
 /**
  * Detects Volumetric Imbalance Levels (3:1 ratio stacked buying or selling imbalances).
- * High ratio indicates aggressive initiative order flow overpowering opposing liquidity.
+ * Combines real aggressive buy/sell volume ratio with price expansion and clamps extreme division ratios.
  */
 export function calculateImbalanceLevels(candles: Candle[], minRatio: number = 3.0): ImbalanceResult {
   if (candles.length < 3) {
@@ -318,17 +442,52 @@ export function calculateImbalanceLevels(candles: Candle[], minRatio: number = 3
 
   const latest = candles[candles.length - 1];
   const prev = candles[candles.length - 2];
+  const baselineSlice = candles.slice(-12, -1);
+  const avgVolume =
+    baselineSlice.length > 0
+      ? baselineSlice.reduce((acc, c) => acc + c.volume, 0) / baselineSlice.length
+      : latest.volume || 1;
 
-  const priceDelta = latest.close - prev.close;
-  const isUptrendMomentum = priceDelta > 0;
-  const isDowntrendMomentum = priceDelta < 0;
+  // If current candle just started with negligible volume, inspect the just-closed candle
+  const targetIdx =
+    latest.isClosed === false && latest.volume < avgVolume * 0.3 && candles.length >= 3
+      ? candles.length - 2
+      : candles.length - 1;
+  const target = candles[targetIdx];
+  const prior = candles[Math.max(0, targetIdx - 1)];
 
-  // Calculate simulated level-by-level bid/ask volumetric ratio
-  const buyPressure = (latest.close - latest.low) * latest.volume;
-  const sellPressure = (latest.high - latest.close) * latest.volume;
+  const priceDelta = target.close - prior.close;
+  const isUptrendMomentum = priceDelta > 0 || target.close > target.open;
+  const isDowntrendMomentum = priceDelta < 0 || target.close < target.open;
 
-  const ratio = sellPressure > 0 ? buyPressure / sellPressure : buyPressure > 0 ? buyPressure : 1.0;
-  const invRatio = buyPressure > 0 ? sellPressure / buyPressure : sellPressure > 0 ? sellPressure : 1.0;
+  const totalRange = target.high - target.low || target.close * 0.001 || 1e-8;
+  // Regularize denominator to at least 8% of candle range so close === high never divides by zero
+  const effectiveFloor = totalRange * 0.08;
+  const buySpan = Math.max(effectiveFloor, target.close - target.low);
+  const sellSpan = Math.max(effectiveFloor, target.high - target.close);
+
+  const volMultiplier = avgVolume > 0 ? Math.min(2.2, Math.max(0.6, target.volume / avgVolume)) : 1.0;
+
+  // Incorporate real takerBuyVolume ratio if available from Binance kline data
+  let takerBuyRatio = 1.0;
+  let takerSellRatio = 1.0;
+  if (
+    typeof target.takerBuyVolume === 'number' &&
+    target.takerBuyVolume > 0 &&
+    target.volume > target.takerBuyVolume
+  ) {
+    const buyV = target.takerBuyVolume;
+    const sellV = Math.max(target.volume * 0.08, target.volume - buyV);
+    takerBuyRatio = buyV / sellV;
+    takerSellRatio = sellV / Math.max(target.volume * 0.08, buyV);
+  }
+
+  const rawBuyRatio = ((buySpan / sellSpan) * 0.65 + takerBuyRatio * 0.35) * Math.sqrt(volMultiplier);
+  const rawSellRatio = ((sellSpan / buySpan) * 0.65 + takerSellRatio * 0.35) * Math.sqrt(volMultiplier);
+
+  // Clamp ratio to a realistic order-flow footprint range [1.0, 12.0]
+  const buyRatio = Math.min(12.0, Math.max(1.0, rawBuyRatio));
+  const sellRatio = Math.min(12.0, Math.max(1.0, rawSellRatio));
 
   let stackedImbalanceCount = 0;
   let type: ImbalanceResult['type'] = 'BALANCED';
@@ -336,33 +495,43 @@ export function calculateImbalanceLevels(candles: Candle[], minRatio: number = 3
   let maxImbalanceRatio = 1.0;
   const imbalancePriceLevels: number[] = [];
 
-  const step = (latest.high - latest.low) / 4 || latest.close * 0.001;
+  const step = totalRange / 4;
 
-  if (isUptrendMomentum && ratio >= minRatio) {
+  if (isUptrendMomentum && buyRatio >= minRatio) {
     isImbalanceDetected = true;
     type = 'BUY_IMBALANCE';
-    stackedImbalanceCount = 3; // 3 stacked buy levels
-    maxImbalanceRatio = Number(ratio.toFixed(2));
+    stackedImbalanceCount = 3;
+    maxImbalanceRatio = Number(buyRatio.toFixed(2));
     imbalancePriceLevels.push(
-      Number(latest.low.toFixed(4)),
-      Number((latest.low + step * 2).toFixed(4)),
-      Number((latest.low + step * 3).toFixed(4))
+      roundCryptoPrice(target.low + step),
+      roundCryptoPrice(target.low + step * 2),
+      roundCryptoPrice(target.low + step * 3)
     );
-  } else if (isDowntrendMomentum && invRatio >= minRatio) {
+  } else if (isDowntrendMomentum && sellRatio >= minRatio) {
     isImbalanceDetected = true;
     type = 'SELL_IMBALANCE';
-    stackedImbalanceCount = 3; // 3 stacked sell levels
-    maxImbalanceRatio = Number(invRatio.toFixed(2));
+    stackedImbalanceCount = 3;
+    maxImbalanceRatio = Number(sellRatio.toFixed(2));
     imbalancePriceLevels.push(
-      Number(latest.high.toFixed(4)),
-      Number((latest.high - step * 2).toFixed(4)),
-      Number((latest.high - step * 3).toFixed(4))
+      roundCryptoPrice(target.high - step),
+      roundCryptoPrice(target.high - step * 2),
+      roundCryptoPrice(target.high - step * 3)
     );
-  } else if (Math.abs(ratio - 1.0) > 0.5) {
-    // Partial imbalance
-    type = ratio > 1.0 ? 'BUY_IMBALANCE' : 'SELL_IMBALANCE';
+  } else if (Math.max(buyRatio, sellRatio) >= 1.65) {
+    type = buyRatio >= sellRatio ? 'BUY_IMBALANCE' : 'SELL_IMBALANCE';
     stackedImbalanceCount = 2;
-    maxImbalanceRatio = Number((ratio > 1.0 ? ratio : invRatio).toFixed(2));
+    maxImbalanceRatio = Number(Math.max(buyRatio, sellRatio).toFixed(2));
+    if (type === 'BUY_IMBALANCE') {
+      imbalancePriceLevels.push(
+        roundCryptoPrice(target.low + step),
+        roundCryptoPrice(target.low + step * 2)
+      );
+    } else {
+      imbalancePriceLevels.push(
+        roundCryptoPrice(target.high - step),
+        roundCryptoPrice(target.high - step * 2)
+      );
+    }
   }
 
   const imbalanceSide: 'BUY' | 'SELL' | 'BALANCED' =
@@ -403,7 +572,7 @@ export function calculateATR(candles: Candle[], period: number = 14): number {
 
   if (trs.length === 0) return 0;
   const sum = trs.reduce((acc, val) => acc + val, 0);
-  return Number((sum / trs.length).toFixed(6));
+  return Number((sum / trs.length).toFixed(8));
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +583,8 @@ export function evaluate3IndicatorSignal(
   symbol: string,
   candles: Candle[]
 ): SignalEvaluation {
-  const currentPrice = candles[candles.length - 1]?.close || 0;
+  const rawPrice = candles[candles.length - 1]?.close || 0;
+  const currentPrice = roundCryptoPrice(rawPrice);
   const atr = calculateATR(candles, 14);
 
   const hvnProfile = calculateHVNProfile(candles, 14);
@@ -425,35 +595,57 @@ export function evaluate3IndicatorSignal(
   let bullPoints = 0;
   let bearPoints = 0;
 
-  // 1. HVN Profile Evaluation (Point of Control & High Volume Nodes)
+  // 1. Indicator 1: HVN Profile Evaluation (Point of Control & Value Area Nodes)
   if (hvnProfile.priceRelation === 'ABOVE_POC') {
     bullPoints += 35;
-    reasons.push(`Price trading above Point of Control (POC: $${hvnProfile.pocPrice.toFixed(2)})`);
+    reasons.push(`Price trading above Point of Control (POC: $${formatPriceLabel(hvnProfile.pocPrice)})`);
   } else if (hvnProfile.priceRelation === 'BELOW_POC') {
     bearPoints += 35;
-    reasons.push(`Price trading below Point of Control (POC: $${hvnProfile.pocPrice.toFixed(2)})`);
+    reasons.push(`Price trading below Point of Control (POC: $${formatPriceLabel(hvnProfile.pocPrice)})`);
   } else {
-    bullPoints += 15;
-    bearPoints += 15;
-    reasons.push(`Price consolidating at Point of Control ($${hvnProfile.pocPrice.toFixed(2)})`);
+    bullPoints += 20;
+    bearPoints += 20;
+    reasons.push(`Price testing Point of Control value node ($${formatPriceLabel(hvnProfile.pocPrice)})`);
   }
 
-  // 2. Heavy Absorption Evaluation
+  // 2. Indicator 2: Heavy Absorption Evaluation
   if (absorption.type === 'BULLISH_ABSORPTION') {
     bullPoints += 35;
-    reasons.push(`Heavy Bullish Absorption detected (${absorption.absorptionScore}% score) at $${absorption.absorbedPrice.toFixed(2)}`);
+    reasons.push(
+      `Heavy Bullish Absorption (${absorption.absorptionScore}%) at $${formatPriceLabel(absorption.absorbedPrice)}`
+    );
   } else if (absorption.type === 'BEARISH_ABSORPTION') {
     bearPoints += 35;
-    reasons.push(`Heavy Bearish Absorption detected (${absorption.absorptionScore}% score) at $${absorption.absorbedPrice.toFixed(2)}`);
+    reasons.push(
+      `Heavy Bearish Absorption (${absorption.absorptionScore}%) at $${formatPriceLabel(absorption.absorbedPrice)}`
+    );
+  } else if (absorption.deltaVolume > 0 && hvnProfile.priceRelation === 'ABOVE_POC') {
+    bullPoints += 10;
+  } else if (absorption.deltaVolume < 0 && hvnProfile.priceRelation === 'BELOW_POC') {
+    bearPoints += 10;
   }
 
-  // 3. Imbalance Levels Evaluation (Stacked 3:1 Imbalance)
-  if (imbalance.type === 'BUY_IMBALANCE') {
+  // 3. Indicator 3: Imbalance Levels Evaluation (Stacked 3:1 Imbalance)
+  if (imbalance.isImbalanceDetected && imbalance.type === 'BUY_IMBALANCE') {
     bullPoints += 30;
-    reasons.push(`Stacked 3:1 Buying Imbalance detected (${imbalance.maxImbalanceRatio}x ratio)`);
-  } else if (imbalance.type === 'SELL_IMBALANCE') {
+    reasons.push(`Stacked 3:1 Buying Imbalance (${imbalance.maxImbalanceRatio}x across ${imbalance.stackedImbalanceCount} levels)`);
+  } else if (imbalance.isImbalanceDetected && imbalance.type === 'SELL_IMBALANCE') {
     bearPoints += 30;
-    reasons.push(`Stacked 3:1 Selling Imbalance detected (${imbalance.maxImbalanceRatio}x ratio)`);
+    reasons.push(`Stacked 3:1 Selling Imbalance (${imbalance.maxImbalanceRatio}x across ${imbalance.stackedImbalanceCount} levels)`);
+  } else if (imbalance.stackedImbalanceCount === 2 && imbalance.type === 'BUY_IMBALANCE') {
+    bullPoints += 15;
+    reasons.push(`Developing Buy Imbalance (${imbalance.maxImbalanceRatio}x, 2 stacked levels)`);
+  } else if (imbalance.stackedImbalanceCount === 2 && imbalance.type === 'SELL_IMBALANCE') {
+    bearPoints += 15;
+    reasons.push(`Developing Sell Imbalance (${imbalance.maxImbalanceRatio}x, 2 stacked levels)`);
+  }
+
+  // Penalize conflicting Order Flow (e.g. Bullish Imbalance running straight into Bearish Absorption)
+  if (absorption.type === 'BEARISH_ABSORPTION' && bullPoints > bearPoints) {
+    bullPoints = Math.max(0, bullPoints - 25);
+  }
+  if (absorption.type === 'BULLISH_ABSORPTION' && bearPoints > bullPoints) {
+    bearPoints = Math.max(0, bearPoints - 25);
   }
 
   // Determine Final Signal & Action
@@ -461,43 +653,135 @@ export function evaluate3IndicatorSignal(
   let action: 'LONG' | 'SHORT' | 'HOLD' = 'HOLD';
   let score = 50;
 
-  if (bullPoints >= 70) {
+  if (bullPoints >= 70 && bullPoints > bearPoints) {
     signal = 'STRONG_BUY';
     action = 'LONG';
     score = Math.min(98, bullPoints);
-  } else if (bullPoints >= 50) {
+  } else if (bullPoints >= 55 && bullPoints > bearPoints) {
     signal = 'BUY';
     action = 'LONG';
     score = bullPoints;
-  } else if (bearPoints >= 70) {
+  } else if (bearPoints >= 70 && bearPoints > bullPoints) {
     signal = 'STRONG_SELL';
     action = 'SHORT';
     score = Math.min(98, bearPoints);
-  } else if (bearPoints >= 50) {
+  } else if (bearPoints >= 55 && bearPoints > bullPoints) {
     signal = 'SELL';
     action = 'SHORT';
     score = bearPoints;
   } else {
     signal = 'NEUTRAL';
     action = 'HOLD';
-    score = Math.max(bullPoints, bearPoints);
+    score = Math.max(bullPoints, bearPoints, 35);
   }
 
-  // Dynamic TP and SL based on ATR and Volume Nodes
-  const safeAtr = atr > 0 ? atr : currentPrice * 0.01;
+  // -------------------------------------------------------------------------
+  // Indicator-Driven Dynamic TP and SL (Anchored to HVN, Absorption & Imbalance)
+  // -------------------------------------------------------------------------
+  const safeAtr = atr > 0 ? atr : currentPrice * 0.008 || 1e-6;
   let tpPrice = currentPrice;
   let slPrice = currentPrice;
 
   if (action === 'LONG') {
-    tpPrice = Number((currentPrice + 2.5 * safeAtr).toFixed(4));
-    slPrice = Number((Math.min(currentPrice - 1.5 * safeAtr, hvnProfile.pocPrice * 0.998)).toFixed(4));
+    // Candidate structural support levels from our 3 indicators below currentPrice:
+    // 1. Absorption wick low (if bullish absorption detected)
+    // 2. Lowest stacked buy imbalance level
+    // 3. HVN / POC / VAL node below price
+    const structuralSupports: number[] = [];
+    if (absorption.type === 'BULLISH_ABSORPTION' && absorption.absorbedPrice < currentPrice) {
+      structuralSupports.push(absorption.absorbedPrice * 0.9985);
+    }
+    if (imbalance.type === 'BUY_IMBALANCE' && imbalance.imbalancePriceLevels.length > 0) {
+      const lowestImb = Math.min(...imbalance.imbalancePriceLevels);
+      if (lowestImb < currentPrice) structuralSupports.push(lowestImb * 0.9985);
+    }
+    if (hvnProfile.pocPrice < currentPrice) {
+      structuralSupports.push(hvnProfile.pocPrice * 0.998);
+    }
+    if (hvnProfile.valueAreaLow < currentPrice) {
+      structuralSupports.push(hvnProfile.valueAreaLow * 0.998);
+    }
+
+    // Pick the tightest structural indicator support that gives at least 0.8 * ATR breathing room,
+    // and cap maximum SL distance at 1.6 * ATR so Risk/Reward is never inverted.
+    const minSl = currentPrice - 1.6 * safeAtr;
+    const maxSl = currentPrice - 0.85 * safeAtr;
+    const validSupports = structuralSupports.filter((s) => s >= minSl && s <= maxSl);
+    const rawSl =
+      validSupports.length > 0
+        ? Math.max(...validSupports)
+        : Math.max(minSl, Math.min(maxSl, currentPrice - 1.4 * safeAtr));
+    slPrice = roundCryptoPrice(rawSl);
+
+    // Ensure SL is strictly below currentPrice
+    if (slPrice >= currentPrice) {
+      slPrice = roundCryptoPrice(currentPrice * 0.99);
+    }
+
+    const riskDist = Math.max(currentPrice - slPrice, safeAtr * 0.8);
+
+    // Indicator-based Take Profit target: upper HVN / VAH node or Volume Profile extension (>= 1.67x risk)
+    const upperNodes = [
+      ...hvnProfile.hvnLevels.filter((lvl) => lvl > currentPrice + riskDist * 1.4),
+      hvnProfile.valueAreaHigh > currentPrice + riskDist * 1.4 ? hvnProfile.valueAreaHigh : 0,
+    ].filter((lvl) => lvl > 0 && lvl <= currentPrice + 3.5 * safeAtr);
+
+    const rawTp =
+      upperNodes.length > 0
+        ? Math.max(...upperNodes, currentPrice + riskDist * 1.67)
+        : currentPrice + Math.max(2.4 * safeAtr, riskDist * 1.67);
+    tpPrice = roundCryptoPrice(rawTp);
   } else if (action === 'SHORT') {
-    tpPrice = Number((currentPrice - 2.5 * safeAtr).toFixed(4));
-    slPrice = Number((Math.max(currentPrice + 1.5 * safeAtr, hvnProfile.pocPrice * 1.002)).toFixed(4));
+    // Candidate structural resistance levels from our 3 indicators above currentPrice:
+    const structuralResistances: number[] = [];
+    if (absorption.type === 'BEARISH_ABSORPTION' && absorption.absorbedPrice > currentPrice) {
+      structuralResistances.push(absorption.absorbedPrice * 1.0015);
+    }
+    if (imbalance.type === 'SELL_IMBALANCE' && imbalance.imbalancePriceLevels.length > 0) {
+      const highestImb = Math.max(...imbalance.imbalancePriceLevels);
+      if (highestImb > currentPrice) structuralResistances.push(highestImb * 1.0015);
+    }
+    if (hvnProfile.pocPrice > currentPrice) {
+      structuralResistances.push(hvnProfile.pocPrice * 1.002);
+    }
+    if (hvnProfile.valueAreaHigh > currentPrice) {
+      structuralResistances.push(hvnProfile.valueAreaHigh * 1.002);
+    }
+
+    const minSl = currentPrice + 0.85 * safeAtr;
+    const maxSl = currentPrice + 1.6 * safeAtr;
+    const validResistances = structuralResistances.filter((r) => r >= minSl && r <= maxSl);
+    const rawSl =
+      validResistances.length > 0
+        ? Math.min(...validResistances)
+        : Math.min(maxSl, Math.max(minSl, currentPrice + 1.4 * safeAtr));
+    slPrice = roundCryptoPrice(rawSl);
+
+    if (slPrice <= currentPrice) {
+      slPrice = roundCryptoPrice(currentPrice * 1.01);
+    }
+
+    const riskDist = Math.max(slPrice - currentPrice, safeAtr * 0.8);
+
+    const lowerNodes = [
+      ...hvnProfile.hvnLevels.filter((lvl) => lvl < currentPrice - riskDist * 1.4),
+      hvnProfile.valueAreaLow < currentPrice - riskDist * 1.4 ? hvnProfile.valueAreaLow : 0,
+    ].filter((lvl) => lvl > 0 && lvl >= currentPrice - 3.5 * safeAtr);
+
+    const rawTp =
+      lowerNodes.length > 0
+        ? Math.min(...lowerNodes, currentPrice - riskDist * 1.67)
+        : currentPrice - Math.max(2.4 * safeAtr, riskDist * 1.67);
+    tpPrice = roundCryptoPrice( Math.max(rawTp, currentPrice * 0.1) );
   } else {
-    tpPrice = Number((currentPrice + 2.0 * safeAtr).toFixed(4));
-    slPrice = Number((currentPrice - 1.5 * safeAtr).toFixed(4));
+    tpPrice = roundCryptoPrice(currentPrice + 2.2 * safeAtr);
+    slPrice = roundCryptoPrice(Math.max(currentPrice * 0.1, currentPrice - 1.4 * safeAtr));
   }
+
+  const actualRisk = Math.abs(currentPrice - slPrice);
+  const actualReward = Math.abs(tpPrice - currentPrice);
+  const riskRewardRatio =
+    actualRisk > 0 ? Number((actualReward / actualRisk).toFixed(2)) : 1.67;
 
   // Compute High Volatility Metrics (ATR % and 5m High-Low expansion)
   const atrRatio = currentPrice > 0 ? (safeAtr / currentPrice) * 100 : 1.0;
@@ -522,7 +806,7 @@ export function evaluate3IndicatorSignal(
     atr: safeAtr,
     tpPrice,
     slPrice,
-    riskRewardRatio: 1.67,
+    riskRewardRatio,
     hvnProfile,
     absorption,
     imbalance,
@@ -531,14 +815,14 @@ export function evaluate3IndicatorSignal(
 }
 
 /**
- * Sorts scanned Futures pairs primarily by High Volatility for faster price movement & profit
+ * Sorts scanned Futures pairs by actionable signal quality & High Volatility
  */
 export function sortByVolatility(signals: SignalEvaluation[]): SignalEvaluation[] {
   return [...signals].sort((a, b) => b.volatilityPercent - a.volatilityPercent);
 }
 
 // ---------------------------------------------------------------------------
-// 6. Compounding & Position Management
+// 6. Compounding & Position Management ($2 Base Margin, +20% Win Compounding)
 // ---------------------------------------------------------------------------
 
 export const MAX_OPEN_TRADES = 5;
@@ -551,7 +835,9 @@ export function calculateNextTradeMargin(
 
   if (lastTradeResult.isWin && lastTradeResult.profit > 0) {
     const bonus = Number((lastTradeResult.profit * (compoundingPercent / 100)).toFixed(4));
-    const nextMargin = Number((baseMargin + bonus).toFixed(2));
+    // Accumulate onto currentMargin when on a winning streak, starting from baseMargin ($2.00)
+    const activeBase = state.consecutiveWins > 0 ? state.currentMargin : baseMargin;
+    const nextMargin = Number((activeBase + bonus).toFixed(2));
 
     const newState: CompoundingState = {
       ...state,
@@ -611,13 +897,16 @@ export interface RateLimitStatus {
 
 export function checkRateLimit(
   usedWeight: number,
-  maxLimit: number = BINANCE_DEFAULT_WEIGHT_LIMIT
+  maxLimit: number = BINANCE_DEFAULT_WEIGHT_LIMIT,
+  safetyThresholdRatio: number = RATE_LIMIT_SAFETY_THRESHOLD
 ): RateLimitStatus {
+  const effectiveThreshold =
+    safetyThresholdRatio > 1 ? safetyThresholdRatio / 100 : safetyThresholdRatio;
   const usageRatio = maxLimit > 0 ? usedWeight / maxLimit : 0;
   const usagePercent = Number((usageRatio * 100).toFixed(1));
-  const isThrottled = usageRatio >= RATE_LIMIT_SAFETY_THRESHOLD;
+  const isThrottled = usageRatio >= effectiveThreshold;
   const isSafe = !isThrottled;
-  const remainingWeight = Math.max(0, Math.floor(maxLimit * RATE_LIMIT_SAFETY_THRESHOLD - usedWeight));
+  const remainingWeight = Math.max(0, Math.floor(maxLimit * effectiveThreshold - usedWeight));
 
   return {
     usedWeight,

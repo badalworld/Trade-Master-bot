@@ -12,83 +12,152 @@ export function TradeMasterLogo({ size = 'md', showSubtitle = false }: TradeMast
   const isSm = size === 'sm';
   const isLg = size === 'lg';
 
-  const iconDim = isSm ? 32 : isLg ? 48 : 40;
+  const iconDim = isSm ? 34 : isLg ? 48 : 40;
 
   return (
-    <div className="flex items-center gap-3 select-none group cursor-pointer">
-      {/* Google-Inspired Sharp Precision Multi-Color Orbital Glyph */}
+    <motion.div
+      whileHover={{ scale: 1.02 }}
+      whileTap={{ scale: 0.97 }}
+      className="flex items-center gap-2.5 sm:gap-3 select-none group cursor-pointer shrink-0"
+    >
+      {/* Jitter Round-Logo-Ripple Motion Graphic Emblem */}
       <div
-        className="relative shrink-0 flex items-center justify-center rounded-2xl overflow-hidden"
+        className="relative shrink-0 flex items-center justify-center rounded-full"
         style={{
           width: iconDim,
           height: iconDim,
         }}
       >
-        {/* Animated Chromatic Orbital Glow: Google Blue, Emerald Green, Golden Amber, Crimson Red */}
+        {/* Concentric Expanding Ripple Wave 1 */}
+        <motion.span
+          animate={{
+            scale: [0.85, 1.85],
+            opacity: [0.75, 0],
+          }}
+          transition={{
+            duration: 2.6,
+            repeat: Infinity,
+            ease: [0.16, 1, 0.3, 1],
+            delay: 0,
+          }}
+          className="absolute inset-0 rounded-full border border-cyan-400/80 shadow-[0_0_12px_rgba(0,240,255,0.6)] pointer-events-none"
+        />
+
+        {/* Concentric Expanding Ripple Wave 2 */}
+        <motion.span
+          animate={{
+            scale: [0.85, 1.85],
+            opacity: [0.65, 0],
+          }}
+          transition={{
+            duration: 2.6,
+            repeat: Infinity,
+            ease: [0.16, 1, 0.3, 1],
+            delay: 0.85,
+          }}
+          className="absolute inset-0 rounded-full border border-emerald-400/70 shadow-[0_0_12px_rgba(52,211,153,0.5)] pointer-events-none"
+        />
+
+        {/* Concentric Expanding Ripple Wave 3 */}
+        <motion.span
+          animate={{
+            scale: [0.85, 1.85],
+            opacity: [0.55, 0],
+          }}
+          transition={{
+            duration: 2.6,
+            repeat: Infinity,
+            ease: [0.16, 1, 0.3, 1],
+            delay: 1.7,
+          }}
+          className="absolute inset-0 rounded-full border border-sky-400/70 shadow-[0_0_14px_rgba(56,189,248,0.5)] pointer-events-none"
+        />
+
+        {/* Ambient Rotating Conic Halo */}
         <motion.div
           animate={{ rotate: 360 }}
-          transition={{ duration: 8, repeat: Infinity, ease: 'linear' }}
-          className="absolute inset-[-4px] rounded-full opacity-90 blur-[3px]"
+          transition={{ duration: 7, repeat: Infinity, ease: 'linear' }}
+          className="absolute inset-[-2px] rounded-full opacity-90 blur-[2px]"
           style={{
-            background: 'conic-gradient(from 0deg, #4285F4 0deg 90deg, #34A853 90deg 180deg, #FBBC05 180deg 270deg, #EA4335 270deg 360deg)',
+            background:
+              'conic-gradient(from 0deg, #00f0ff 0deg 90deg, #34d399 90deg 180deg, #38bdf8 180deg 270deg, #6366f1 270deg 360deg)',
           }}
         />
 
-        {/* Sharp Deep Sapphire / Obsidian Core Plate */}
-        <div className="absolute inset-[2px] bg-slate-950 rounded-[14px] flex items-center justify-center overflow-hidden border border-slate-800/80 shadow-inner">
-          {/* Subtle Precision Grid Backdrop */}
-          <div className="absolute inset-0 bg-[radial-gradient(#38bdf8_1px,transparent_1px)] [background-size:6px_6px] opacity-25" />
+        {/* Round Core Plate with Breathing Pulse */}
+        <motion.div
+          animate={{ scale: [1, 1.05, 1] }}
+          transition={{ duration: 2.6, repeat: Infinity, ease: 'easeInOut' }}
+          className="relative w-full h-full bg-slate-950 rounded-full flex items-center justify-center overflow-hidden border border-cyan-400/60 shadow-[inset_0_0_12px_rgba(0,240,255,0.35)] z-10"
+        >
+          {/* Subtle Radial Ripple Grid Inside Core */}
+          <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(0,240,255,0.22)_0%,transparent_70%)]" />
 
-          {/* SVG Vector Motion Graphic */}
+          {/* SVG Vector Round Ripple Emblem */}
           <svg
             viewBox="0 0 48 48"
             className="w-full h-full p-1.5 relative z-10"
             fill="none"
             xmlns="http://www.w3.org/2000/svg"
           >
-            {/* Google-Style 4-Quadrant Geometric Ring */}
+            {/* Outer Precision Segmented Ring */}
+            <circle
+              cx="24"
+              cy="24"
+              r="18"
+              stroke="rgba(56, 189, 248, 0.28)"
+              strokeWidth="1.5"
+              strokeDasharray="4 3"
+            />
             <path
               d="M 24 6 A 18 18 0 0 1 42 24"
-              stroke="#34A853"
-              strokeWidth="3.2"
+              stroke="#00F0FF"
+              strokeWidth="3"
               strokeLinecap="round"
-              className="drop-shadow-[0_0_6px_rgba(52,168,83,0.8)]"
+              className="drop-shadow-[0_0_6px_#00F0FF]"
             />
             <path
               d="M 42 24 A 18 18 0 0 1 24 42"
-              stroke="#FBBC05"
-              strokeWidth="3.2"
+              stroke="#34D399"
+              strokeWidth="3"
               strokeLinecap="round"
-              className="drop-shadow-[0_0_6px_rgba(251,188,5,0.8)]"
+              className="drop-shadow-[0_0_6px_#34D399]"
             />
             <path
               d="M 24 42 A 18 18 0 0 1 6 24"
-              stroke="#EA4335"
-              strokeWidth="3.2"
+              stroke="#38BDF8"
+              strokeWidth="3"
               strokeLinecap="round"
-              className="drop-shadow-[0_0_6px_rgba(234,67,53,0.8)]"
+              className="drop-shadow-[0_0_6px_#38BDF8]"
             />
             <path
               d="M 6 24 A 18 18 0 0 1 24 6"
-              stroke="#4285F4"
-              strokeWidth="3.2"
+              stroke="#818CF8"
+              strokeWidth="3"
               strokeLinecap="round"
-              className="drop-shadow-[0_0_6px_rgba(66,133,244,0.8)]"
+              className="drop-shadow-[0_0_6px_#818CF8]"
             />
 
-            {/* Inner Futuristic Algorithmic Chevron / Monogram 'T' 'M' */}
+            {/* Inner Ripple Ring */}
+            <circle
+              cx="24"
+              cy="24"
+              r="12"
+              stroke="rgba(0, 240, 255, 0.35)"
+              strokeWidth="1.2"
+            />
+
+            {/* Futuristic Algorithmic Monogram 'T' + Breakout Vector */}
             <path
-              d="M 15 17 L 33 17 M 24 17 L 24 33"
+              d="M 16 18 L 32 18 M 24 18 L 24 33"
               stroke="#FFFFFF"
               strokeWidth="2.8"
               strokeLinecap="round"
               strokeLinejoin="round"
               className="drop-shadow-[0_0_8px_rgba(255,255,255,0.9)]"
             />
-            
-            {/* High-Frequency Market Breakout Arrow (Sharp Cyan) */}
             <path
-              d="M 27 27 L 33 21 M 33 21 L 28 21 M 33 21 L 33 26"
+              d="M 26.5 27.5 L 32.5 21.5 M 32.5 21.5 L 28 21.5 M 32.5 21.5 L 32.5 26"
               stroke="#00F0FF"
               strokeWidth="2.2"
               strokeLinecap="round"
@@ -96,39 +165,39 @@ export function TradeMasterLogo({ size = 'md', showSubtitle = false }: TradeMast
               className="drop-shadow-[0_0_8px_#00F0FF]"
             />
 
-            {/* Micro Orbit Pulse Point */}
-            <circle cx="24" cy="6" r="2.2" fill="#FFFFFF" className="animate-ping" />
-            <circle cx="24" cy="6" r="1.8" fill="#4285F4" />
+            {/* Top Apex Pulse Node */}
+            <circle cx="24" cy="6" r="2.3" fill="#FFFFFF" />
+            <circle cx="24" cy="6" r="1.5" fill="#00F0FF" />
           </svg>
-        </div>
+        </motion.div>
       </div>
 
-      {/* Brand Typographic Identity: Sharp Google-Clean Grotesque Structure */}
-      <div className="flex flex-col">
-        <div className="flex items-center gap-2">
-          <div className="flex items-baseline tracking-tight">
+      {/* Brand Typographic Identity */}
+      <div className="flex flex-col min-w-0">
+        <div className="flex items-center gap-1.5">
+          <div className="flex items-baseline tracking-tight whitespace-nowrap">
             <span
               className={`font-black tracking-wider uppercase font-sans ${
-                isSm ? 'text-sm' : isLg ? 'text-2xl' : 'text-lg'
-              } text-white drop-shadow-[0_0_12px_rgba(255,255,255,0.3)]`}
+                isSm ? 'text-xs' : isLg ? 'text-xl' : 'text-sm sm:text-base'
+              } text-white drop-shadow-[0_0_10px_rgba(255,255,255,0.25)]`}
             >
               Trade
             </span>
             <span
               className={`font-black tracking-wider uppercase font-sans ml-1 ${
-                isSm ? 'text-sm' : isLg ? 'text-2xl' : 'text-lg'
-              } bg-gradient-to-r from-cyan-300 via-emerald-300 to-sky-400 bg-clip-text text-transparent drop-shadow-[0_0_14px_rgba(0,240,255,0.6)]`}
+                isSm ? 'text-xs' : isLg ? 'text-xl' : 'text-sm sm:text-base'
+              } bg-gradient-to-r from-cyan-300 via-emerald-300 to-sky-400 bg-clip-text text-transparent drop-shadow-[0_0_12px_rgba(0,240,255,0.5)]`}
             >
               Master
             </span>
           </div>
 
-          {/* Google 4-Color Micro Convergence Dots */}
-          <div className="flex items-center gap-1 ml-1 bg-slate-900/90 px-1.5 py-0.5 rounded-full border border-slate-800 shadow-sm">
-            <span className="w-1.5 h-1.5 rounded-full bg-[#4285F4] animate-pulse" title="HVN Profile" />
-            <span className="w-1.5 h-1.5 rounded-full bg-[#EA4335] animate-pulse [animation-delay:200ms]" title="Absorption" />
-            <span className="w-1.5 h-1.5 rounded-full bg-[#FBBC05] animate-pulse [animation-delay:400ms]" title="Imbalance" />
-            <span className="w-1.5 h-1.5 rounded-full bg-[#34A853] animate-pulse [animation-delay:600ms]" title="Execution" />
+          {/* 4-Color Micro Convergence Ripple Dots */}
+          <div className="hidden sm:flex items-center gap-1 bg-slate-900/90 px-1.5 py-0.5 rounded-full border border-slate-800 shadow-sm">
+            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" title="HVN Profile" />
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse [animation-delay:200ms]" title="Absorption" />
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse [animation-delay:400ms]" title="Imbalance" />
+            <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse [animation-delay:600ms]" title="Execution" />
           </div>
         </div>
 
@@ -136,11 +205,11 @@ export function TradeMasterLogo({ size = 'md', showSubtitle = false }: TradeMast
           <div className="flex items-center gap-1.5 mt-0.5">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
             <span className="text-[10px] font-mono tracking-widest text-cyan-300/90 uppercase font-semibold">
-              Binance Futures Algo Core · 10x Isolated
+              Binance Futures Algo Core · 10x–15x Isolated
             </span>
           </div>
         )}
       </div>
-    </div>
+    </motion.div>
   );
 }
