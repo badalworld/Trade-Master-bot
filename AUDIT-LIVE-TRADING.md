@@ -1,10 +1,12 @@
 # Pre-Live Audit — Trade Master (Binance Futures Bot)
 
-**Date:** 2026-10-16 (round 5 — signed-read failure) · **Branch:** `arena/937908a7-trade-master-bot`
+**Date:** 2026-10-17 (round 7 — the opportunity list) · **Branch:** `arena/cb8fc695-trade-master-bot`
 **Audit verdict:** ❌ still NOT CLEARED for live trading with real funds.
-**Remediation status:** round-1 (B1–B5, H1–H4), round-2 (R2-1 … R2-9), round-3 (R3-1 … R3-7) and
-round-4 (R4-1 … R4-3) items fixed; round-5 items (R5-1 … R5-4) fixed in code, verified by `tsc`,
-`eslint`, **116/116 unit tests**, a production build (15 routes) and a live engine probe.
+**Remediation status:** round-1 (B1–B5, H1–H4), round-2 (R2-1 … R2-9), round-3 (R3-1 … R3-7),
+round-4 (R4-1 … R4-3), round-5 (R5-1 … R5-4) and round-6 (R6-1 … R6-4) items fixed; round-7
+added the opportunity list and fixed the config-check route that was dropping every
+universe diagnostic. Verified by `tsc`, `eslint`, **179/179 unit tests**, a production build
+(15 routes) and a synthetic-market probe of the full two-stage loop.
 **Still not cleared for real money** — the strategy has no backtest and no track record, so it must
 earn that on testnet first.
 
@@ -19,6 +21,222 @@ position on the exchange with no stop-loss and no monitoring process**.
 > the *policy* answer instead, because the endpoints were never authenticated). All three are fixed
 > below; the round-1 narrative is kept for history and its claims about the current code should be
 > read through this header.
+
+---
+
+## Round 7 — the opportunity list: promote, scan separately, evict (branch `arena/cb8fc695-trade-master-bot`)
+
+**Origin:** the operator's clarification of round 6, which asked for more than a fixed shortlist:
+
+> *"We scan full futures markets and find best opportunity not only 12, when how much available for
+> opportunity it scan separate and market scanner find next opportunity assets. when market scanner
+> found any opportunity assets it moves to opportunity assets. opportunity assets scan separately and
+> trade execution. if any opportunity assets not fulfill our requirements it remove from opportunity
+> list."*
+
+Round 6 discovered the market correctly but threw the result away every cycle: the board was re-sliced
+into a shortlist of `TRADE_SCAN_TOP_N` (12) and the slice was recomputed from scratch each scan. That is
+a stateless funnel — it has no memory of what it found, so it cannot "move an asset to the opportunity
+assets", cannot scan them *separately*, and has no concept of an asset being *removed* from anything.
+The fix is a small state machine with a name the operator already uses.
+
+### What was built
+
+- `lib/opportunity-list.ts` (**new, pure**): promotion, screening, displacement, strike-based eviction,
+  removal memory and the fast-path universe. Takes `now` and a board; returns the next state. No clock,
+  no I/O, no env.
+- `lib/opportunity-store.ts` (**new, server-only**): the list as `opportunity-list.json` under
+  `TRADE_DATA_DIR`, written atomically (tmp + rename), read through an in-process cache. Missing or
+  corrupt means "no list yet" — the next market scan rebuilds it, so losing the file costs one
+  discovery cycle and never a position.
+- `lib/market-data.ts`: the scan now resolves its universe from the list when
+  `TRADE_OPPORTUNITY_ENABLED` (default **true**), and applies the deep-scan verdicts back to it at the
+  end of the cycle. `resolveOpportunityCap()` bounds the list by what one cycle can afford.
+- `lib/engine.ts` and the scan route: both load the list, scan exactly it, persist the result, and
+  report `OPPORTUNITY_ADDED` / `OPPORTUNITY_REMOVED` / `OPPORTUNITY_WARNED`.
+- Policy knobs: `TRADE_OPPORTUNITY_ENABLED`, `_MAX` (20), `_STRIKES` (2), `_COOLDOWN_MS` (5 min).
+- `.env.example`, README (two-stage description + eviction table) and `/api/config/check`
+  (`OPPORTUNITY_LIST_DISABLED`, `OPPORTUNITY_BUDGET_LIMITED`) updated.
+- The config check route also had to be fixed: it was sending only five `policy` fields, so every
+  universe/band diagnostic added in round 6 was dead code in production. It now sends the full block.
+
+### The rules, and why each one exists
+
+| Rule | Why |
+|---|---|
+| Promote most-volatile-first, screening out pairs outside `floor/3 … ceiling×3` | Stage 1 ranks on the 24h range, stage 2 measures 5m volatility: different scales, so the screen is wide. Without it the list would be "the 12 wildest names", all of which the band then refuses. |
+| Cap the list at `min(TRADE_OPPORTUNITY_MAX, MAX_SCAN_PAIRS, TRADE_MAX_OPEN_POSITIONS × 4)` | Every member is deep-scanned every cycle, so the cap *is* the weight ceiling — 20 pairs at 100 candles is ~40 weight per cycle against 2400/min. |
+| A newcomer must beat the weakest member by 5% to take its slot | Otherwise two pairs whose 24h ranges differ by a rounding error trade places every market scan, and the list churns instead of tracking the market. |
+| A pair held by an open position keeps its place but is not scanned | It stops being an *opportunity* only when it stops qualifying, not when we are already in it — and not re-scanning it saves the weight. |
+| One failed pass is a warning; `TRADE_OPPORTUNITY_STRIKES` consecutive failures evict | A pair that pauses for one candle should not be thrown off the list and re-discovered a minute later. |
+| A removed pair is barred for `TRADE_OPPORTUNITY_COOLDOWN_MS` | Without it, the next market scan immediately re-promotes a pair the deep scan just refused — the bounce that turns a list into a churn. |
+| A fallback board carries the list over untouched | The fallback board is the built-in majors with **no volatility readings**. Read as a ranking it says "every member went quiet", which would empty the entire list over one failed ticker call. Found in review, fixed, and pinned by a test. |
+| Losing exchange filters evicts immediately | An unsizeable symbol is not an opportunity, and no number of extra chances changes that. |
+
+### Verification
+
+`tsc` clean · `eslint` clean · `npm test` **179/179** (+17 planner, +3 funnel integration, +1 config
+check) · production build clean · a synthetic 31-pair market driven through the real
+`scanUniverse`:
+
+```
+Cap: 20 pairs (asked for 20, budget = maxOpenPositions x 4)
+Cycle 1 — list before: none
+  market board: 30 liquid of 31 perps ranked
+  list now: 20 pairs — OPP25USDT, OPP24USDT, … (ranks 6-25: the 5 wildest are outside the screen)
+  illiquid THINUSDT on the list? false
+  refused (measured): {"choppy":3}
+Cycle 2 — one market scan later, the top pair collapses to a 0.1% range
+  removed: OPP25USDT (vol-below-floor), OPP21USDT (choppy), OPP14USDT (choppy), OPP07USDT (choppy)
+  promoted to the freed slot: OPP05USDT
+Cycles 3-4 — removed none; promoted OPP04USDT#26, OPP03USDT#27, OPP02USDT#28; size 20
+Persisted file: /tmp/tm-listdata/opportunity-list.json
+  reloaded from disk: 20 pairs · memory of removals kept: 4
+```
+
+That is the operator's sentence, executed: the market scan finds opportunities across the whole market,
+moves them to the opportunity assets, those are scanned separately every cycle for execution, and an
+asset that stops fulfilling the requirements is removed — with the reason recorded and the slot refilled
+from the next opportunity in the ranking.
+
+### Still not proven
+
+The two-stage split is a design choice, not a measurement: nothing here demonstrates that a 20-pair
+opportunity list outperforms re-ranking every cycle, and the band/strike/cooldown values are reasoned
+defaults. Only a testnet run can argue about the numbers.
+
+---
+
+## Round 6 — volatility ranking, market discovery and the chop filter (branch `arena/cb8fc695-trade-master-bot`)
+
+**Origin:** the operator's report, after the signed-read fix let the app run for real:
+
+> *"our trading assets only high volatility assets sorting. We trade on maximum to minimum volatile
+> assets. Scanner scan most volatile to low volatile. We avoid only Choppy market. I think this is not
+> full established."*
+
+They were right, and the honest reading of the code was worse than the complaint. Volatility was
+**measured only to be displayed**, the universe was a hand-written list, and the engine picked the
+most volatile pair that had *any* signal. Two of those are the reported bug; investigating them
+surfaced a third that stopped automated entries entirely.
+
+Agreed design (operator's answers): market-wide discovery then a focused execution scan
+[*"find full futures market best opportunity and separate them and opportunity assets scan faster for
+trade execution … market scanner find opportunity with volatility sort system"*], a tradeable band
+**above a chop floor and below a blow-off ceiling** [floor_ceiling], **best score wins** with
+volatility as tie-break [best_score], and the top band **skipped rather than sized down** [skip_only].
+
+### R6-1 · CRITICAL — no automated entry could ever happen: the exchange-filter lookup read the envelope
+
+`resolveTradeable()` in `lib/market-data.ts` did:
+
+```ts
+const map = buildSpecMap(await publicGet<unknown>(isTestnet, '/fapi/v1/exchangeInfo', '', 6000));
+```
+
+`publicGet` resolves to `{ data, usedWeight }`. `buildSpecMap` looks for `.symbols`, found none, and
+returned `{}` — so **every symbol was marked `tradeable: false`**. The engine required
+`scan.tradeable[symbol] === true` and the browser loop required `!== false`; both therefore refused
+every candidate, forever, while reporting a healthy scan. TypeScript could not catch it because
+`buildSpecMap(exchangeInfo: unknown)` accepts anything.
+
+**Evidence:** a stubbed exchange driven through the real `scanUniverse` printed
+`tradeable map: [['SYM30USDT', false], …]` for symbols whose `exchangeInfo` filters were present and
+valid, and `selectBestCandidate` returned `null` regardless of scores. After the fix the same probe
+prints `true` and selects a candidate.
+
+**Fix:** inspect the payload (`const { data } = await publicGet(...)`), plus a regression test asserting
+`scan.tradeable.GOODUSDT === true` and `selectBestCandidate(...) !== null` through the real funnel — the
+assertion that was missing and would have caught this.
+
+### R6-2 · HIGH — the engine traded the most volatile pair with any signal, not the best setup
+
+`scan.signals` was sorted by volatility and the engine took the first entry passing the threshold:
+
+```ts
+const candidate = scan.signals.find((sig) => isActionableSignal(sig) && scan.tradeable[sig.symbol] === true);
+```
+
+So a 66 % setup on a 4.5 %-volatility pair beat a 92 % setup on a 1.2 % one — exactly the backwards
+selection the operator described ("only high volatility assets"). Volatility is a *precondition* here,
+not a quality score.
+
+**Fix:** `selectBestCandidate()` (pure, exported) ranks by **score first, volatility as tie-break** and
+refuses anything the regime gate or the exchange filters did not clear. The same function now serves
+both the engine and the browser loop, replacing a third copy of the threshold logic that had drifted
+in `app/page.tsx`.
+
+### R6-3 · HIGH — the reported "avoid choppy market" did not exist anywhere in the codebase
+
+No ADX, no efficiency ratio, no trend/chop classification existed. `evaluateEntryGate()` checked
+auto-entry/halt/`canTrade`/daily-loss/position-cap and nothing about the market itself, and the only
+use of volatility was `isHighVol >= 1.5` colouring a badge. Consequences: a dead 0.3 %-volatility pair
+generated "signals" that stopped out on spread, and a chop market produced a steady supply of
+`STRONG_BUY`/`STRONG_SELL` readings at 10–15× leverage — two of the three indicator families (POC
+relation, stacked imbalance) read as bullish in a market that is only oscillating.
+
+**Fix:** `lib/market-regime.ts` (pure, no I/O) measures Wilder ADX(14), Kaufman efficiency ratio,
+realised volatility and range expansion — **on settled candles only** — and gates entries on:
+
+- **chop** — ADX below the floor **and** efficiency ratio below the floor (both must agree, so an
+  orderly slow trend with a low ADX is still traded);
+- **band** — below the floor (dead market) or above the ceiling (violent market) is refused and
+  reported.
+
+One subtlety worth recording: the first version of `computeADX` reported **100** for a perfectly flat
+oscillation. Wilder's `|+DI − −DI| / (+DI + −DI)` keeps its meaning while both DIs are large, but as
+both decay toward zero it amplifies rounding — the calmest possible market scored as the strongest
+trend, which would have steered the bot straight into it. A directional noise floor (directional
+movement under 10 % of the true range scores no direction) fixes it, and a regression test pins it.
+
+### R6-4 · MEDIUM — "scan the top 12 by volatility" plus a volatility ceiling meant no trades, ever
+
+Found by running the funnel against a synthetic 41-pair market: the shortlist was the 12 most volatile
+pairs, **all 12 were above the 4 % ceiling**, all were refused, and the scanner reported "no setup"
+while hundreds of tradeable pairs sat further down the ranking. Ranking by a metric and then refusing
+the top of that ranking by the same metric is self-defeating.
+
+**Fix:** `selectShortlist()` walks the ranking most-volatile-first but prefers pairs a deliberately
+wide stage-1 proxy says could be inside the band (proxy band = floor ÷ 3 … ceiling × 3, because the 24h
+range and the 5m composite are different scales), and fills any leftover budget with the rest so the
+wild end of the market stays *visible* — just not deep-scanned first. The trade/no-trade verdict
+remains the measured one; the proxy only decides who deserves an expensive kline request. Live probe
+after the fix: 12 deep-scanned, 10 inside the band, 2 refused as too violent, 1 selected.
+
+### Also in this round
+
+- **Universe**: `lib/market-scanner.ts` ranks the whole USDT-M market from one `/ticker/24hr` call
+  (perpetual + `TRADING` + USDT + no stablecoin pairs + no quarterly contracts, $50M liquidity floor,
+  60 s cache, stale-board reuse, built-in-majors fallback). Because it is one call, whole-market
+  discovery costs less weight than the 12-pair kline fan-out it feeds.
+- **`TRADE_SYMBOL_ALLOWLIST` semantics changed** from "the 12 defaults unless overridden" to "empty =
+  discovered; non-empty = strict restriction". `TRADE_DISCOVERY_ENABLED=false` restores the old
+  universe *and* the old execution-layer restriction, so the narrow behaviour is still one flag away.
+  The widening is now stated in `/api/config/check` (`UNIVERSE_MARKET_WIDE` / `UNIVERSE_FIXED_LIST` /
+  `VOLATILITY_BAND_EMPTY`) instead of being implicit.
+- **Visibility**: the scanner shows the funnel's work — liquid-count → deep-scanned, the hottest five
+  pairs, the band and chop thresholds in force, a `TRADEABLE`/`CHOPPY`/`TOO QUIET`/`TOO VIOLENT` verdict
+  per row with the measured reason, a 0–100 volatility rank, ADX/ER per row, and the refusal counts.
+  The engine's `lastScan` carries the same, and its log line reads
+  `12 pairs deep-scanned from a board of 340 liquid pairs · refused: 3 choppy, 1 vol-above-ceiling · closest: …`.
+
+### Fixed / verified in this round
+
+`tsc` clean · `eslint` clean · `npm test` **158/158** (was 116; +16 regime, +9 discovery, +13 funnel,
++2 config-check, +2 rewritten symbol-gate) · `NODE_ENV=production next build` clean (15 routes) · live
+probes: (a) the app's own `/api/binance/scan` on a server with no egress returned `board.source:
+"fallback"` with its error, the in-force band/chop thresholds and a 12-pair universe instead of an empty
+scan; (b) a synthetic 41-symbol market through the real `scanUniverse` produced 40 ranked / illiquid
+pair excluded / 12 deep-scanned / refusals by reason / `SYM30USDT` selected at score 75 rather than the
+most volatile `SYM40USDT` (refused at 4.75 %).
+
+### Still not proven
+
+No order has ever been placed against a live exchange from this environment, so the *behaviour* of
+these gates on real fills is unverified. The band (0.6 %–4 %) and the chop thresholds (ADX 20 / ER 0.3)
+are reasoned defaults with no backtest behind them, and the claim that skipping the upper volatility
+band improves a 5m strategy is an assumption, not a measurement. Testnet results are the only way to
+revisit them.
 
 ---
 

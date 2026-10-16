@@ -45,6 +45,27 @@ export interface ConfigCheckInput {
     maxMarginUsdt: number;
     maxDailyLossUsdt: number;
     maxOpenPositions: number;
+    /** Universe settings, so an operator can see which pairs the bot is allowed to reach. */
+    discovery?: {
+      enabled: boolean;
+      topN: number;
+      minQuoteVolumeUsdt: number;
+    };
+    scan?: {
+      topN: number;
+      minVolatilityPercent: number;
+      maxVolatilityPercent: number;
+      chopAdxFloor: number;
+      chopEfficiencyFloor: number;
+    };
+    /** The opportunity list: the pool the fast execution scan works from. */
+    opportunity?: {
+      enabled: boolean;
+      max: number;
+      strikes: number;
+      cooldownMs: number;
+    };
+    symbolAllowlist?: string[];
   };
 }
 
@@ -234,6 +255,65 @@ export function buildConfigCheck(input: ConfigCheckInput): ConfigCheckResult {
         `The trade ledger is not writable at ${ledger.path}`,
         'Without a writable ledger the engine cannot persist positions, compounding or the daily-loss figure across restarts.',
         'Point TRADE_DATA_DIR at a mounted, writable volume (on a container the default location dies with the instance).'
+      )
+    );
+  }
+
+  const discovery = policy.discovery;
+  const scan = policy.scan;
+  if (discovery && !discovery.enabled && (policy.symbolAllowlist ?? []).length === 0) {
+    issues.push(
+      issue(
+        'UNIVERSE_FIXED_LIST',
+        'warning',
+        'Market discovery is OFF: only the built-in major list is scanned',
+        'TRADE_DISCOVERY_ENABLED=false pins the universe to the 12 built-in majors, so any more volatile pair listed on Binance is invisible to the scanner.',
+        'Set TRADE_DISCOVERY_ENABLED=true to rank the whole USDT-M market each scan (or set TRADE_SYMBOL_ALLOWLIST to name the pairs you do want).'
+      )
+    );
+  }
+  if (discovery?.enabled && (policy.symbolAllowlist ?? []).length === 0 && scan) {
+    issues.push(
+      issue(
+        'UNIVERSE_MARKET_WIDE',
+        'warning',
+        'The whole market is tradeable: entries are bounded by the scan funnel, not by a symbol list',
+        `Ranking every USDT-M perpetual with at least $${(discovery.minQuoteVolumeUsdt / 1_000_000).toFixed(0)}M of 24h turnover, deep-scanning the most volatile ${scan.topN}, and refusing chop (ADX<${scan.chopAdxFloor} and ER<${scan.chopEfficiencyFloor}) and out-of-band volatility (${scan.minVolatilityPercent}%-${scan.maxVolatilityPercent}%). Pairs outside that funnel cannot be entered by the bot.`,
+        'Set TRADE_SYMBOL_ALLOWLIST to restrict the bot to named pairs, or TRADE_DISCOVERY_ENABLED=false to go back to the built-in major list.'
+      )
+    );
+  }
+  const opportunity = policy.opportunity;
+  if (discovery?.enabled && opportunity && !opportunity.enabled) {
+    issues.push(
+      issue(
+        'OPPORTUNITY_LIST_DISABLED',
+        'warning',
+        'The opportunity list is OFF: every cycle re-derives a fresh shortlist',
+        'TRADE_OPPORTUNITY_ENABLED=false makes each scan rebuild a candidate slice from the market ranking instead of keeping the opportunity assets it found, so a pair that qualifies and then pauses is re-discovered from scratch rather than staying under watch.',
+        'Set TRADE_OPPORTUNITY_ENABLED=true to keep the promoted opportunity assets in a list that is scanned every cycle and pruned when a pair stops qualifying.'
+      )
+    );
+  }
+  if (opportunity?.enabled && opportunity.max > policy.maxOpenPositions * 4) {
+    issues.push(
+      issue(
+        'OPPORTUNITY_BUDGET_LIMITED',
+        'warning',
+        'The opportunity list is capped by the per-cycle weight budget',
+        `TRADE_OPPORTUNITY_MAX=${opportunity.max} asks for more opportunities than one cycle affords: the budget is TRADE_MAX_OPEN_POSITIONS x 4 = ${policy.maxOpenPositions * 4} pairs per cycle. The list is clamped to that, so the extra slots are never filled.`,
+        `Raise TRADE_MAX_OPEN_POSITIONS if you want a deeper opportunity list, or leave it and treat ${policy.maxOpenPositions * 4} as the honest ceiling.`
+      )
+    );
+  }
+  if (scan && scan.minVolatilityPercent >= scan.maxVolatilityPercent) {
+    issues.push(
+      issue(
+        'VOLATILITY_BAND_EMPTY',
+        'blocker',
+        'The volatility band cannot be satisfied: the floor is not below the ceiling',
+        `TRADE_MIN_VOLATILITY_PCT=${scan.minVolatilityPercent} and TRADE_MAX_VOLATILITY_PCT=${scan.maxVolatilityPercent} refuse every pair, so no entry can ever be taken.`,
+        'Set a floor strictly below the ceiling, e.g. TRADE_MIN_VOLATILITY_PCT=0.6 and TRADE_MAX_VOLATILITY_PCT=4.'
       )
     );
   }
