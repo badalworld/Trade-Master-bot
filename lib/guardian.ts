@@ -140,6 +140,15 @@ export interface EntryGateInput {
   dailyLossLocked: boolean;
   openOwned: number;
   maxOpenPositions: number;
+  /**
+   * Whether the trade ledger can be written. Without it, a restart forgets which positions are ours,
+   * how much was lost today, and where the compounding ladder had got to — the daily-loss breaker
+   * comes back at zero and the engine would happily keep trading a losing day. Automated entries
+   * therefore fail closed, and `allowNonDurableLedger` is the operator's explicit override for
+   * deployments that accept an ephemeral ledger (for example a Cloud Run instance with no volume).
+   */
+  ledgerDurable?: boolean;
+  allowNonDurableLedger?: boolean;
 }
 
 /** Single place that decides whether the engine may open something new. */
@@ -149,6 +158,14 @@ export function evaluateEntryGate(input: EntryGateInput): { allowed: boolean; re
   if (input.haltedByPolicy) return { allowed: false, reason: 'TRADE_HALT is set on the server' };
   if (!input.canTrade) return { allowed: false, reason: 'Binance reports canTrade=false' };
   if (input.dailyLossLocked) return { allowed: false, reason: 'daily loss breaker tripped' };
+  if (input.ledgerDurable === false && !input.allowNonDurableLedger) {
+    return {
+      allowed: false,
+      reason:
+        'the trade ledger is not writable, so positions, the daily-loss figure and compounding would be forgotten on restart ' +
+        '(point TRADE_DATA_DIR at a writable volume, or set TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER=true to accept that)',
+    };
+  }
   if (input.openOwned >= input.maxOpenPositions) {
     return { allowed: false, reason: `position cap reached (${input.openOwned}/${input.maxOpenPositions})` };
   }

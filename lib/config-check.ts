@@ -38,7 +38,14 @@ export interface ConfigCheckInput {
   verification: { attempted: boolean; ok: boolean; failure: BinanceFailure | null };
   reachability: { testnet: ReachabilityProbe; mainnet: ReachabilityProbe };
   engine: { enabled: boolean; autoEntry: boolean; running: boolean };
-  ledger: { durable: boolean; path: string };
+  ledger: {
+    durable: boolean;
+    path: string;
+    /** The last write error, when there was one — the difference between "not writable" and why. */
+    error?: string | null;
+    /** Failed writes since start (the log prints the first of each kind only). */
+    failures?: number;
+  };
   policy: {
     halted: boolean;
     allowMainnet: boolean;
@@ -248,13 +255,21 @@ export function buildConfigCheck(input: ConfigCheckInput): ConfigCheckResult {
   }
 
   if (!ledger.durable) {
+    // This is a money-path problem, not a cosmetic one: a restart with no ledger forgets which
+    // positions are ours, resets the daily-loss breaker to zero, and restarts the compounding ladder.
+    // The engine therefore refuses automated entries until it is fixed (or explicitly overridden).
+    const entriesBlocked = engine.enabled && engine.autoEntry;
     issues.push(
       issue(
         'LEDGER_EPHEMERAL',
         'warning',
         `The trade ledger is not writable at ${ledger.path}`,
-        'Without a writable ledger the engine cannot persist positions, compounding or the daily-loss figure across restarts.',
-        'Point TRADE_DATA_DIR at a mounted, writable volume (on a container the default location dies with the instance).'
+        `Every write is failing${ledger.error ? ` (${ledger.error})` : ''}${ledger.failures ? ` — ${ledger.failures} so far` : ''}. ` +
+          'Positions, compounding and the daily-loss figure live in memory only and are lost when the process restarts. ' +
+          (entriesBlocked
+            ? 'Automated entries are REFUSED until this is fixed, because a restart would reset the daily-loss breaker and the record of which positions are the engine\'s.'
+            : 'Automated entries would be refused while this is true.'),
+        'Mount a writable volume and point TRADE_DATA_DIR at it. On a container the default path under the app directory is usually read-only; /tmp is writable but dies with the instance, which is only acceptable with TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER=true.'
       )
     );
   }

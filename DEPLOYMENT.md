@@ -141,10 +141,18 @@ be ignored when they are not met):
 
 - **Always-on instance.** `--min-instances=1` — scale-to-zero means the loop sleeps between requests,
   which defeats the entire point. Sessions/idempotency are per-process too, hence `max-instances=1`.
-- **Persistent `TRADE_DATA_DIR`.** The ledger is a JSON file written atomically (tmp + rename). On a
-  container without a volume, `ledgerDurable` reports `in-process only` and a restart forgets which
-  positions the engine owns (it will then treat them as foreign — protected by the exchange brackets,
-  but not managed). NFS Filestore / a PVC / a mounted disk is required for real unattended use.
+- **Persistent, writable `TRADE_DATA_DIR`.** The ledger (and the opportunity list) are JSON files
+  written atomically (tmp + rename) into that directory. On a container without a volume,
+  `ledgerDurable` reports `in-process only` and a restart forgets which positions the engine owns (it
+  will then treat them as foreign — protected by the exchange brackets, but not managed), how much was
+  lost today, and where the compounding ladder had got to. NFS Filestore / a PVC / a mounted disk is
+  required for real unattended use.
+- **This is enforced, not just documented.** With an unwritable ledger the engine logs one
+  `LEDGER_NOT_DURABLE` event, counts the failed writes instead of printing one line per cycle, reports
+  `LEDGER_EPHEMERAL` in `/api/config/check`, and **refuses automated entries** — a restart that resets
+  the daily-loss breaker to zero is a losing day the bot would happily keep trading. Set
+  `TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER=true` only if you have accepted an in-memory ledger
+  deliberately (it keeps the guardian working; it does not make the ledger durable).
 - **Server-side credentials only.** The loop reads `BINANCE_API_KEY`/`BINANCE_API_SECRET` from the
   environment; a browser session cannot outlive the tab, so by design it will not start without them.
 - **Start guardian-only, then decide.** `TRADE_ENGINE_AUTO_ENTRY=false` means the loop can only *reduce*
@@ -242,6 +250,8 @@ curl -s -b /tmp/tm.jar -H 'X-TM-Request: 1' https://<service>/api/engine/status 
   | jq '{engine: .engine | {running, enabled: .config.enabled, cycles, credentialSource, network, ledgerDurable, ownedPositions, lastError}, ledger: .ledger.network}'
 # With TRADE_ENGINE_ENABLED=true and env credentials you must see running:true, credentialSource:"env",
 # cycles increasing every interval, and ledgerDurable:true. With the flag off, running:false is correct.
+# If ledgerDurable:false, the ledger cannot be written: see LEDGER_EPHEMERAL in /api/config/check and
+# the LEDGER_NOT_DURABLE event in the engine log. Automated entries are refused until it is fixed.
 
 # 6. Egress IP for the Binance key whitelist (never whitelist anything it did not verify):
 curl -s https://<service>/api/network/ip | jq '{ipv4, verified, warnings}'

@@ -139,6 +139,32 @@ test('auto-entry is OFF by default, so the engine is a guardian rather than an a
   assert.match(gate.reason, /guardian-only mode/);
 });
 
+test('a ledger that cannot be persisted blocks automated entries unless explicitly overridden', () => {
+  // The deployment this was written for: Cloud Run with a read-only /app, so every write failed and
+  // the daily-loss memory, the compounding ladder and the record of which positions are ours would
+  // all reset on the next restart. Opening a leveraged position under those conditions is not
+  // something the bot should decide to do on its own.
+  const blocked = evaluateEntryGate({ ...open, ledgerDurable: false });
+  assert.equal(blocked.allowed, false);
+  assert.match(blocked.reason, /ledger is not writable/);
+  assert.match(blocked.reason, /TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER=true/, 'the override is named');
+
+  // The operator can still choose an ephemeral ledger explicitly.
+  const overridden = evaluateEntryGate({ ...open, ledgerDurable: false, allowNonDurableLedger: true });
+  assert.equal(overridden.allowed, true);
+
+  // And a durable ledger is not affected by the flag either way.
+  assert.equal(evaluateEntryGate({ ...open, ledgerDurable: true }).allowed, true);
+  assert.equal(evaluateEntryGate({ ...open, ledgerDurable: true, allowNonDurableLedger: true }).allowed, true);
+});
+
+test('guardian-only mode and the ledger gate are independent', () => {
+  // With auto-entry off there is nothing to refuse; the durability gate only matters for entries.
+  const guardian = evaluateEntryGate({ ...open, autoEntry: false, ledgerDurable: false });
+  assert.equal(guardian.allowed, false);
+  assert.match(guardian.reason, /guardian-only mode/);
+});
+
 test('every halt condition blocks entries independently', () => {
   for (const [key, expected] of [
     ['haltedByOperator', /operator/],

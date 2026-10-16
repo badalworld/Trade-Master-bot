@@ -170,7 +170,18 @@ test('operational warnings each surface independently', () => {
   assert.ok(codes(engineStalled).includes('ENGINE_NOT_RUNNING'));
   assert.ok(!codes(engineStalled).includes('ENGINE_DISABLED'));
 
-  const ephemeral = buildConfigCheck(base({ ledger: { durable: false, path: '/tmp/ledger.json' } }));
+  const ephemeral = buildConfigCheck(
+    base({
+      ledger: { durable: false, path: '/app/.data/trade-ledger.json', error: 'EACCES: permission denied', failures: 42 },
+      engine: { enabled: true, autoEntry: true, running: true },
+    })
+  );
+  const report = ephemeral.issues.find((i) => i.code === 'LEDGER_EPHEMERAL');
+  assert.ok(report, 'an unwritable ledger must always be reported');
+  assert.match(report.detail, /EACCES/, 'with the actual OS error');
+  assert.match(report.detail, /42 so far/, 'and how often it has failed');
+  assert.match(report.detail, /REFUSED/, 'and that entries are blocked while it is true');
+  assert.match(report.action, /TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER=true/, 'including the explicit override');
   assert.ok(codes(ephemeral).includes('LEDGER_EPHEMERAL'));
 
   const halted = buildConfigCheck(base({ policy: { halted: true, allowMainnet: false, maxMarginUsdt: 25, maxDailyLossUsdt: 50, maxOpenPositions: 5 } }));

@@ -47,6 +47,8 @@ export interface EngineStatusPayload {
       leverage: number;
       baseMargin: number;
       compoundingPercent: number;
+      /** The operator's explicit acceptance of an in-memory ledger (entries are otherwise refused). */
+      allowNonDurableLedger?: boolean;
     };
     credentialSource: 'env' | 'none';
     network: 'testnet' | 'mainnet';
@@ -102,6 +104,10 @@ export interface EngineStatusPayload {
     } | null;
     events: Array<{ at: number; level: 'INFO' | 'WARN' | 'ERROR' | 'SUCCESS'; kind: string; message: string }>;
     ledgerDurable: boolean;
+    /** Where the ledger is written, and why the write failed when it did. */
+    ledgerPath?: string;
+    ledgerError?: string | null;
+    ledgerFailures?: number;
   };
   policy: {
     maxLeverage: number;
@@ -275,7 +281,7 @@ export function EngineStatusPanel({ state, loading, error, onAction, onToggleAut
                 { label: 'Credentials', value: e.credentialSource === 'env' ? 'server env' : 'none (env required)', tone: e.credentialSource === 'env' ? 'text-emerald-300' : 'text-rose-300' },
                 { label: 'Cycles', value: `${e.cycles} · last ${fmtAgo(e.lastCycleAt, nowMs)}`, tone: 'text-slate-200' },
                 { label: 'Interval', value: `${Math.round(e.config.intervalMs / 1000)}s`, tone: 'text-slate-200' },
-                { label: 'Ledger persistence', value: e.ledgerDurable ? 'durable (TRADE_DATA_DIR)' : 'in-process only', tone: e.ledgerDurable ? 'text-emerald-300' : 'text-amber-300' },
+                { label: 'Ledger persistence', value: e.ledgerDurable ? 'durable (TRADE_DATA_DIR)' : 'in-process only', tone: e.ledgerDurable ? 'text-emerald-300' : 'text-rose-300' },
                 { label: 'Owned positions', value: `${owned.length} / ${state?.policy.maxOpenPositions ?? '?'}`, tone: 'text-slate-200' },
                 { label: 'Realized today', value: `$${e.realizedPnlTodayUsdt.toFixed(2)}`, tone: e.realizedPnlTodayUsdt < 0 ? 'text-rose-300' : 'text-emerald-300' },
                 {
@@ -339,6 +345,26 @@ export function EngineStatusPanel({ state, loading, error, onAction, onToggleAut
                     ` · refused: ${Object.entries(e.lastScan.skipped)
                       .map(([reason, count]) => `${count} ${reason}`)
                       .join(', ')}`}
+                </div>
+              </div>
+            )}
+
+            {!e.ledgerDurable && (
+              <div className="flex items-start gap-2 p-3 rounded-md border border-rose-800 bg-rose-950/40 text-[11px] text-rose-100">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <div className="font-semibold">
+                    The trade ledger cannot be written{e.ledgerPath ? ` to ${e.ledgerPath}` : ''}
+                    {e.ledgerFailures ? ` — ${e.ledgerFailures} failed write${e.ledgerFailures === 1 ? '' : 's'}` : ''}.
+                  </div>
+                  <div className="text-rose-200/90">
+                    {e.ledgerError ? `${e.ledgerError}. ` : ''}
+                    Positions, compounding and today&apos;s realized loss live in memory only and are lost when
+                    this process restarts — so automated entries are refused
+                    {e.config.allowNonDurableLedger ? ' only by the explicit override, which is set' : ''}.
+                    Mount a writable volume and point <span className="font-mono">TRADE_DATA_DIR</span> at it
+                    (on Cloud Run the default path under the app directory is read-only; /tmp is writable but dies with the instance).
+                  </div>
                 </div>
               </div>
             )}

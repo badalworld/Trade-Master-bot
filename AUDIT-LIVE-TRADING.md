@@ -1,12 +1,12 @@
 # Pre-Live Audit — Trade Master (Binance Futures Bot)
 
-**Date:** 2026-10-17 (round 7 — the opportunity list) · **Branch:** `arena/cb8fc695-trade-master-bot`
+**Date:** 2026-10-17 (round 8 — the unwritable ledger) · **Branch:** `arena/d1a0d505-trade-master-bot`
 **Audit verdict:** ❌ still NOT CLEARED for live trading with real funds.
 **Remediation status:** round-1 (B1–B5, H1–H4), round-2 (R2-1 … R2-9), round-3 (R3-1 … R3-7),
-round-4 (R4-1 … R4-3), round-5 (R5-1 … R5-4) and round-6 (R6-1 … R6-4) items fixed; round-7
-added the opportunity list and fixed the config-check route that was dropping every
-universe diagnostic. Verified by `tsc`, `eslint`, **179/179 unit tests**, a production build
-(15 routes) and a synthetic-market probe of the full two-stage loop.
+round-4 (R4-1 … R4-3), round-5 (R5-1 … R5-4), round-6 (R6-1 … R6-4) and round-7 items fixed;
+round-8 made ledger durability a fail-closed entry condition (R8-1 … R8-3). Verified by `tsc`,
+`eslint`, **185/185 unit tests**, a production build (15 routes), a synthetic-market probe of
+the two-stage loop and a live reproduction of the unwritable-ledger deployment.
 **Still not cleared for real money** — the strategy has no backtest and no track record, so it must
 earn that on testnet first.
 
@@ -21,6 +21,83 @@ position on the exchange with no stop-loss and no monitoring process**.
 > the *policy* answer instead, because the endpoints were never authenticated). All three are fixed
 > below; the round-1 narrative is kept for history and its claims about the current code should be
 > read through this header.
+
+---
+
+## Round 8 — the ledger that could not be written (branch `arena/d1a0d505-trade-master-bot`)
+
+**Origin:** production logs from a Cloud Run deployment with `TRADE_ENGINE_AUTO_ENTRY=true`:
+
+```
+[ledger] persist failed: EACCES: permission denied, mkdir '/app/.data'     ← every ~15 s, forever
+[engine:info] NO_SETUP: 12 pairs scanned, none met the entry threshold.
+[engine:warn] STOPPED: Engine received SIGTERM; ledger flushed to disk.    ← nothing had been written
+```
+
+Three separate problems in three lines.
+
+### R8-1 · HIGH — the engine was trading with a ledger that never touched the disk
+
+`/app` is read-only on that deployment and `TRADE_DATA_DIR` was unset, so every write failed. The
+in-memory ledger keeps the process working — that part is by design — but what it *means* was never
+enforced: the daily-loss breaker (`realizedPnlTodayUsdt`, `pnlDay`), the compounding ladder and the
+record of which positions are the engine's all reset on the next restart. A crash or a redeploy on a
+losing day therefore restarts the bot with a clean loss counter and an empty position book, and it
+happily keeps trading. That is a money-path hazard, not a cosmetic warning.
+
+**Fix:** durability is now part of the entry gate, fail-closed. `evaluateEntryGate()` refuses
+automated entries while `ledgerDurable` is false unless the operator has explicitly accepted an
+ephemeral ledger with `TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER=true`. The guardian — reconciliation,
+stop re-arm, breach backstop, settlement — is never blocked: protecting an open position does not need
+the ledger, and blocking it would be the opposite of safe.
+
+### R8-2 · MEDIUM — one identical error line per save, forever
+
+`writeState()` printed an `EACCES` line on every failed save: 4/minute at the default 15 s interval,
+which is how the interesting lines get buried (the same failure mode round 5 fixed for cycle errors).
+The failure is now recorded once, in `ledger.persistence()` — `{ path, durable, error, failures,
+lastFailureAt }` — printed once per distinct error with the remedy attached, and counted thereafter.
+The engine also emits a single `LEDGER_NOT_DURABLE` event explaining what an unwritable ledger costs,
+and `/api/config/check` reports `LEDGER_EPHEMERAL` with the OS error, the failure count and the fix.
+
+### R8-3 · LOW — the stop message claimed a flush that never happened
+
+`Engine received SIGTERM; ledger flushed to disk.` was printed unconditionally. On a deployment where
+nothing had been persisted all day, that is the last line an operator reads before assuming their
+position book is safe. It now says what actually happened, and what it costs.
+
+### Also in this round
+
+- `EngineStatus.status` carries `ledgerPath`, `ledgerError` and `ledgerFailures`, refreshed every cycle
+  so a volume that appears (or a write that starts failing) shows up without a restart; the engine panel
+  renders a red banner naming the path and the remedy.
+- The opportunity list writes to the same directory and had the same exposure: it already reported
+  `OPPORTUNITY_NOT_DURABLE` once, and keeps doing so.
+- `.env.example`, README (safety model + troubleshooting), `DEPLOYMENT.md` (the persistent-volume
+  bullet now states that this is enforced, not just recommended).
+
+### Observation on the deployed revision (not a code change)
+
+The second log line — `12 pairs scanned, none met the entry threshold` — does not exist in any revision
+of this repository's `main`: the wording was removed by `488ed42` (round 6), where the count and the
+wording both changed. The deployment was therefore running a build from before the discovery work,
+which is also why it says "12 pairs": that image still scans the hard-coded 12-major list, the very
+thing the operator asked to move away from. Redeploying `main` is what puts the market ranking, the
+opportunity list and the chop/band gate in front of them.
+
+### Fixed / verified in this round
+
+`tsc` clean · `eslint` clean · `npm test` **185/185** (+2 ledger persistence, +2 entry gate, +1 config
+check, +2 engine) · production build clean · a reproduction probe against the real engine with
+`TRADE_DATA_DIR=/dev/null/app/.data` (the same class of unwritable path) produced: exactly one ledger
+error line, one `LEDGER_NOT_DURABLE` event, a counted failure total, `entry gate: allowed=false` with
+the remedy in the reason, and a stop message reading *"the in-memory ledger was NOT persisted"*.
+
+### Still not proven
+
+Whether an operator notices in time is a deployment property, not a code property: with the volume
+missing the bot now *refuses to enter*, which is safe but silent from the outside — the alerting
+limitation from earlier rounds still applies.
 
 ---
 

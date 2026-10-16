@@ -55,6 +55,12 @@ export interface EngineConfig {
   enabled: boolean;
   autoEntry: boolean;
   enforceBrackets: boolean;
+  /**
+   * Open positions even though the ledger cannot be persisted. Off by default: it is the difference
+   * between "a restart loses the daily-loss memory and the record of which positions are ours" and
+   * "the bot does not trade until the data directory is fixed".
+   */
+  allowNonDurableLedger: boolean;
   intervalMs: number;
   /** Cycles a stop can stay missing before the position is flattened to protect capital. */
   unprotectedTolerance: number;
@@ -115,6 +121,11 @@ export interface EngineStatus {
   } | null;
   events: EngineEvent[];
   ledgerDurable: boolean;
+  /** Where the ledger is written, and the last persistence error if there was one. */
+  ledgerPath: string;
+  ledgerError: string | null;
+  /** Writes that failed since start — a counter, because the log only prints the first of each kind. */
+  ledgerFailures: number;
 }
 
 /**
@@ -202,6 +213,8 @@ export function loadEngineConfig(env: Record<string, string | undefined> = proce
     enabled: bool(env.TRADE_ENGINE_ENABLED, false),
     autoEntry: bool(env.TRADE_ENGINE_AUTO_ENTRY, false),
     enforceBrackets: bool(env.TRADE_ENGINE_ENFORCE_BRACKETS, true),
+    // Default false: fail closed on the money path. Set true only if you accept an in-memory ledger.
+    allowNonDurableLedger: bool(env.TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER, false),
     intervalMs: Math.max(MIN_INTERVAL_MS, parseInt(env.TRADE_ENGINE_INTERVAL_MS ?? '15000', 10) || 15000),
     unprotectedTolerance: Math.max(0, parseInt(env.TRADE_ENGINE_UNPROTECTED_TOLERANCE ?? '2', 10) || 2),
     leverage: Math.min(15, Math.max(1, parseInt(env.TRADE_ENGINE_LEVERAGE ?? '10', 10) || 10)),
@@ -271,6 +284,7 @@ class TradeEngine {
   private failureStreak: EngineFailureStreak | null = null;
   /** Reported once instead of every cycle, so a non-durable volume cannot drown the log. */
   private opportunityDurabilityWarned = false;
+  private ledgerDurabilityWarned = false;
   private status: EngineStatus;
   private events: EngineEvent[] = [];
 
@@ -298,7 +312,44 @@ class TradeEngine {
       lastScan: null,
       events: [],
       ledgerDurable: false,
+      ledgerPath: '',
+      ledgerError: null,
+      ledgerFailures: 0,
     };
+  }
+
+  /**
+   * Say once — in the operator's language, with the actual path and the fix — that the ledger cannot
+   * be written. `writeState` already keeps the repeated failures out of the log; this is the line
+   * that explains what it means for a trading bot, and it is refreshed in the status every cycle so
+   * the panel and `/api/config/check` show it without anyone reading logs.
+   */
+  private reportLedgerDurability(): void {
+    const persistence = ledger.persistence();
+    this.status = {
+      ...this.status,
+      ledgerDurable: persistence.durable,
+      ledgerPath: persistence.path,
+      ledgerError: persistence.error,
+      ledgerFailures: persistence.failures,
+    };
+
+    if (persistence.durable) return;
+    if (this.ledgerDurabilityWarned) return;
+    this.ledgerDurabilityWarned = true;
+
+    const entriesNote = this.status.config.autoEntry
+      ? this.status.config.allowNonDurableLedger
+        ? 'Automated entries continue because TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER=true.'
+        : 'Automated entries are REFUSED until this is fixed (the daily-loss breaker and the record of which positions are ours would reset on every restart).'
+      : 'Guardian-only mode is unaffected: existing positions are still protected.';
+    this.log(
+      'WARN',
+      'LEDGER_NOT_DURABLE',
+      `The trade ledger cannot be written to ${persistence.path}${persistence.error ? ` (${persistence.error})` : ''}. ` +
+        `Everything the engine keeps — positions, compounding, today's realized loss — lives only in memory and is lost when this process restarts. ` +
+        `${entriesNote} Fix: mount a writable volume and point TRADE_DATA_DIR at it (on Cloud Run the default /app path is read-only; /tmp works but dies with the instance).`
+    );
   }
 
   private log(level: EngineEvent['level'], kind: string, message: string): void {
@@ -355,6 +406,7 @@ class TradeEngine {
     };
     this.running = true;
     this.schedule(0);
+    this.reportLedgerDurability();
     this.log(
       'SUCCESS',
       'STARTED',
@@ -372,7 +424,15 @@ class TradeEngine {
     this.running = false;
     this.status = { ...this.status, running: false, nextCycleAt: null };
     ledger.flush();
-    this.log('WARN', 'STOPPED', `Engine ${reason}; ledger flushed to disk.`);
+    const persistence = ledger.persistence();
+    this.log(
+      'WARN',
+      'STOPPED',
+      persistence.durable
+        ? `Engine ${reason}; ledger flushed to disk.`
+        : `Engine ${reason}; the in-memory ledger was NOT persisted (${persistence.error ?? 'the data directory is not writable'}). ` +
+          'Positions, compounding and the daily-loss figure are lost when this process ends.'
+    );
     return { ok: true, message: `Engine ${reason}` };
   }
 
@@ -713,6 +773,8 @@ class TradeEngine {
       autoEntry: this.status.config.autoEntry,
       haltedByOperator: this.haltEntries,
       haltedByPolicy: policy.halted,
+      ledgerDurable: this.status.ledgerDurable,
+      allowNonDurableLedger: this.status.config.allowNonDurableLedger,
       canTrade: account.canTrade,
       dailyLossLocked,
       openOwned: owned.length,

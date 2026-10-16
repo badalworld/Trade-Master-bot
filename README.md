@@ -189,6 +189,7 @@ Defence in depth, every layer independent:
 | **Exchange-filter sizing** | `LOT_SIZE` / `PRICE_FILTER` / `MIN_NOTIONAL` read live from `exchangeInfo`; refuses to guess rather than over-sizing or sending a stop Binance will reject for precision. |
 | **Guardian engine** | Reconciles against `positionRisk` every cycle, re-arms a missing stop, closes positions whose stop cannot be established, adopts stops moved on the exchange. |
 | **Position-mode check** | Refuses to trade a Hedge-Mode account (this bot places One-Way orders). |
+| **Ledger durability** | A ledger the process cannot write is treated as a safety failure, not a warning: automated entries are refused until `TRADE_DATA_DIR` is writable (or `TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER=true` accepts an in-memory one on purpose). A restart that silently resets the daily-loss breaker is how a losing day keeps trading. |
 | **Clickjacking / transport** | `X-Frame-Options: DENY` + `frame-ancestors 'none'` by default, httpOnly + `Secure` (on https) cookies. `TM_FRAME_ANCESTORS` (build-time; Next.js bakes headers into the routes manifest) opts in to a named embedding origin (`https://console.example.com` or `https://*.example.com`) — X-Frame-Options cannot express an allowlist, so that path relies on the CSP control alone. |
 | **No key in the browser** | API keys are never in `localStorage`, never in a request body, and never returned to the client. |
 
@@ -359,7 +360,7 @@ Representative refusal codes: `OPERATOR_AUTH_REQUIRED`, `OPERATOR_AUTH_NOT_CONFI
 ```bash
 npm run lint          # eslint (also enforced during `next build`)
 npx tsc --noEmit      # strict type-check
-npm test              # 179 tests, 15 files, node:test + native TypeScript
+npm test              # 185 tests, 15 files, node:test + native TypeScript
 ```
 
 The suite covers the parts that lose money if they are wrong:
@@ -386,12 +387,15 @@ The suite covers the parts that lose money if they are wrong:
   override, board caching, stale-board and fallback behaviour when the exchange is unreachable.
 - **The scan funnel** — shortlist selection, chop/band refusals with their reasons, volatility
   percentile ranks, and that the best score wins over the most volatile pair.
+- **Ledger durability** — a writable data dir reports durable; an unwritable one keeps the OS error,
+  counts the failures, leaves the in-memory ledger authoritative, and (via the entry gate) blocks
+  automated entries until it is fixed or explicitly overridden.
 - **The opportunity list** — promotion most-volatile-first, the screening band, displacement with its
   anti-churn margin, board-drop and band-exit removals, strike-based eviction of chop/band/no-data
   failures, the removal cooldown, and that a fallback board carries the list over instead of wiping
   it.
 
-Verified state of this revision: `tsc` clean · `eslint` clean · **179/179 tests** · production build
+Verified state of this revision: `tsc` clean · `eslint` clean · **185/185 tests** · production build
 clean (15 routes) · live route probes (anonymous money calls answer **401**, oversized requests
 answer **409 POLICY_BLOCKED**, unreachable exchange answers **502 NETWORK_UNREACHABLE** with the
 remedy rather than a bogus credential rejection). Live audit history and the honest list of what has *not* been proven
@@ -448,6 +452,7 @@ DEPLOYMENT.md  AUDIT-LIVE-TRADING.md
 | Engine panel keeps showing the same `CYCLE_FAILED` | Each failure is classified (key, IP allowlist, geo-block, malformed request, network) and the panel shows the diagnosis, the remedy and how many cycles it has repeated. A first line is logged in full; an identical repeat is logged every 20th cycle instead of every cycle, and failures no retry can fix back off to a 2-minute poll — the loop never stops retrying, so a fix made in Binance is picked up on its own. |
 | `TIMESTAMP_DRIFT` / `SIGNATURE_INVALID` | Host clock skew >1s (enable NTP) / the secret does not match the key (re-copy or regenerate). |
 | `BINANCE_UNREACHABLE` / `TIMEOUT` | Egress/DNS problem: no credential would work. Check outbound HTTPS, then `/api/config/check` reachability. |
+| `[ledger] persist failed: EACCES ... mkdir '/app/.data'` | The data directory is not writable (Cloud Run's app directory is read-only by default). The first line explains it once, the rest are counted; `/api/config/check` reports `LEDGER_EPHEMERAL` and the engine panel shows a red banner. **Automated entries are refused until it is fixed** — a restart would otherwise reset the daily-loss breaker. Mount a volume and set `TRADE_DATA_DIR`, or accept it explicitly with `TRADE_ENGINE_ALLOW_NON_DURABLE_LEDGER=true`. |
 | The opportunity list keeps shrinking | Each removal carries its reason in the scanner strip and the engine log: `not-on-board` (fell out of the liquid set), `vol-below-floor`/`vol-above-ceiling` (moved out of the band), `choppy` (struck off after `TRADE_OPPORTUNITY_STRIKES` failed passes). Raise `TRADE_OPPORTUNITY_MAX` or widen the band if the list never fills. |
 | The opportunity list never fills to `TRADE_OPPORTUNITY_MAX` | The list is clamped by the per-cycle weight budget (`TRADE_MAX_OPEN_POSITIONS × 4`). Raise `TRADE_MAX_OPEN_POSITIONS`, or accept the clamp — `/api/config/check` reports it as `OPPORTUNITY_BUDGET_LIMITED`. |
 | Same pairs stay on the list too long | `TRADE_OPPORTUNITY_STRIKES=1` evicts on the first bad reading, `TRADE_OPPORTUNITY_COOLDOWN_MS` controls how long a removed pair stays out, and `TRADE_OPPORTUNITY_ENABLED=false` goes back to rebuilding a shortlist every cycle. |
