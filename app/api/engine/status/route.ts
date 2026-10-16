@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { engine } from '@/lib/engine';
 import { ledger } from '@/lib/position-ledger';
 import { loadRiskPolicy, policySummary } from '@/lib/risk-policy';
+import { requireOperator } from '@/lib/operator-auth';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -16,6 +17,12 @@ export const dynamic = 'force-dynamic';
 export async function GET(req: Request) {
   if (req.headers.get('x-tm-request') !== '1') {
     return NextResponse.json({ success: false, code: 'ORIGIN_REJECTED', error: 'Direct browsing of this endpoint is not allowed.' }, { status: 403 });
+  }
+
+  // Position sizes and PnL are not public: the header alone is not authentication.
+  const operator = requireOperator(req);
+  if (!operator.ok) {
+    return NextResponse.json({ success: false, code: operator.code, error: operator.error }, { status: operator.httpStatus });
   }
 
   const snapshot = ledger.snapshot();

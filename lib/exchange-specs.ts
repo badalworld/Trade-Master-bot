@@ -114,9 +114,14 @@ export function resolveSpec(
   if (fromExchange) {
     return { symbol: upper, filters: fromExchange, known: true, source: 'exchangeInfo' };
   }
+  // The builtin table is a *frozen copy* of what exchangeInfo said on the day it was written, and
+  // Binance does change stepSize/minNotional. Sizing a live order from it is the same class of
+  // guess that produced precision-rejected stop-losses (B1) and 5-10x over-sized positions (B2),
+  // so it is no longer treated as authoritative: `known: false` makes every money path refuse.
+  // The values stay available as a display hint only.
   const builtin = BUILTIN[upper];
   if (builtin) {
-    return { symbol: upper, filters: builtin, known: true, source: 'builtin' };
+    return { symbol: upper, filters: builtin, known: false, source: 'builtin' };
   }
   return {
     symbol: upper,
@@ -150,6 +155,21 @@ export function formatToStep(
   // send it to the exchange.
   if (!Number.isFinite(snapped) || snapped <= 0) return '0';
   return Number(snapped.toFixed(12)).toFixed(p);
+}
+
+/**
+ * Last-resort quantity formatting for paths that must still work without exchange filters — a
+ * CLOSE, which only reduces risk. `toFixed(8).replace(/0+$/, '')` produced `"2."` for a
+ * whole-number position, which Binance rejects as a malformed number, so the decimal point is
+ * trimmed too. Returns a plain decimal string or '0', never exponent notation.
+ */
+export function formatQtyFallback(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0';
+  const trimmed = value
+    .toFixed(8)
+    .replace(/0+$/, '')
+    .replace(/\.$/, '');
+  return trimmed === '' || trimmed === '-' ? '0' : trimmed;
 }
 
 export type SizingResult =

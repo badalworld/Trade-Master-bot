@@ -18,6 +18,7 @@ import {
   getExchangeInfoRaw,
   getLivePositions,
   getOrderStatus,
+  getPositionMode,
   getRealizedPnlToday,
   placeBracketOrder,
   placeMarketOrder,
@@ -25,8 +26,23 @@ import {
   setMarginTypeIsolated,
   type LivePosition,
 } from './binance-client.ts';
-import { alignPriceToTick, buildSpecMap, computeOrderQuantity, resolveSpec, validateEntryBracket, type SymbolFilters } from './exchange-specs.ts';
-import { loadRiskPolicy, type RiskPolicy, validateOpenRequest, type Violation } from './risk-policy.ts';
+import {
+  alignPriceToTick,
+  buildSpecMap,
+  computeOrderQuantity,
+  formatQtyFallback,
+  resolveSpec,
+  validateEntryBracket,
+  type SymbolFilters,
+} from './exchange-specs.ts';
+import {
+  dailyLossGate,
+  loadRiskPolicy,
+  positionModeViolation,
+  type RiskPolicy,
+  validateOpenRequest,
+  type Violation,
+} from './risk-policy.ts';
 import { claimIdempotency, makeClientOrderId, releaseIdempotency } from './trade-guard.ts';
 
 export interface Executed<T extends { success: boolean }> {
@@ -113,6 +129,12 @@ export interface RecoveryBody {
   code: string;
   reconciliation: string;
   symbol: string;
+  /** Everything the caller needs to ADOPT the position into its ledger instead of forgetting it. */
+  side: 'LONG' | 'SHORT';
+  entryPrice: number;
+  quantity: number;
+  /** Tick-aligned stop that was re-attached, or null when no stop could be established. */
+  stopLoss: number | null;
   livePositions: NonNullable<FailureBody['livePositions']>;
   slOrderId: number | string | null;
   positionMayBeOpen: boolean;
@@ -246,10 +268,11 @@ export async function openPosition(
     }
 
     // --- Live facts from the exchange (never from browser state) ---------
-    const [account, livePositions, realizedToday] = await Promise.all([
+    const [account, livePositions, realizedToday, dualSide] = await Promise.all([
       getAccount(creds),
       getLivePositions(creds),
       getRealizedPnlToday(creds),
+      getPositionMode(creds),
     ]);
 
     if (!account.canTrade) {
@@ -257,6 +280,21 @@ export async function openPosition(
         code: 'ACCOUNT_CANNOT_TRADE',
         error: 'Binance reports canTrade=false for this API key (permissions reduced, or account restricted).',
       });
+    }
+
+    // Hedge Mode would reject this bot's orders (no positionSide, reduceOnly closes). `null` means
+    // the mode could not be read: the order is then left to fail loudly at the exchange rather than
+    // blocking entries on a metadata hiccup.
+    const modeViolation = positionModeViolation(dualSide === true);
+    if (modeViolation) {
+      return fail(409, { code: 'POLICY_BLOCKED', violations: [modeViolation], error: modeViolation.message });
+    }
+
+    // Fail-closed daily loss breaker: an unreadable income endpoint locks entries instead of being
+    // silently treated as "no loss today" (the previous behaviour).
+    const lossGate = dailyLossGate(policy, Number.isFinite(realizedToday) ? realizedToday : null);
+    if (!lossGate.ok) {
+      return fail(409, { code: lossGate.code, error: lossGate.message });
     }
 
     const violations = validateOpenRequest(policy, {
@@ -270,12 +308,6 @@ export async function openPosition(
     });
     if (!violations.ok) {
       return fail(409, { code: 'POLICY_BLOCKED', violations: violations.violations, error: violations.violations.map((v) => v.message).join(' ') });
-    }
-    if (policy.maxDailyLossUsdt > 0 && Number.isFinite(realizedToday) && realizedToday <= -policy.maxDailyLossUsdt) {
-      return fail(409, {
-        code: 'DAILY_LOSS_BREAKER',
-        error: `Realized PnL today is $${realizedToday.toFixed(2)}; entries locked by the $${policy.maxDailyLossUsdt} daily loss breaker.`,
-      });
     }
     if (livePositions.some((p) => p.symbol === symbol)) {
       return fail(409, {
@@ -581,6 +613,7 @@ export async function openPosition(
       }
     }
 
+    const recoveredAction = found[0];
     return {
       status: 502,
       body: {
@@ -590,6 +623,13 @@ export async function openPosition(
         code: recoveredSl !== null ? 'RECOVERED_STOP_ATTACHED' : 'UNPROTECTED_POSITION',
         reconciliation: recoveredSl !== null ? 'STOP_ATTACHED' : 'STOP_FAILED',
         symbol,
+        // Enough for the caller to adopt the position into its own ledger: without this, an
+        // ambiguous entry that turned out to be filled was "protected but forgotten" — the engine
+        // had no ledger row, so it never re-armed the stop or settled the trade.
+        side: recoveredAction ? recoveredAction.side : intent.side,
+        entryPrice: recoveredAction && recoveredAction.entryPrice > 0 ? recoveredAction.entryPrice : intent.price,
+        quantity: recoveredAction ? Math.abs(recoveredAction.positionAmt) : 0,
+        stopLoss: ctx.slPrice ? Number(ctx.slPrice) : null,
         livePositions: found.map((p) => ({
           side: p.side,
           quantity: Math.abs(p.positionAmt),
@@ -661,9 +701,7 @@ export async function closePosition(
       const finalQty =
         qty.ok && spec.known
           ? qty.quantity
-          : Math.abs(p.positionAmt)
-              .toFixed(8)
-              .replace(/0+$/, '') || String(Math.abs(p.positionAmt));
+          : formatQtyFallback(Math.abs(p.positionAmt));
 
       const ack = await placeMarketOrder(creds, {
         symbol,

@@ -58,6 +58,9 @@ interface SettingsViewProps {
   botActive: boolean;
   onStartBot: (updatedSettings?: BotSettings) => void;
   onPauseBot: () => void;
+  /** Operator session wall in front of the trading endpoints (null while unknown). */
+  operator?: { required: boolean; authenticated: boolean } | null;
+  onOperatorSignOut?: () => void;
 }
 
 export function SettingsView({
@@ -72,6 +75,8 @@ export function SettingsView({
   botActive,
   onStartBot,
   onPauseBot,
+  operator,
+  onOperatorSignOut,
 }: SettingsViewProps) {
   const [localSettings, setLocalSettings] = useState<BotSettings>(settings);
   // Held in component state only: never persisted, never mirrored into settings/localStorage.
@@ -268,6 +273,27 @@ export function SettingsView({
                 {session.isTestnet ? 'TESTNET · PAPER FUNDS' : 'MAINNET · REAL MONEY'}
               </div>
             </div>
+
+            {operator?.required ? (
+              <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-lg bg-slate-950/80 border border-cyan-900/60">
+                <span className="text-[11px] text-slate-300 flex items-center gap-1.5">
+                  <Shield className="w-3.5 h-3.5 text-cyan-400" />
+                  Operator session
+                  <span className={operator.authenticated ? 'text-emerald-300' : 'text-amber-300'}>
+                    {operator.authenticated ? 'active (12h cookie)' : 'required'}
+                  </span>
+                </span>
+                {operator.authenticated && onOperatorSignOut ? (
+                  <button
+                    type="button"
+                    onClick={onOperatorSignOut}
+                    className="py-1 px-2 text-[10px] rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200"
+                  >
+                    Sign out
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
 
             {session.active ? (
               <div className="p-3 rounded-lg bg-slate-950/80 border border-emerald-800/60 space-y-2">

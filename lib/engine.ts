@@ -28,7 +28,7 @@ import {
   placeBracketOrder,
 } from './binance-client.ts';
 import { formatToStep } from './exchange-specs.ts';
-import { closePosition, getSpecMap, openPosition, type OpenSuccess } from './order-executor.ts';
+import { closePosition, getSpecMap, openPosition, type OpenSuccess, type RecoveryBody } from './order-executor.ts';
 import {
   classifyExit,
   detectBreach,
@@ -594,8 +594,57 @@ class TradeEngine {
             if (b.bracketWarning) this.log('WARN', 'BRACKET_PARTIAL', b.bracketWarning);
           }
         } else {
-          const f = result.body as { code?: string; error?: string };
-          this.log('WARN', 'ENTRY_SKIPPED', `${candidate.symbol}: ${f.code ?? 'rejected'} — ${f.error ?? 'no detail'}`);
+          const f = result.body as Partial<RecoveryBody> & { code?: string; error?: string };
+          const live = Array.isArray(f.livePositions) && f.livePositions.length > 0 ? f.livePositions[0] : null;
+
+          if (f.orderPlaced === true) {
+            // The exchange may already hold a position. Opening anything else while that is
+            // unresolved is how one half-known position becomes two, so entries stop here — the
+            // same decision the browser loop makes when it sees `orderPlaced`.
+            this.haltEntries = true;
+            this.status = { ...this.status, entriesHalted: true };
+
+            if (live && f.side) {
+              // Adopt it: without a ledger row the guardian classifies it as foreign, which means
+              // it would never re-arm the stop, never settle PnL and never appear in history.
+              const entryPrice = live.entryPrice > 0 ? live.entryPrice : candidate.currentPrice;
+              const notional = live.quantity * entryPrice;
+              const margin = live.leverage > 0 ? notional / live.leverage : this.status.config.baseMargin;
+              const stopLoss = typeof f.stopLoss === 'number' && f.stopLoss > 0 ? f.stopLoss : 0;
+
+              ledger.upsert({
+                id: `rec-${candidate.symbol}-${Date.now()}`,
+                symbol: candidate.symbol,
+                side: f.side,
+                entryPrice,
+                markPrice: live.markPrice > 0 ? live.markPrice : entryPrice,
+                margin: Number(margin.toFixed(4)),
+                leverage: live.leverage || this.status.config.leverage,
+                quantity: live.quantity,
+                stopLoss,
+                takeProfit: 0,
+                unrealizedPnl: Number((live.unrealizedProfit ?? 0).toFixed(2)),
+                unrealizedPnlPercent:
+                  margin > 0 ? Number((((live.unrealizedProfit ?? 0) / margin) * 100).toFixed(2)) : 0,
+                entryTime: Date.now(),
+                slOrderId: f.slOrderId ?? undefined,
+                signalId: `${candidate.symbol}:${candidate.signal}:${candidate.score}`,
+              });
+              this.log(
+                'WARN',
+                'ENTRY_RECOVERED',
+                `${candidate.symbol} ${f.side} ${live.quantity} was found live on Binance after an ambiguous entry (${f.code ?? 'no code'}). It is now in the ledger${stopLoss > 0 ? ` with stop ${stopLoss}` : ' but with no known stop level'} so the guardian can re-arm and settle it. New entries halted — resume when you have checked the position.`
+              );
+            } else {
+              this.log(
+                'ERROR',
+                'ENTRY_UNRESOLVED',
+                `${candidate.symbol}: ${f.code ?? 'ambiguous outcome'} — ${f.error ?? 'no detail'}. Entries halted. The exchange state could not be pinned to a position, so nothing was adopted — verify on Binance before resuming.`
+              );
+            }
+          } else {
+            this.log('WARN', 'ENTRY_SKIPPED', `${candidate.symbol}: ${f.code ?? 'rejected'} — ${f.error ?? 'no detail'}`);
+          }
         }
       } else if (scan.ok) {
         this.log('INFO', 'NO_SETUP', `${scan.signals.length} pairs scanned, none met the entry threshold.`);

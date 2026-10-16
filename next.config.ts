@@ -17,8 +17,14 @@ const nextConfig: NextConfig = {
         headers: [
           { key: 'X-Content-Type-Options', value: 'nosniff' },
           { key: 'Referrer-Policy', value: 'no-referrer' },
-          // Deliberately no X-Frame-Options: this applet is embedded by its host platform, and the
-          // session cookie is SameSite=Lax, which already withholds it from cross-site iframe GETs.
+          // This page drives real orders, so it must not be framed by another site: clickjacking a
+          // "START BOT" / "Close position" button is a real path to a real loss. Both headers are
+          // sent because `frame-ancestors` is the modern control and `X-Frame-Options` covers older
+          // clients. Consequence: embedding this app inside another page (an applet shell) will be
+          // blocked — put the shell behind the operator session and link out instead, or relax this
+          // deliberately if embedding is more important than the clickjacking risk.
+          { key: 'X-Frame-Options', value: 'DENY' },
+          { key: 'Content-Security-Policy', value: "frame-ancestors 'none'" },
           { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=(), interest-cohort=()' },
         ],
       },
