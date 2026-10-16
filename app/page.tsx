@@ -6,6 +6,7 @@ import { Header } from '@/components/Header';
 import { KpiMetricsStrip, type BinanceAccountMetrics } from '@/components/KpiMetricsStrip';
 import { ActivePositions } from '@/components/ActivePositions';
 import { ScannerTable } from '@/components/ScannerTable';
+import { isActionableSignal } from '@/lib/market-data';
 import { InteractiveChart } from '@/components/InteractiveChart';
 import { TradeHistory } from '@/components/TradeHistory';
 import { DiagnosticsLog, type LogEntry } from '@/components/DiagnosticsLog';
@@ -162,6 +163,12 @@ export default function HomePage() {
     isThrottled: false,
     remainingWeight: 1116,
   });
+
+  // Stage-1 (market-wide) output of the last scan: the ranking the shortlist was drawn from, plus
+  // the regime settings and the reasons pairs were refused.
+  const [marketBoard, setMarketBoard] = useState<any>(null);
+  const [scanSkipped, setScanSkipped] = useState<Record<string, number> | null>(null);
+  const [scanUniverse, setScanUniverse] = useState<any>(null);
   const [logs, setLogs] = useState<LogEntry[]>(INITIAL_LOGS);
 
   // Operator session: when this deployment holds server-side Binance keys, the money endpoints
@@ -986,31 +993,38 @@ export default function HomePage() {
           if (data.rateLimitStatus) {
             setRateLimitStatus(data.rateLimitStatus);
           }
+          if (data.board) setMarketBoard(data.board);
+          if (data.skipped) setScanSkipped(data.skipped);
+          if (data.universe) setScanUniverse(data.universe);
 
           // Evaluate Auto-Trade Opportunity
           if (botActive) {
             const topScore = data.signals[0];
+            const board = data.board;
+            const skippedText = data.skipped && Object.keys(data.skipped).length > 0
+              ? ` Refused: ${Object.entries(data.skipped).map(([r, c]) => `${c} ${r}`).join(', ')}.`
+              : '';
             appendLog(
               'SCAN',
               'INFO',
-              `Market scan evaluated ${data.signals.length} Binance 5m pairs. Top setup: ${topScore?.symbol || 'None'} (${topScore?.signal || 'NEUTRAL'}, Score: ${topScore?.score || 0}%, Volatility: ${topScore?.volatilityPercent?.toFixed(2) || '0'}%).`
+              `Market scan ranked ${board?.liquidCount ?? '?'} liquid USDT-M perps and deep-scanned ${data.signals.length}. Best setup: ${topScore?.symbol || 'None'} (${topScore?.signal || 'NEUTRAL'}, Score: ${topScore?.score || 0}%, Vol ${topScore?.volatilityPercent?.toFixed(2) || '0'}%, ADX ${Number.isFinite(topScore?.regime?.adx) ? topScore.regime.adx.toFixed(0) : '—'}, ER ${Number.isFinite(topScore?.regime?.efficiencyRatio) ? topScore.regime.efficiencyRatio.toFixed(2) : '—'}).${skippedText}`
             );
 
             const openLimit = canOpenNewTrade(positions.length, settings.maxOpenTrades);
             if (openLimit.allowed) {
               const openSymbols = new Set(positions.map((p) => p.symbol));
+              // One shared gate for the browser and the engine: signal strength *and* the regime
+              // verdict (chop filter + volatility band). The list arrives best-score-first, so the
+              // strongest setup inside the band wins instead of the most volatile one.
               const topCandidate = data.signals.find(
                 (s: SignalEvaluation) =>
                   !openSymbols.has(s.symbol) &&
                   // The server refuses symbols with no exchange filter data; don't even try.
-                  (data.tradeable ? data.tradeable[s.symbol] !== false : true) &&
+                  (data.tradeable ? data.tradeable[s.symbol] === true : true) &&
                   !submittedSignalsRef.current.has(
                     `${s.symbol}:${s.action}:${s.currentPrice}`
                   ) &&
-                  (s.signal === 'STRONG_BUY' ||
-                    s.signal === 'STRONG_SELL' ||
-                    (s.signal === 'BUY' && s.score >= 65) ||
-                    (s.signal === 'SELL' && s.score >= 65))
+                  isActionableSignal(s)
               );
 
               if (topCandidate) {
@@ -1727,6 +1741,11 @@ export default function HomePage() {
               isScanning={isScanning}
               hasApiKey={session.active}
               onGoToSettings={() => setActiveTab('settings')}
+              board={marketBoard}
+              skipped={scanSkipped}
+              volatilityBand={scanUniverse?.volatilityBand ?? null}
+              chopFilter={scanUniverse?.chopFilter ?? null}
+              shortlistSkipped={scanUniverse?.shortlistSkipped ?? null}
             />
           </div>
         )}

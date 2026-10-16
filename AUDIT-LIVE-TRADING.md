@@ -1,10 +1,11 @@
 # Pre-Live Audit — Trade Master (Binance Futures Bot)
 
-**Date:** 2026-10-16 (round 5 — signed-read failure) · **Branch:** `arena/937908a7-trade-master-bot`
+**Date:** 2026-10-17 (round 6 — volatility ranking, discovery, chop filter) · **Branch:** `arena/cb8fc695-trade-master-bot`
 **Audit verdict:** ❌ still NOT CLEARED for live trading with real funds.
-**Remediation status:** round-1 (B1–B5, H1–H4), round-2 (R2-1 … R2-9), round-3 (R3-1 … R3-7) and
-round-4 (R4-1 … R4-3) items fixed; round-5 items (R5-1 … R5-4) fixed in code, verified by `tsc`,
-`eslint`, **116/116 unit tests**, a production build (15 routes) and a live engine probe.
+**Remediation status:** round-1 (B1–B5, H1–H4), round-2 (R2-1 … R2-9), round-3 (R3-1 … R3-7),
+round-4 (R4-1 … R4-3) and round-5 (R5-1 … R5-4) items fixed; round-6 items (R6-1 … R6-4) fixed in
+code, verified by `tsc`, `eslint`, **158/158 unit tests**, a production build (15 routes), a live
+engine probe and a synthetic-market funnel probe.
 **Still not cleared for real money** — the strategy has no backtest and no track record, so it must
 earn that on testnet first.
 
@@ -19,6 +20,139 @@ position on the exchange with no stop-loss and no monitoring process**.
 > the *policy* answer instead, because the endpoints were never authenticated). All three are fixed
 > below; the round-1 narrative is kept for history and its claims about the current code should be
 > read through this header.
+
+---
+
+## Round 6 — volatility ranking, market discovery and the chop filter (branch `arena/cb8fc695-trade-master-bot`)
+
+**Origin:** the operator's report, after the signed-read fix let the app run for real:
+
+> *"our trading assets only high volatility assets sorting. We trade on maximum to minimum volatile
+> assets. Scanner scan most volatile to low volatile. We avoid only Choppy market. I think this is not
+> full established."*
+
+They were right, and the honest reading of the code was worse than the complaint. Volatility was
+**measured only to be displayed**, the universe was a hand-written list, and the engine picked the
+most volatile pair that had *any* signal. Two of those are the reported bug; investigating them
+surfaced a third that stopped automated entries entirely.
+
+Agreed design (operator's answers): market-wide discovery then a focused execution scan
+[*"find full futures market best opportunity and separate them and opportunity assets scan faster for
+trade execution … market scanner find opportunity with volatility sort system"*], a tradeable band
+**above a chop floor and below a blow-off ceiling** [floor_ceiling], **best score wins** with
+volatility as tie-break [best_score], and the top band **skipped rather than sized down** [skip_only].
+
+### R6-1 · CRITICAL — no automated entry could ever happen: the exchange-filter lookup read the envelope
+
+`resolveTradeable()` in `lib/market-data.ts` did:
+
+```ts
+const map = buildSpecMap(await publicGet<unknown>(isTestnet, '/fapi/v1/exchangeInfo', '', 6000));
+```
+
+`publicGet` resolves to `{ data, usedWeight }`. `buildSpecMap` looks for `.symbols`, found none, and
+returned `{}` — so **every symbol was marked `tradeable: false`**. The engine required
+`scan.tradeable[symbol] === true` and the browser loop required `!== false`; both therefore refused
+every candidate, forever, while reporting a healthy scan. TypeScript could not catch it because
+`buildSpecMap(exchangeInfo: unknown)` accepts anything.
+
+**Evidence:** a stubbed exchange driven through the real `scanUniverse` printed
+`tradeable map: [['SYM30USDT', false], …]` for symbols whose `exchangeInfo` filters were present and
+valid, and `selectBestCandidate` returned `null` regardless of scores. After the fix the same probe
+prints `true` and selects a candidate.
+
+**Fix:** inspect the payload (`const { data } = await publicGet(...)`), plus a regression test asserting
+`scan.tradeable.GOODUSDT === true` and `selectBestCandidate(...) !== null` through the real funnel — the
+assertion that was missing and would have caught this.
+
+### R6-2 · HIGH — the engine traded the most volatile pair with any signal, not the best setup
+
+`scan.signals` was sorted by volatility and the engine took the first entry passing the threshold:
+
+```ts
+const candidate = scan.signals.find((sig) => isActionableSignal(sig) && scan.tradeable[sig.symbol] === true);
+```
+
+So a 66 % setup on a 4.5 %-volatility pair beat a 92 % setup on a 1.2 % one — exactly the backwards
+selection the operator described ("only high volatility assets"). Volatility is a *precondition* here,
+not a quality score.
+
+**Fix:** `selectBestCandidate()` (pure, exported) ranks by **score first, volatility as tie-break** and
+refuses anything the regime gate or the exchange filters did not clear. The same function now serves
+both the engine and the browser loop, replacing a third copy of the threshold logic that had drifted
+in `app/page.tsx`.
+
+### R6-3 · HIGH — the reported "avoid choppy market" did not exist anywhere in the codebase
+
+No ADX, no efficiency ratio, no trend/chop classification existed. `evaluateEntryGate()` checked
+auto-entry/halt/`canTrade`/daily-loss/position-cap and nothing about the market itself, and the only
+use of volatility was `isHighVol >= 1.5` colouring a badge. Consequences: a dead 0.3 %-volatility pair
+generated "signals" that stopped out on spread, and a chop market produced a steady supply of
+`STRONG_BUY`/`STRONG_SELL` readings at 10–15× leverage — two of the three indicator families (POC
+relation, stacked imbalance) read as bullish in a market that is only oscillating.
+
+**Fix:** `lib/market-regime.ts` (pure, no I/O) measures Wilder ADX(14), Kaufman efficiency ratio,
+realised volatility and range expansion — **on settled candles only** — and gates entries on:
+
+- **chop** — ADX below the floor **and** efficiency ratio below the floor (both must agree, so an
+  orderly slow trend with a low ADX is still traded);
+- **band** — below the floor (dead market) or above the ceiling (violent market) is refused and
+  reported.
+
+One subtlety worth recording: the first version of `computeADX` reported **100** for a perfectly flat
+oscillation. Wilder's `|+DI − −DI| / (+DI + −DI)` keeps its meaning while both DIs are large, but as
+both decay toward zero it amplifies rounding — the calmest possible market scored as the strongest
+trend, which would have steered the bot straight into it. A directional noise floor (directional
+movement under 10 % of the true range scores no direction) fixes it, and a regression test pins it.
+
+### R6-4 · MEDIUM — "scan the top 12 by volatility" plus a volatility ceiling meant no trades, ever
+
+Found by running the funnel against a synthetic 41-pair market: the shortlist was the 12 most volatile
+pairs, **all 12 were above the 4 % ceiling**, all were refused, and the scanner reported "no setup"
+while hundreds of tradeable pairs sat further down the ranking. Ranking by a metric and then refusing
+the top of that ranking by the same metric is self-defeating.
+
+**Fix:** `selectShortlist()` walks the ranking most-volatile-first but prefers pairs a deliberately
+wide stage-1 proxy says could be inside the band (proxy band = floor ÷ 3 … ceiling × 3, because the 24h
+range and the 5m composite are different scales), and fills any leftover budget with the rest so the
+wild end of the market stays *visible* — just not deep-scanned first. The trade/no-trade verdict
+remains the measured one; the proxy only decides who deserves an expensive kline request. Live probe
+after the fix: 12 deep-scanned, 10 inside the band, 2 refused as too violent, 1 selected.
+
+### Also in this round
+
+- **Universe**: `lib/market-scanner.ts` ranks the whole USDT-M market from one `/ticker/24hr` call
+  (perpetual + `TRADING` + USDT + no stablecoin pairs + no quarterly contracts, $50M liquidity floor,
+  60 s cache, stale-board reuse, built-in-majors fallback). Because it is one call, whole-market
+  discovery costs less weight than the 12-pair kline fan-out it feeds.
+- **`TRADE_SYMBOL_ALLOWLIST` semantics changed** from "the 12 defaults unless overridden" to "empty =
+  discovered; non-empty = strict restriction". `TRADE_DISCOVERY_ENABLED=false` restores the old
+  universe *and* the old execution-layer restriction, so the narrow behaviour is still one flag away.
+  The widening is now stated in `/api/config/check` (`UNIVERSE_MARKET_WIDE` / `UNIVERSE_FIXED_LIST` /
+  `VOLATILITY_BAND_EMPTY`) instead of being implicit.
+- **Visibility**: the scanner shows the funnel's work — liquid-count → deep-scanned, the hottest five
+  pairs, the band and chop thresholds in force, a `TRADEABLE`/`CHOPPY`/`TOO QUIET`/`TOO VIOLENT` verdict
+  per row with the measured reason, a 0–100 volatility rank, ADX/ER per row, and the refusal counts.
+  The engine's `lastScan` carries the same, and its log line reads
+  `12 pairs deep-scanned from a board of 340 liquid pairs · refused: 3 choppy, 1 vol-above-ceiling · closest: …`.
+
+### Fixed / verified in this round
+
+`tsc` clean · `eslint` clean · `npm test` **158/158** (was 116; +16 regime, +9 discovery, +13 funnel,
++2 config-check, +2 rewritten symbol-gate) · `NODE_ENV=production next build` clean (15 routes) · live
+probes: (a) the app's own `/api/binance/scan` on a server with no egress returned `board.source:
+"fallback"` with its error, the in-force band/chop thresholds and a 12-pair universe instead of an empty
+scan; (b) a synthetic 41-symbol market through the real `scanUniverse` produced 40 ranked / illiquid
+pair excluded / 12 deep-scanned / refusals by reason / `SYM30USDT` selected at score 75 rather than the
+most volatile `SYM40USDT` (refused at 4.75 %).
+
+### Still not proven
+
+No order has ever been placed against a live exchange from this environment, so the *behaviour* of
+these gates on real fills is unverified. The band (0.6 %–4 %) and the chop thresholds (ADX 20 / ER 0.3)
+are reasoned defaults with no backtest behind them, and the claim that skipping the upper volatility
+band improves a 5m strategy is an assumption, not a measurement. Testnet results are the only way to
+revisit them.
 
 ---
 

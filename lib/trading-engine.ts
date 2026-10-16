@@ -12,7 +12,11 @@
  * - Leverage constraint support (10x - 15x Isolated)
  * - Maximum Open Trades constraint (max 5)
  * - Binance API Rate Limit Shield (95% safety cap)
+ * - Market-regime measurement (ADX + efficiency ratio chop filter, realised volatility) on settled
+ *   candles only, so a gate can never be decided by a bar that is still forming.
  */
+
+import { measureRegime, settledCandles, type RegimeMetrics } from './market-regime.ts';
 
 export interface Candle {
   time: number;
@@ -64,12 +68,22 @@ export interface ImbalanceResult {
 
 export type SignalType = 'STRONG_BUY' | 'BUY' | 'NEUTRAL' | 'SELL' | 'STRONG_SELL';
 
+export interface ScanAnnotationLike {
+  /** 0-100 percentile of volatility within the scan (100 = most volatile pair scanned). */
+  volatilityRank: number;
+  volatilityLevel: 'LOW' | 'TRADEABLE' | 'HIGH';
+  /** false = the scanner refused this pair (chop market, or volatility outside the band). */
+  tradeable: boolean;
+  skipReason?: 'choppy' | 'vol-below-floor' | 'vol-above-ceiling' | 'vol-unknown';
+  skipDetail?: string;
+}
+
 export interface SignalEvaluation {
   symbol: string;
   signal: SignalType;
   action: 'LONG' | 'SHORT' | 'HOLD';
   score: number; // 0 - 100%
-  volatilityPercent: number; // ATR % and 5m range expansion %
+  volatilityPercent: number; // ATR % and 5m range expansion %, settled candles only
   volatilityScore: number; // 0 - 100 volatility index
   currentPrice: number;
   atr: number;
@@ -79,6 +93,13 @@ export interface SignalEvaluation {
   hvnProfile: HVNProfileResult;
   absorption: AbsorptionResult;
   imbalance: ImbalanceResult;
+  /** Trend/chop diagnostics — measured on settled candles, never on the forming bar. */
+  regime: RegimeMetrics;
+  /**
+   * Filled in by the scanner, which is the only layer that knows the policy band and the rest of
+   * the board to rank against. Absent means "not yet gated" (a raw single-pair evaluation).
+   */
+  scan?: ScanAnnotationLike;
   reasons: string[];
 }
 
@@ -785,9 +806,14 @@ export function evaluate3IndicatorSignal(
   const riskRewardRatio =
     actualRisk > 0 ? Number((actualReward / actualRisk).toFixed(2)) : 1.67;
 
-  // Compute High Volatility Metrics (ATR % and 5m High-Low expansion)
+  // Compute High Volatility Metrics (ATR % and 5m High-Low expansion) on **settled** candles.
+  // The forming bar's high/low/close change on every tick, so including it made the volatility
+  // number — and therefore the band gate and the displayed ranking — flicker inside a single 5m
+  // candle. The last settled bar is the newest information that cannot change underneath us.
+  const settled = settledCandles(candles);
+  const settledForVol = settled.length >= 10 ? settled : candles;
   const atrRatio = currentPrice > 0 ? (safeAtr / currentPrice) * 100 : 1.0;
-  const recentSlice = candles.slice(-10);
+  const recentSlice = settledForVol.slice(-10);
   const recentHighs = recentSlice.map((c) => c.high);
   const recentLows = recentSlice.map((c) => c.low);
   const maxHigh = Math.max(...recentHighs);
@@ -796,6 +822,10 @@ export function evaluate3IndicatorSignal(
 
   const volatilityPercent = Number((atrRatio * 0.55 + rangeExpansion * 0.45).toFixed(2));
   const volatilityScore = Math.min(99, Math.round(volatilityPercent * 30));
+
+  // Trend vs chop, also on settled candles. Default thresholds here; the scanner passes the
+  // policy's own floors through `annotateSignals` for the trade/no-trade decision.
+  const regime = measureRegime(candles, { adxFloor: 20, efficiencyFloor: 0.3 });
 
   return {
     symbol,
@@ -812,6 +842,7 @@ export function evaluate3IndicatorSignal(
     hvnProfile,
     absorption,
     imbalance,
+    regime,
     reasons,
   };
 }

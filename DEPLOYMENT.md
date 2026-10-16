@@ -261,5 +261,6 @@ A correct production deployment reports `READY_MAINNET` (or `READY_TESTNET` whil
 `TESTNET_FLAG_UNSET` when `BINANCE_TESTNET` was never set, which is why a deployment can look
 configured while still trading paper funds. If step 2 or 3 returns
 anything else, do not fund the deployment. Clickjacking is blocked by `X-Frame-Options: DENY` +
-`frame-ancestors 'none'`, so this page cannot be embedded in another site (if you *need* it embedded
-in an applet shell, that trade-off has to be made deliberately in `next.config.ts`).
+`frame-ancestors 'none'`, so this page cannot be embedded in another site. If you *do* need it inside
+a shell you control, set `TM_FRAME_ANCESTORS` to that origin (e.g. `https://console.example.com`) —
+a deliberate relaxation that keeps every other site out, and the trade-off has to be made on purpose.

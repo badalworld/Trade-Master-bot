@@ -8,6 +8,15 @@
  * Pure + env-injected so it is unit-testable without Next.
  */
 
+/**
+ * The pre-discovery universe.
+ *
+ * No longer the trading universe (see `discovery` below): the market is ranked from the exchange
+ * itself and the most volatile liquid pairs are scanned, so a hot pair that is not on this list is
+ * still found. This list is still used for two things: the pairs scanned when
+ * `TRADE_DISCOVERY_ENABLED=false`, and the fallback used for one cycle when `ticker/24hr` cannot be
+ * reached (so an exchange blip cannot empty the scanner).
+ */
 export const DEFAULT_SCANNED_SYMBOLS = [
   'BTCUSDT',
   'ETHUSDT',
@@ -23,6 +32,32 @@ export const DEFAULT_SCANNED_SYMBOLS = [
   '1000PEPEUSDT',
 ] as const;
 
+/** Stage 1: how the tradeable universe is discovered from the exchange itself. */
+export interface DiscoveryConfig {
+  /** false = use the built-in/fixed symbol list only (the pre-discovery behaviour). */
+  enabled: boolean;
+  /** How many of the most volatile liquid pairs the opportunity board keeps. */
+  topN: number;
+  /** 24h quote-volume floor in USDT: below this a pair is too illiquid to enter or exit cleanly. */
+  minQuoteVolumeUsdt: number;
+  /** How long a board is reused before the market is ranked again. */
+  ttlMs: number;
+}
+
+/** Stage 2: which of the discovered pairs may actually be entered, and when. */
+export interface ScanConfig {
+  /** Pairs deep-scanned per cycle, after the board is ranked most-volatile-first. */
+  topN: number;
+  /** Chop floor: below this volatility a pair is noise, not opportunity. */
+  minVolatilityPercent: number;
+  /** Blow-off ceiling: above this, an ATR-sized stop is a coin flip. */
+  maxVolatilityPercent: number;
+  /** ADX below this counts as "no trend" for the chop filter. */
+  chopAdxFloor: number;
+  /** Efficiency ratio below this counts as "going nowhere" for the chop filter. */
+  chopEfficiencyFloor: number;
+}
+
 export interface RiskPolicy {
   maxLeverage: number;
   minLeverage: number;
@@ -31,8 +66,14 @@ export interface RiskPolicy {
   maxOpenPositions: number;
   /** Realized loss (positive number) that halts new entries for the UTC day. 0 = disabled. */
   maxDailyLossUsdt: number;
-  /** Empty array = allow any symbol on the exchange. */
+  /**
+   * Non-empty = restrict scanning *and* order placement to these symbols (an operator override on
+   * top of discovery). Empty = the universe is discovered from the exchange and any symbol with
+   * valid exchange filters may be traded.
+   */
   symbolAllowlist: string[];
+  discovery: DiscoveryConfig;
+  scan: ScanConfig;
   /** Ceiling on effectiveNotional / requestedNotional before the order is refused. */
   maxNotionalDeviationRatio: number;
   /** Reject stops closer than this fraction of price (0.0005 = 5bp). */
@@ -68,14 +109,35 @@ function boolFrom(value: string | undefined, fallback = false): boolean {
 
 export function loadRiskPolicy(env: Record<string, string | undefined> = process.env): RiskPolicy {
   const rawList = (env.TRADE_SYMBOL_ALLOWLIST ?? '').trim();
-  const symbolAllowlist = rawList
+  const explicitAllowlist = rawList
     ? rawList
         .split(',')
         .map((s) => s.trim().toUpperCase())
         .filter(Boolean)
-    : [...DEFAULT_SCANNED_SYMBOLS];
+    : [];
+
+  const discoveryEnabled = boolFrom(env.TRADE_DISCOVERY_ENABLED, true);
+
+  /**
+   * The symbol gate has three deliberate shapes, and the operator can pick any of them:
+   *
+   *  - an explicit `TRADE_SYMBOL_ALLOWLIST` is always honoured, discovery or not;
+   *  - discovery on with no list = the whole market (the universe is the ranked board, and the
+   *    scanner + `selectBestCandidate` are what bound which pairs may be entered);
+   *  - discovery off with no list = exactly the old behaviour, the built-in majors, enforced at the
+   *    order layer as well as in the scanner. This is the switch that restores the narrower universe.
+   */
+  const symbolAllowlist =
+    explicitAllowlist.length > 0 ? explicitAllowlist : discoveryEnabled ? [] : [...DEFAULT_SCANNED_SYMBOLS];
 
   const maxLeverage = intFrom(env.TRADE_MAX_LEVERAGE, 15, 1, 25);
+
+  const minVolatilityPercent = floatFrom(env.TRADE_MIN_VOLATILITY_PCT, 0.6, 0, 100);
+  // A ceiling below the floor would refuse every pair; treat that as an operator error and fall
+  // back to the documented default rather than locking the bot out of the market.
+  const rawMaxVolatility = floatFrom(env.TRADE_MAX_VOLATILITY_PCT, 4, 0, 100);
+  const maxVolatilityPercent =
+    rawMaxVolatility > minVolatilityPercent ? rawMaxVolatility : 4 > minVolatilityPercent ? 4 : minVolatilityPercent * 2;
 
   return {
     maxLeverage,
@@ -86,6 +148,23 @@ export function loadRiskPolicy(env: Record<string, string | undefined> = process
     maxOpenPositions: intFrom(env.TRADE_MAX_OPEN_POSITIONS, 5, 1, 20),
     maxDailyLossUsdt: floatFrom(env.TRADE_MAX_DAILY_LOSS_USDT, 50, 0, 1000000),
     symbolAllowlist,
+    discovery: {
+      // On by default: the operator's complaint was that only a hand-written list was ever scanned.
+      enabled: discoveryEnabled,
+      topN: intFrom(env.TRADE_DISCOVERY_TOP_N, 40, 1, 200),
+      minQuoteVolumeUsdt: floatFrom(env.TRADE_DISCOVERY_MIN_QUOTE_VOLUME, 50_000_000, 0, 1e12),
+      // One ranking per minute is plenty for a 5m strategy and keeps the browser and the engine on
+      // the same board instead of each paying for its own copy.
+      ttlMs: intFrom(env.TRADE_DISCOVERY_TTL_MS, 60_000, 5_000, 3_600_000),
+    },
+    scan: {
+      // Deep-scanning more than a dozen pairs per cycle is where the weight budget starts to hurt.
+      topN: intFrom(env.TRADE_SCAN_TOP_N, 12, 1, 50),
+      minVolatilityPercent,
+      maxVolatilityPercent,
+      chopAdxFloor: floatFrom(env.TRADE_CHOP_ADX_FLOOR, 20, 0, 100),
+      chopEfficiencyFloor: floatFrom(env.TRADE_CHOP_EFFICIENCY_FLOOR, 0.3, 0, 1),
+    },
     maxNotionalDeviationRatio: floatFrom(env.TRADE_MAX_NOTIONAL_DEVIATION_RATIO, 1.5, 1, 4),
     minStopDistanceFraction: floatFrom(env.TRADE_MIN_STOP_DISTANCE_PCT, 0.0005, 0.0001, 0.05),
     halted: boolFrom(env.TRADE_HALT, false),
@@ -244,6 +323,8 @@ export function policySummary(policy: RiskPolicy) {
     maxOpenPositions: policy.maxOpenPositions,
     maxDailyLossUsdt: policy.maxDailyLossUsdt,
     symbolAllowlist: policy.symbolAllowlist,
+    discovery: policy.discovery,
+    scan: policy.scan,
     halted: policy.halted,
     mainnetAllowed: policy.allowMainnet,
     clientKeysAllowed: policy.allowClientProvidedKeys,

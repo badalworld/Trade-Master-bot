@@ -43,7 +43,7 @@ import {
   findProtectiveStop,
   planBracketEnforcement,
 } from './guardian.ts';
-import { isActionableSignal, scanUniverse } from './market-data.ts';
+import { scanUniverse, selectBestCandidate } from './market-data.ts';
 import { ledger } from './position-ledger.ts';
 import { loadRiskPolicy, type RiskPolicy } from './risk-policy.ts';
 import { envCredentials } from './trade-guard.ts';
@@ -94,7 +94,18 @@ export interface EngineStatus {
   ownedPositions: number;
   foreignPositions: string[];
   unprotectedPositions: string[];
-  lastScan: { at: number; ok: boolean; signals: number; failures: number } | null;
+  lastScan: {
+    at: number;
+    ok: boolean;
+    signals: number;
+    failures: number;
+    /** Stage-1 output: how much of the market was ranked, and where the board came from. */
+    board: { source: 'binance' | 'fallback'; universeSize: number; liquidCount: number } | null;
+    /** Pairs the funnel refused this cycle, by reason (choppy, vol-below-floor, ...). */
+    skipped: Record<string, number>;
+    /** True when a candidate was found and an entry was attempted. */
+    selected: string | null;
+  } | null;
   events: EngineEvent[];
   ledgerDurable: boolean;
 }
@@ -691,16 +702,56 @@ class TradeEngine {
         policy,
         skip: ledger.list().map((p) => p.symbol),
       });
+
+      // The board is the market-wide ranking; the shortlist below it is what was deep-scanned.
+      const skippedSummary = Object.entries(scan.skipped)
+        .map(([reason, count]) => `${count} ${reason}`)
+        .join(', ');
+
+      if (scan.board.source === 'fallback') {
+        this.log(
+          'WARN',
+          'DISCOVERY_FALLBACK',
+          `Market ranking unavailable (${scan.board.error ?? 'unknown error'}); scanning the built-in ${scan.requestedPairs.length} majors instead. No pair outside that list can be found until the exchange answers.`
+        );
+      }
+
+      // Fail closed: an entry needs an explicit tradeable=true from the exchange filters (checked in
+      // the selector) and must not be refused by the regime gate. The best signal score wins;
+      // volatility only breaks ties. This is the piece that used to pick the most volatile pair with
+      // any signal at all.
+      const candidate = selectBestCandidate(scan.signals, scan.tradeable);
+
       this.status = {
         ...this.status,
-        lastScan: { at: scan.timestamp, ok: scan.ok, signals: scan.signals.length, failures: scan.failures.length },
+        lastScan: {
+          at: scan.timestamp,
+          ok: scan.ok,
+          signals: scan.signals.length,
+          failures: scan.failures.length,
+          board: {
+            source: scan.board.source,
+            universeSize: scan.board.universeSize,
+            liquidCount: scan.board.liquidCount,
+          },
+          skipped: scan.skipped,
+          selected: candidate ? candidate.symbol : null,
+        },
       };
 
-      const candidate = scan.signals.find(
-        // Fail closed: an entry needs an explicit tradeable=true from the exchange filters, not just
-        // the absence of a false.
-        (sig) => isActionableSignal(sig) && scan.tradeable[sig.symbol] === true && sig.action !== 'HOLD'
-      );
+      if (!candidate && scan.ok) {
+        const ranked = scan.signals
+          .slice(0, 3)
+          .map((sig) => `${sig.symbol} ${sig.score}%${sig.scan?.skipReason ? ` (${sig.scan.skipReason})` : ''}`)
+          .join(', ');
+        this.log(
+          'INFO',
+          'NO_SETUP',
+          `${scan.signals.length} pairs deep-scanned from a board of ${scan.board.liquidCount} liquid pairs` +
+            `${skippedSummary ? ` · refused: ${skippedSummary}` : ''}` +
+            `${ranked ? ` · closest: ${ranked}` : ''}. Nothing met the entry threshold.`
+        );
+      }
 
       if (candidate) {
         const margin = ledger.snapshot().compounding.currentMargin;
@@ -797,8 +848,6 @@ class TradeEngine {
             this.log('WARN', 'ENTRY_SKIPPED', `${candidate.symbol}: ${f.code ?? 'rejected'} — ${f.error ?? 'no detail'}`);
           }
         }
-      } else if (scan.ok) {
-        this.log('INFO', 'NO_SETUP', `${scan.signals.length} pairs scanned, none met the entry threshold.`);
       }
     }
 

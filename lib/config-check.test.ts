@@ -24,7 +24,18 @@ function base(over: Partial<ConfigCheckInput> = {}): ConfigCheckInput {
     reachability: { testnet: reachable, mainnet: reachable },
     engine: { enabled: true, autoEntry: false, running: true },
     ledger: { durable: true, path: '/data/trade-ledger.json' },
-    policy: { halted: false, allowMainnet: false, maxMarginUsdt: 25, maxDailyLossUsdt: 50, maxOpenPositions: 5 },
+    policy: {
+      halted: false,
+      allowMainnet: false,
+      maxMarginUsdt: 25,
+      maxDailyLossUsdt: 50,
+      maxOpenPositions: 5,
+      // Discovery off + no allowlist = the built-in list, which is the quiet case here. The
+      // market-wide case is asserted on its own below, with the numbers it actually applied.
+      discovery: { enabled: false, topN: 40, minQuoteVolumeUsdt: 50_000_000 },
+      scan: { topN: 12, minVolatilityPercent: 0.6, maxVolatilityPercent: 4, chopAdxFloor: 20, chopEfficiencyFloor: 0.3 },
+      symbolAllowlist: ['BTCUSDT'],
+    },
     ...over,
   };
 }
@@ -181,4 +192,57 @@ test('only one of the two env keys set is a blocker', () => {
     })
   );
   assert.ok(codes(r).includes('PARTIAL_ENV_KEYS'));
+});
+
+test('the universe in force is always reported, because it decides what the bot can even see', () => {
+  const marketWide = buildConfigCheck(
+    base({
+      policy: {
+        ...base().policy,
+        symbolAllowlist: [],
+        discovery: { enabled: true, topN: 40, minQuoteVolumeUsdt: 50_000_000 },
+        scan: { topN: 12, minVolatilityPercent: 0.6, maxVolatilityPercent: 4, chopAdxFloor: 20, chopEfficiencyFloor: 0.3 },
+      },
+    })
+  );
+  const wide = marketWide.issues.find((i) => i.code === 'UNIVERSE_MARKET_WIDE');
+  assert.ok(wide, 'market-wide discovery must be stated, not implied');
+  assert.match(wide.detail, /\$50M/, 'the liquidity floor is named');
+  assert.match(wide.detail, /most volatile 12/, 'as is how many pairs get deep-scanned');
+  assert.match(wide.detail, /ADX<20 and ER<0\.3/, 'and the chop rule that guards it');
+  assert.match(wide.action, /TRADE_SYMBOL_ALLOWLIST/, 'the operator is told how to narrow it again');
+
+  const pinned = buildConfigCheck(
+    base({
+      policy: {
+        ...base().policy,
+        symbolAllowlist: [],
+        discovery: { enabled: false, topN: 40, minQuoteVolumeUsdt: 50_000_000 },
+      },
+    })
+  );
+  const fixed = pinned.issues.find((i) => i.code === 'UNIVERSE_FIXED_LIST');
+  assert.ok(fixed, 'a pinned universe must also be visible');
+  assert.match(fixed.action, /TRADE_DISCOVERY_ENABLED=true/);
+
+  // An explicit allowlist is neither case: the operator has already said which pairs.
+  const listed = buildConfigCheck(base());
+  assert.ok(!codes(listed).includes('UNIVERSE_MARKET_WIDE'));
+  assert.ok(!codes(listed).includes('UNIVERSE_FIXED_LIST'));
+});
+
+test('a volatility band that cannot be satisfied is a blocker, not a warning', () => {
+  const r = buildConfigCheck(
+    base({
+      policy: {
+        ...base().policy,
+        symbolAllowlist: ['BTCUSDT'],
+        scan: { topN: 12, minVolatilityPercent: 5, maxVolatilityPercent: 4, chopAdxFloor: 20, chopEfficiencyFloor: 0.3 },
+      },
+    })
+  );
+  const issue = r.issues.find((i) => i.code === 'VOLATILITY_BAND_EMPTY');
+  assert.ok(issue, 'a floor above the ceiling refuses every pair and must be called out');
+  assert.equal(issue.severity, 'blocker');
+  assert.match(issue.action, /TRADE_MIN_VOLATILITY_PCT=0\.6/);
 });

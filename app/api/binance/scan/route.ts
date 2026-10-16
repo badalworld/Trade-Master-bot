@@ -55,6 +55,21 @@ export async function GET(req: NextRequest) {
       weightSource,
       tradeable: scan.tradeable,
       rateLimitStatus: checkRateLimit(usedWeight, 1200, safetyCapRatio),
+      /** Stage-1 market ranking, so the UI can show what the whole market looked like. */
+      board: scan.board,
+      /** Universe + regime settings this scan actually applied (env, not client input). */
+      universe: {
+        discovered: scan.board.source === 'binance',
+        deepScanned: scan.requestedPairs.length,
+        /** Ranked liquid pairs that did not fit the shortlist this cycle (reported, not hidden). */
+        shortlistSkipped: scan.shortlistSkipped,
+        minQuoteVolumeUsdt: scan.board.minQuoteVolumeUsdt,
+        volatilityBand: { minPercent: policy.scan.minVolatilityPercent, maxPercent: policy.scan.maxVolatilityPercent },
+        chopFilter: { adxFloor: policy.scan.chopAdxFloor, efficiencyFloor: policy.scan.chopEfficiencyFloor },
+        allowlist: policy.symbolAllowlist,
+      },
+      /** Pairs the funnel refused this cycle, by reason — makes "no setup" self-explaining. */
+      skipped: scan.skipped,
       signals: scan.signals,
       candles: scan.candles,
     },

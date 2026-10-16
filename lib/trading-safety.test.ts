@@ -10,7 +10,13 @@ import {
   validateEntryBracket,
   type SymbolFilters,
 } from './exchange-specs.ts';
-import { dailyLossGate, loadRiskPolicy, positionModeViolation, validateOpenRequest } from './risk-policy.ts';
+import {
+  DEFAULT_SCANNED_SYMBOLS,
+  dailyLossGate,
+  loadRiskPolicy,
+  positionModeViolation,
+  validateOpenRequest,
+} from './risk-policy.ts';
 
 const BTC: SymbolFilters = {
   stepSize: 0.001,
@@ -259,17 +265,41 @@ test('B4: daily loss breaker keys on exchange realized PnL', () => {
   assert.equal(fine.ok, true);
 });
 
-test('B4: position cap and symbol allowlist are enforced server-side', () => {
-  const policy = loadRiskPolicy({});
+test('B4: position cap is enforced server-side', () => {
+  const policy = loadRiskPolicy({ TRADE_DISCOVERY_ENABLED: 'false' });
   const capped = validateOpenRequest(policy, { ...base, openPositionsCount: 5 });
   assert.equal(capped.ok, false);
   if (capped.ok) return;
   assert.ok(capped.violations.some((v) => v.code === 'MAX_OPEN_POSITIONS'));
+});
 
-  const offlist = validateOpenRequest(policy, { ...base, symbol: 'MEMECOINUSDT' });
-  assert.equal(offlist.ok, false);
-  if (offlist.ok) return;
-  assert.ok(offlist.violations.some((v) => v.code === 'SYMBOL_NOT_ALLOWED'));
+test('B4b: the symbol gate has three deliberate modes, and the strict ones still refuse an off-list pair', () => {
+  // 1. An explicit allowlist is honoured whatever discovery is doing.
+  const listed = loadRiskPolicy({ TRADE_SYMBOL_ALLOWLIST: 'BTCUSDT, ETHUSDT' });
+  const offList = validateOpenRequest(listed, { ...base, symbol: 'MEMECOINUSDT' });
+  assert.equal(offList.ok, false);
+  if (offList.ok) return;
+  assert.ok(offList.violations.some((v) => v.code === 'SYMBOL_NOT_ALLOWED'));
+  assert.equal(validateOpenRequest(listed, { ...base, symbol: 'ETHUSDT' }).ok, true, 'the listed pair still trades');
+
+  // 2. Discovery OFF with no list is the old behaviour: the built-in majors, enforced at the order
+  //    layer as well as in the scanner.
+  const legacy = loadRiskPolicy({ TRADE_DISCOVERY_ENABLED: 'false' });
+  assert.deepEqual(legacy.symbolAllowlist, [...DEFAULT_SCANNED_SYMBOLS]);
+  const legacyOffList = validateOpenRequest(legacy, { ...base, symbol: 'MEMECOINUSDT' });
+  assert.equal(legacyOffList.ok, false, 'turning discovery off must narrow the universe again');
+  if (legacyOffList.ok) return;
+  assert.ok(legacyOffList.violations.some((v) => v.code === 'SYMBOL_NOT_ALLOWED'));
+
+  // 3. Discovery ON with no list = the market itself is the universe. That is a deliberate widening
+  //    (the operator asked to trade the best opportunity in the whole market), and what bounds it is
+  //    the scan funnel: only pairs on the ranked board are ever evaluated, the regime gate refuses
+  //    chop/out-of-band pairs, and `selectBestCandidate` refuses anything not marked tradeable.
+  //    Covered end-to-end in lib/market-data.test.ts.
+  const discovered = loadRiskPolicy({});
+  assert.deepEqual(discovered.symbolAllowlist, [], 'no list, no restriction: the board is the universe');
+  assert.equal(validateOpenRequest(discovered, { ...base, symbol: 'MEMECOINUSDT' }).ok, true);
+  assert.equal(discovered.discovery.enabled, true, 'and that is only true while discovery is on');
 });
 
 // ---------------------------------------------------------------------------

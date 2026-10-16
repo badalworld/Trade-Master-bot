@@ -79,7 +79,15 @@ export interface EngineStatusPayload {
     ownedPositions: number;
     foreignPositions: string[];
     unprotectedPositions: string[];
-    lastScan: { at: number; ok: boolean; signals: number; failures: number } | null;
+    lastScan: {
+      at: number;
+      ok: boolean;
+      signals: number;
+      failures: number;
+      board: { source: 'binance' | 'fallback'; universeSize: number; liquidCount: number } | null;
+      skipped: Record<string, number>;
+      selected: string | null;
+    } | null;
     events: Array<{ at: number; level: 'INFO' | 'WARN' | 'ERROR' | 'SUCCESS'; kind: string; message: string }>;
     ledgerDurable: boolean;
   };
@@ -270,6 +278,31 @@ export function EngineStatusPanel({ state, loading, error, onAction, onToggleAut
                 </div>
               ))}
             </div>
+
+            {e.lastScan && (
+              <div className="p-3 rounded-md border border-slate-800 bg-slate-950/50 text-[11px] font-mono text-slate-400 space-y-1">
+                <div>
+                  <span className="text-cyan-300 font-semibold">Last scan</span> · {fmtAgo(e.lastScan.at, nowMs)} ·{' '}
+                  {e.lastScan.board?.source === 'binance'
+                    ? `ranked ${e.lastScan.board.liquidCount} liquid of ${e.lastScan.board.universeSize} perps`
+                    : 'market ranking unavailable — built-in majors used'}
+                  {' → '}
+                  <span className="text-slate-200">{e.lastScan.signals} deep-scanned</span>
+                  {e.lastScan.failures > 0 ? ` · ${e.lastScan.failures} with no candles` : ''}
+                </div>
+                <div>
+                  {e.lastScan.selected ? (
+                    <span className="text-emerald-300">Selected {e.lastScan.selected} (best score inside the band)</span>
+                  ) : (
+                    <span className="text-slate-500">No pair met the entry rules this cycle</span>
+                  )}
+                  {Object.keys(e.lastScan.skipped ?? {}).length > 0 &&
+                    ` · refused: ${Object.entries(e.lastScan.skipped)
+                      .map(([reason, count]) => `${count} ${reason}`)
+                      .join(', ')}`}
+                </div>
+              </div>
+            )}
 
             {unprotected.length > 0 && (
               <div className="flex items-start gap-2 p-3 rounded-md border border-rose-800 bg-rose-950/40 text-[11px] text-rose-200">
