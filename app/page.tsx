@@ -574,6 +574,14 @@ export default function HomePage() {
           orderPlacementAllowed: data.policy ? !data.policy.halted : undefined,
           mainnetAllowed: data.policy?.mainnetAllowed,
         });
+        // Keep the browser's own network view in lockstep with the server's. They used to be
+        // independent: the badge read the server while the start log read localStorage, so a
+        // deployment on testnet could announce "STARTED on MAINNET (REAL MONEY)" — or, far worse,
+        // a mainnet deployment could start with no real-money warning at all.
+        if (data.active) {
+          const serverIsTestnet = data.isTestnet !== false;
+          setSettings((prev) => (prev.isTestnet === serverIsTestnet ? prev : { ...prev, isTestnet: serverIsTestnet }));
+        }
       } catch {
         /* server unreachable — leave current session view alone */
       }
@@ -1486,7 +1494,9 @@ export default function HomePage() {
           return true;
         }
 
-        appendLog('ERROR', 'ERROR', `Credential verification failed: ${data.error || 'Binance rejected the key'}`);
+        const detail = data.error || 'Binance rejected the key';
+        // The route now classifies the failure, so surface the remedy too instead of a bare error.
+        appendLog('ERROR', 'ERROR', `Credential verification failed: ${detail}${data.hint ? ` Fix: ${data.hint}` : ''}`);
         return false;
       } catch (err) {
         appendLog('ERROR', 'ERROR', `Credential verification error: ${(err as Error).message}`);
@@ -1533,7 +1543,11 @@ export default function HomePage() {
         setActiveTab('settings');
         return;
       }
-      if (!activeSettings.isTestnet) {
+      // Past this point `session.active` is guaranteed. The server decides which network orders
+      // actually go to (env keys or the verified session), so the warning and the log report the
+      // server's network — a stale localStorage toggle must never be able to hide a real-money start.
+      const effectiveIsTestnet = session.isTestnet;
+      if (!effectiveIsTestnet) {
         appendLog(
           'SYSTEM',
           'WARN',
@@ -1542,7 +1556,7 @@ export default function HomePage() {
       }
 
       if (updatedSettings) {
-        applyUpdatedSettings(updatedSettings);
+        applyUpdatedSettings({ ...updatedSettings, isTestnet: effectiveIsTestnet });
       }
       setBotActive(true);
       setActiveTab('positions');
@@ -1552,10 +1566,10 @@ export default function HomePage() {
       appendLog(
         'SYSTEM',
         'SUCCESS',
-        `Trade Master bot STARTED on ${activeSettings.isTestnet ? 'TESTNET (paper)' : 'MAINNET (REAL MONEY)'}: scanning 5m pairs every ${activeSettings.scanIntervalSeconds || 15}s with $${activeSettings.baseMargin.toFixed(2)} base margin (${activeSettings.leverage}x isolated).`
+        `Trade Master bot STARTED on ${effectiveIsTestnet ? 'TESTNET (paper)' : 'MAINNET (REAL MONEY)'}: scanning 5m pairs every ${activeSettings.scanIntervalSeconds || 15}s with $${activeSettings.baseMargin.toFixed(2)} base margin (${activeSettings.leverage}x isolated).`
       );
     },
-    [settings, session.active, runMarketScan, appendLog, syncBinanceAccount, applyUpdatedSettings]
+    [settings, session.active, session.isTestnet, runMarketScan, appendLog, syncBinanceAccount, applyUpdatedSettings]
   );
 
   const handlePauseBot = useCallback(() => {

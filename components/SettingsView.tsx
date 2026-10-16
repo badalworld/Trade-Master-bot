@@ -327,8 +327,21 @@ export function SettingsView({
                   )}
                 </div>
                 <p className="text-[10px] text-slate-500 leading-snug">
-                  Your key and secret are held in server memory behind an httpOnly cookie — never in
-                  localStorage, never sent back to the browser, never written to disk.
+                  {session.source === 'env' ? (
+                    <>
+                      These credentials come from the server environment
+                      (<span className="font-mono text-slate-400">BINANCE_API_KEY</span>/
+                      <span className="font-mono text-slate-400">BINANCE_API_SECRET</span>), so the
+                      network above is decided by the server value of{' '}
+                      <span className="font-mono text-slate-400">BINANCE_TESTNET</span> — not by
+                      anything in this browser. Changing it requires a redeploy.
+                    </>
+                  ) : (
+                    <>
+                      Your key and secret are held in server memory behind an httpOnly cookie — never
+                      in localStorage, never sent back to the browser, never written to disk.
+                    </>
+                  )}
                 </p>
                 <div className="flex gap-2 pt-1">
                   <button
@@ -356,6 +369,14 @@ export function SettingsView({
               <div className="space-y-3">
                 <div>
                   <span className="block text-xs font-medium text-slate-300 mb-1.5">Credentials target</span>
+                  {session.source === 'env' && (
+                    <p className="text-[10px] text-amber-300/90 mb-1.5 leading-snug">
+                      Ignored while the server holds its own keys: this deployment targets{' '}
+                      <span className="font-mono">{session.isTestnet ? 'testnet' : 'MAINNET'}</span> from{' '}
+                      <span className="font-mono">BINANCE_TESTNET</span>. Browser keys are refused with
+                      ENV_CREDENTIALS_ACTIVE.
+                    </p>
+                  )}
                   <div className="grid grid-cols-2 gap-2">
                     <button
                       type="button"
