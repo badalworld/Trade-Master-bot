@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+.aistudio
+coverage
+env/
+venv/
+.env*
+!.env.example
+*.log
+AUDIT-LIVE-TRADING.md
+DEPLOYMENT.md
+current_view.png

@@ -1,7 +1,11 @@
 node_modules/
 .next/
+*.tsbuildinfo
 coverage/
 .DS_Store
 *.log
 .env*
 !.env.example
+
+# server-side trade ledger + engine state (position/PnL data, never commit)
+.data/

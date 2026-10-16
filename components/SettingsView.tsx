@@ -17,8 +17,7 @@ import {
 } from 'lucide-react';
 
 export interface BotSettings {
-  apiKey: string;
-  apiSecret: string;
+  /** false = Binance mainnet (real money) — gated by the server policy as well as this UI. */
   isTestnet: boolean;
   baseMargin: number; // default $2.00
   leverage: number; // default 10x (10x - 15x isolated)
@@ -28,10 +27,23 @@ export interface BotSettings {
   rateLimitSafetyCap: number; // default 95%
 }
 
+export interface CredentialSession {
+  active: boolean;
+  source: 'env' | 'session' | 'none';
+  isTestnet: boolean;
+  keyHint?: string | null;
+  expiresInMs?: number | null;
+  orderPlacementAllowed?: boolean;
+  mainnetAllowed?: boolean;
+}
+
 interface SettingsViewProps {
   settings: BotSettings;
   onUpdateSettings: (newSettings: BotSettings) => void;
-  onTestConnection: (overrideSettings?: BotSettings) => Promise<void>;
+  session: CredentialSession;
+  onConnectCredentials: (apiKey: string, apiSecret: string, isTestnet: boolean) => Promise<boolean>;
+  onDisconnectCredentials: () => Promise<void>;
+  onTestConnection: () => Promise<void>;
   isTestingConnection: boolean;
   connectionResult: {
     tested: boolean;
@@ -51,6 +63,9 @@ interface SettingsViewProps {
 export function SettingsView({
   settings,
   onUpdateSettings,
+  session,
+  onConnectCredentials,
+  onDisconnectCredentials,
   onTestConnection,
   isTestingConnection,
   connectionResult,
@@ -59,6 +74,12 @@ export function SettingsView({
   onPauseBot,
 }: SettingsViewProps) {
   const [localSettings, setLocalSettings] = useState<BotSettings>(settings);
+  // Held in component state only: never persisted, never mirrored into settings/localStorage.
+  const [draftKey, setDraftKey] = useState<string>('');
+  const [draftSecret, setDraftSecret] = useState<string>('');
+  const [draftTestnet, setDraftTestnet] = useState<boolean>(settings.isTestnet);
+  const [isConnecting, setIsConnecting] = useState<boolean>(false);
+  const [mainnetAck, setMainnetAck] = useState<string>('');
   const [showSecret, setShowSecret] = useState<boolean>(false);
   const [isSaved, setIsSaved] = useState<boolean>(false);
   const [validationError, setValidationError] = useState<string | null>(null);
@@ -94,6 +115,7 @@ export function SettingsView({
     e.preventDefault();
     const normalized: BotSettings = {
       ...localSettings,
+      isTestnet: draftTestnet,
       baseMargin: Math.max(1, Number(localSettings.baseMargin) || 2.0),
       leverage: Math.min(15, Math.max(10, Math.round(Number(localSettings.leverage) || 10))),
     };
@@ -105,12 +127,21 @@ export function SettingsView({
   };
 
   const handleSaveAndStart = () => {
-    if (!localSettings.apiKey.trim() || !localSettings.apiSecret.trim()) {
-      setValidationError('Please input your Binance API Key and Secret Key before starting the bot.');
+    if (!session.active) {
+      setValidationError('Connect a Binance API key (Settings → Binance Connection) before starting the bot.');
+      return;
+    }
+    if (!session.isTestnet && !session.mainnetAllowed) {
+      setValidationError('These are mainnet keys, but this server has not enabled live order placement (TRADE_ALLOW_MAINNET). Run on testnet first.');
+      return;
+    }
+    if (session.orderPlacementAllowed === false) {
+      setValidationError('The server reports new entries are halted (TRADE_HALT). Clear the halt before starting the bot.');
       return;
     }
     const normalized: BotSettings = {
       ...localSettings,
+      isTestnet: draftTestnet,
       baseMargin: Math.max(1, Number(localSettings.baseMargin) || 2.0),
       leverage: Math.min(15, Math.max(10, Math.round(Number(localSettings.leverage) || 10))),
     };
@@ -121,7 +152,29 @@ export function SettingsView({
     onStartBot(normalized);
   };
 
-  const hasCredentials = Boolean(localSettings.apiKey.trim() && localSettings.apiSecret.trim());
+  const hasCredentials = session.active;
+  const mainnetConfirmed =
+    draftTestnet || mainnetAck.trim().toUpperCase() === 'I UNDERSTAND';
+
+  const handleConnect = async () => {
+    if (!draftKey.trim() || !draftSecret.trim()) {
+      setValidationError('Enter both the API key and the secret key to open a session.');
+      return;
+    }
+    if (!draftTestnet && !mainnetConfirmed) {
+      setValidationError('Type I UNDERSTAND to confirm these are MAINNET keys controlling real funds.');
+      return;
+    }
+    setValidationError(null);
+    setIsConnecting(true);
+    const ok = await onConnectCredentials(draftKey.trim(), draftSecret.trim(), draftTestnet);
+    setIsConnecting(false);
+    if (ok) {
+      // Wipe the secrets from the DOM immediately after the server has taken them.
+      setDraftKey('');
+      setDraftSecret('');
+    }
+  };
 
   return (
     <motion.div
@@ -201,55 +254,195 @@ export function SettingsView({
                   Binance Futures API
                 </h4>
               </div>
-              <div className="text-xs font-mono font-bold text-emerald-400 px-2.5 py-1 rounded bg-emerald-950/60 border border-emerald-800 flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                REAL LIVE PRODUCTION (0% SIMULATION)
+              <div
+                className={`text-xs font-mono font-bold px-2.5 py-1 rounded flex items-center gap-1.5 border ${
+                  session.isTestnet
+                    ? 'text-amber-300 bg-amber-950/60 border-amber-800'
+                    : 'text-rose-300 bg-rose-950/60 border-rose-700'
+                }`}
+                title={session.isTestnet ? 'Paper trading on Binance Futures Testnet' : 'REAL MONEY on Binance mainnet'}
+              >
+                <span
+                  className={`w-2 h-2 rounded-full animate-pulse ${session.isTestnet ? 'bg-amber-400' : 'bg-rose-400'}`}
+                />
+                {session.isTestnet ? 'TESTNET · PAPER FUNDS' : 'MAINNET · REAL MONEY'}
               </div>
             </div>
 
-            <div>
-              <label className="block text-xs font-medium text-slate-300 mb-1">
-                API Key <span className="text-rose-400">*</span>
-              </label>
-              <input
-                type="text"
-                value={localSettings.apiKey}
-                onChange={(e) => {
-                  setLocalSettings({ ...localSettings, apiKey: e.target.value.trim() });
-                  setValidationError(null);
-                }}
-                placeholder="Paste your Binance Futures API Key"
-                className="w-full bg-slate-950 border border-slate-700/80 rounded-md px-3 py-2 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-cyan-400"
-              />
-            </div>
+            {session.active ? (
+              <div className="p-3 rounded-lg bg-slate-950/80 border border-emerald-800/60 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
+                    <Shield className="w-4 h-4 text-emerald-400" />
+                    Binance session active
+                  </span>
+                  <span className="text-[10px] font-mono text-slate-400">
+                    {session.source === 'env' ? 'server env keys' : 'httpOnly cookie · 8h'}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-[11px] font-mono text-slate-400">
+                  <div>
+                    Key{' '}
+                    <span className="text-slate-200">{session.keyHint || 'configured'}</span>
+                  </div>
+                  <div>
+                    Network{' '}
+                    <span className={session.isTestnet ? 'text-amber-300' : 'text-rose-300'}>
+                      {session.isTestnet ? 'testnet' : 'MAINNET'}
+                    </span>
+                  </div>
+                  {typeof session.expiresInMs === 'number' && session.expiresInMs > 0 && (
+                    <div className="col-span-2">
+                      Expires in{' '}
+                      <span className="text-slate-200">
+                        {Math.round(session.expiresInMs / 60000)} min
+                      </span>
+                    </div>
+                  )}
+                </div>
+                <p className="text-[10px] text-slate-500 leading-snug">
+                  Your key and secret are held in server memory behind an httpOnly cookie — never in
+                  localStorage, never sent back to the browser, never written to disk.
+                </p>
+                <div className="flex gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDraftKey('');
+                      setDraftSecret('');
+                    }}
+                    className="flex-1 py-1.5 px-2 text-[11px] rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                  >
+                    Replace keys
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void onDisconnectCredentials()}
+                    className="flex-1 py-1.5 px-2 text-[11px] rounded bg-rose-950/70 hover:bg-rose-900/70 text-rose-300 border border-rose-800"
+                  >
+                    Revoke session
+                  </button>
+                </div>
+              </div>
+            ) : null}
 
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="block text-xs font-medium text-slate-300">
-                  Secret Key <span className="text-rose-400">*</span>
-                </label>
+            {!session.active || draftKey !== '' || draftSecret !== '' ? (
+              <div className="space-y-3">
+                <div>
+                  <span className="block text-xs font-medium text-slate-300 mb-1.5">Credentials target</span>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDraftTestnet(true);
+                        setLocalSettings({ ...localSettings, isTestnet: true });
+                      }}
+                      className={`px-2 py-1.5 rounded-md text-[11px] font-mono font-bold border transition-colors ${
+                        draftTestnet
+                          ? 'bg-amber-500/20 border-amber-600 text-amber-200'
+                          : 'bg-slate-900 border-slate-800 text-slate-500 hover:text-slate-300'
+                      }`}
+                    >
+                      TESTNET (paper)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDraftTestnet(false);
+                        setLocalSettings({ ...localSettings, isTestnet: false });
+                      }}
+                      className={`px-2 py-1.5 rounded-md text-[11px] font-mono font-bold border transition-colors ${
+                        !draftTestnet
+                          ? 'bg-rose-500/20 border-rose-600 text-rose-200'
+                          : 'bg-slate-900 border-slate-800 text-slate-500 hover:text-slate-300'
+                      }`}
+                    >
+                      MAINNET (real money)
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    API Key <span className="text-rose-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={draftKey}
+                    onChange={(e) => {
+                      setDraftKey(e.target.value.trim());
+                      setValidationError(null);
+                    }}
+                    placeholder="Paste your Binance Futures API Key"
+                    className="w-full bg-slate-950 border border-slate-700/80 rounded-md px-3 py-2 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-cyan-400"
+                  />
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs font-medium text-slate-300">
+                      Secret Key <span className="text-rose-400">*</span>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setShowSecret(!showSecret)}
+                      className="text-[11px] text-cyan-400 hover:text-cyan-300 flex items-center gap-1"
+                    >
+                      {showSecret ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                      {showSecret ? 'Hide' : 'Reveal'}
+                    </button>
+                  </div>
+                  <div className="relative">
+                    <input
+                      type={showSecret ? 'text' : 'password'}
+                      autoComplete="new-password"
+                      spellCheck={false}
+                      value={draftSecret}
+                      onChange={(e) => {
+                        setDraftSecret(e.target.value.trim());
+                        setValidationError(null);
+                      }}
+                      placeholder="Paste your Binance Futures Secret Key"
+                      className="w-full bg-slate-950 border border-slate-700/80 rounded-md px-3 py-2 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-cyan-400"
+                    />
+                  </div>
+                </div>
+
+                {!draftTestnet && (
+                  <div className="p-3 rounded-lg border border-rose-800 bg-rose-950/40 space-y-2">
+                    <p className="text-[11px] text-rose-200 font-semibold">
+                      Mainnet places REAL orders with REAL money on Binance Futures at leverage.
+                    </p>
+                    <p className="text-[10px] text-rose-300/80 leading-snug">
+                      The strategy has no backtest and no completed live trades. Recommended path:
+                      run on testnet until you have reviewed real fills, then flip to mainnet.
+                    </p>
+                    <input
+                      type="text"
+                      value={mainnetAck}
+                      onChange={(e) => {
+                        setMainnetAck(e.target.value);
+                        setValidationError(null);
+                      }}
+                      placeholder='Type I UNDERSTAND to enable mainnet keys'
+                      className="w-full bg-slate-950 border border-rose-800/70 rounded-md px-3 py-2 text-xs font-mono text-rose-100 placeholder:text-rose-400/50 focus:outline-none focus:border-rose-400"
+                    />
+                  </div>
+                )}
+
                 <button
                   type="button"
-                  onClick={() => setShowSecret(!showSecret)}
-                  className="text-[11px] text-cyan-400 hover:text-cyan-300 flex items-center gap-1"
+                  onClick={() => void handleConnect()}
+                  disabled={isConnecting || !draftKey.trim() || !draftSecret.trim() || !mainnetConfirmed}
+                  className="interactive-glow-btn w-full py-2 px-3 text-xs font-semibold text-slate-950 bg-cyan-400 hover:bg-cyan-300 rounded-md transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                 >
-                  {showSecret ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
-                  {showSecret ? 'Hide' : 'Reveal'}
+                  <RefreshCw className={`w-3.5 h-3.5 ${isConnecting ? 'animate-spin' : ''}`} />
+                  {isConnecting ? 'Verifying with Binance…' : 'Verify & open session'}
                 </button>
               </div>
-              <div className="relative">
-                <input
-                  type={showSecret ? 'text' : 'password'}
-                  value={localSettings.apiSecret}
-                  onChange={(e) => {
-                    setLocalSettings({ ...localSettings, apiSecret: e.target.value.trim() });
-                    setValidationError(null);
-                  }}
-                  placeholder="Paste your Binance Futures Secret Key"
-                  className="w-full bg-slate-950 border border-slate-700/80 rounded-md px-3 py-2 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-cyan-400"
-                />
-              </div>
-            </div>
+            ) : null}
 
             {/* Server IP Whitelisting Helper */}
             {serverIp && (
@@ -287,8 +480,8 @@ export function SettingsView({
             <div className="pt-1">
               <button
                 type="button"
-                onClick={() => onTestConnection(localSettings)}
-                disabled={isTestingConnection || !hasCredentials}
+                onClick={() => onTestConnection()}
+                disabled={isTestingConnection}
                 className="interactive-glow-btn w-full py-2 px-3 text-xs font-medium text-slate-100 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md flex items-center justify-center gap-2 transition-colors disabled:opacity-50"
               >
                 <RefreshCw

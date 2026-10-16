@@ -9,6 +9,7 @@ import {
   ArrowUpRight,
   ArrowDownRight,
   Loader2,
+  AlertTriangle,
 } from 'lucide-react';
 import type { TradePosition } from '@/lib/trading-engine';
 import { formatCryptoPrice } from '@/lib/utils';
@@ -111,6 +112,23 @@ export function ActivePositions({
                             )}
                             {pos.side}
                           </span>
+                          {pos.adoptedFromExchange ? (
+                            <span
+                              title="Discovered on Binance; this browser did not open it. Its stop-loss/take-profit are whatever is configured on the exchange, not here."
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-950/70 text-amber-300 border border-amber-800/60"
+                            >
+                              <AlertTriangle className="w-3 h-3" />
+                              FROM BINANCE
+                            </span>
+                          ) : !pos.slOrderId ? (
+                            <span
+                              title="No stop-loss order id was recorded for this position. Verify a protective stop exists on Binance, or close it."
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono bg-rose-950/70 text-rose-300 border border-rose-800/70"
+                            >
+                              <AlertTriangle className="w-3 h-3" />
+                              NO STOP RECORDED
+                            </span>
+                          ) : null}
                         </div>
                         <div className="text-[11px] text-slate-500 font-sans mt-0.5">
                           Qty: {pos.quantity}
@@ -118,7 +136,9 @@ export function ActivePositions({
                       </td>
 
                       <td className="py-3 px-3 tabular-nums">
-                        <div className="text-slate-200 font-medium">${pos.margin.toFixed(2)}</div>
+                        <div className="text-slate-200 font-medium">
+                          ${Number.isFinite(pos.margin) ? pos.margin.toFixed(2) : '0.00'}
+                        </div>
                         <div className="text-[11px] text-cyan-400">{pos.leverage}x</div>
                       </td>
 

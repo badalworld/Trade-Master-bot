@@ -1,82 +1,104 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-export async function GET(req: NextRequest) {
-  let publicIpv4 = 'Unknown';
-  let source = 'detection';
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-  // 1. Try public IP lookup services
-  const ipServices = [
-    'https://api.ipify.org?format=json',
-    'https://api4.my-ip.io/ip.json',
-    'https://ipv4.icanhazip.com',
-  ];
+const IP_SERVICES = [
+  { url: 'https://api.ipify.org?format=json', kind: 'json' as const },
+  { url: 'https://api4.my-ip.io/ip.json', kind: 'json' as const },
+  { url: 'https://checkip.amazonaws.com', kind: 'text' as const },
+  { url: 'https://ipv4.icanhazip.com', kind: 'text' as const },
+];
 
-  for (const url of ipServices) {
+const isPrivateOrLoopback = (ip: string): boolean =>
+  /^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.)/.test(ip) ||
+  ip.includes(':') ||
+  ip === 'localhost';
+
+/**
+ * Reports the egress IP to whitelist on Binance.
+ *
+ * The previous version returned a *hardcoded, invented* address when detection failed and presented
+ * it as trustworthy guidance — telling a user to whitelist an IP they do not own would either break
+ * their keys or grant access to someone else's range. Detection failure now reports `null` and says so.
+ */
+export async function GET(_req: NextRequest) {
+  const warnings: string[] = [];
+  let ipv4: string | null = null;
+  let source: 'egress-probe' | 'proxy-header' | 'unknown' = 'unknown';
+  const attempts: { url: string; ok: boolean; detail: string }[] = [];
+
+  for (const service of IP_SERVICES) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 2500);
+      const timer = setTimeout(() => controller.abort(), 2500);
+      const res = await fetch(service.url, { signal: controller.signal, cache: 'no-store' });
+      clearTimeout(timer);
 
-      const res = await fetch(url, { signal: controller.signal });
-      clearTimeout(timeout);
-
-      if (res.ok) {
-        if (url.includes('json')) {
-          const data = await res.json();
-          const foundIp = data.ip || data.IPv4;
-          if (foundIp && !foundIp.includes(':')) {
-            publicIpv4 = foundIp.trim();
-            source = 'cloud-egress';
-            break;
-          }
-        } else {
-          const text = await res.text();
-          const clean = text.trim();
-          if (clean && !clean.includes(':')) {
-            publicIpv4 = clean;
-            source = 'cloud-egress';
-            break;
-          }
-        }
+      if (!res.ok) {
+        attempts.push({ url: service.url, ok: false, detail: `HTTP ${res.status}` });
+        continue;
       }
-    } catch {
-      // Continue to next service
+
+      let candidate = '';
+      if (service.kind === 'json') {
+        const data = (await res.json().catch(() => null)) as { ip?: string; IPv4?: string } | null;
+        candidate = (data?.ip || data?.IPv4 || '').trim();
+      } else {
+        candidate = (await res.text()).trim();
+      }
+
+      if (candidate && /^(\d{1,3}\.){3}\d{1,3}$/.test(candidate) && !isPrivateOrLoopback(candidate)) {
+        ipv4 = candidate;
+        source = 'egress-probe';
+        attempts.push({ url: service.url, ok: true, detail: candidate });
+        break;
+      }
+      attempts.push({ url: service.url, ok: false, detail: `unusable value "${candidate.slice(0, 32)}"` });
+    } catch (err) {
+      attempts.push({ url: service.url, ok: false, detail: (err as Error).message });
     }
   }
 
-  // 2. If external services fail, extract public IPv4 from headers (ignore loopback/private IPs)
-  if (publicIpv4 === 'Unknown') {
-    const forwarded = req.headers.get('x-forwarded-for');
-    if (forwarded) {
-      const first = forwarded.split(',')[0].trim();
-      const isPrivateOrLoopback =
-        first.includes(':') ||
-        first.startsWith('127.') ||
-        first.startsWith('10.') ||
-        first.startsWith('192.168.') ||
-        first === 'localhost';
-      if (!isPrivateOrLoopback) {
-        publicIpv4 = first;
-        source = 'request-header';
-      }
+  // Server-side egress can differ from the proxy-visible client IP, so a header value is only a
+  // hint and is never presented as an address to whitelist.
+  if (!ipv4) {
+    const forwarded = _req.headers.get('x-forwarded-for');
+    const first = forwarded?.split(',')[0]?.trim();
+    if (first && !isPrivateOrLoopback(first)) {
+      warnings.push(
+        `Could not probe egress IP directly. Request arrived via proxy header x-forwarded-for=${first}; that is the CLIENT address, not this server's egress address — do not whitelist it for Binance.`
+      );
     }
+    warnings.push('Egress IP could not be determined from this environment.');
   }
 
-  // 3. Fallback to clean realistic static server IPv4 if behind private proxy
-  if (publicIpv4 === 'Unknown' || publicIpv4.includes(':')) {
-    publicIpv4 = '34.87.142.92'; // Standard Google Cloud Run egress IPv4 format
-    source = 'gateway';
+  const isEphemeralEgress = !ipv4;
+  if (isEphemeralEgress) {
+    warnings.push(
+      'On serverless platforms (Cloud Run included) egress IP is usually ephemeral unless you provision a dedicated VPC connector / static egress IP. Prefer a static IP, or a key with no IP binding plus tight permissions.'
+    );
   }
 
   return NextResponse.json({
-    ipv4: publicIpv4,
+    ipv4,
+    verified: source === 'egress-probe',
     source,
-    binanceWhitelistingInstructions: [
-      'Log into Binance > Account > API Management',
-      'Select your Trade Master API Key and click "Edit Restrictions"',
-      'Under "IP Access Restriction", choose "Restrict access to trusted IPs only (Recommended)"',
-      `Paste the IP (${publicIpv4}) and click Save`,
-      'Ensure "Enable Futures" permission is checked in the API settings',
-    ],
+    attempts,
+    warnings,
+    binanceWhitelistingInstructions: ipv4
+      ? [
+          'Log into Binance > Account > API Management',
+          'Select your Trade Master API key and click "Edit Restrictions"',
+          'Under "IP Access Restriction", choose "Restrict access to trusted IPs only (Recommended)"',
+          `Paste exactly this verified address: ${ipv4}`,
+          'Enable "Futures" permission only — disable "Withdraw" and "Enable Spot & Margin Trading"',
+        ]
+      : [
+          'Do NOT whitelist an IP you have not verified — a wrong entry either locks you out or grants access to a stranger.',
+          'Option A (recommended): provision a static egress IP for this service (e.g. Cloud Run VPC connector) and re-run this check.',
+          'Option B: keep "No restrictions" but scope the key to Futures only, set a per-key limit, and keep a separate withdrawal-disabled key.',
+        ],
     timestamp: new Date().toISOString(),
   });
 }

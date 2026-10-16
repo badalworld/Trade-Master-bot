@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { Header } from '@/components/Header';
 import { KpiMetricsStrip, type BinanceAccountMetrics } from '@/components/KpiMetricsStrip';
 import { ActivePositions } from '@/components/ActivePositions';
@@ -11,7 +12,9 @@ import { DiagnosticsLog, type LogEntry } from '@/components/DiagnosticsLog';
 import { SettingsView, type BotSettings } from '@/components/SettingsView';
 import { PnlChartWidget } from '@/components/PnlChartWidget';
 import { TradeResultOverlay, type TradeResultPayload } from '@/components/TradeResultOverlay';
+import { EngineStatusPanel, type EngineStatusPayload } from '@/components/EngineStatusPanel';
 import { generateUniqueId } from '@/lib/utils';
+import type { CredentialSession } from '@/components/SettingsView';
 import {
   calculateNextTradeMargin,
   canOpenNewTrade,
@@ -38,9 +41,8 @@ const STORAGE_KEYS = {
 
 // Initial default settings matching user requirements ($2 Base Margin, 10x-15x Isolated Leverage)
 const DEFAULT_SETTINGS: BotSettings = {
-  apiKey: '',
-  apiSecret: '',
-  isTestnet: false,
+  // Testnet is the default: a fresh deploy must never be pointed at real money by accident.
+  isTestnet: true,
   baseMargin: 2.0, // $2.00 base margin
   leverage: 10, // 10x isolated leverage (10x-15x supported)
   maxOpenTrades: 5, // max 5 concurrent trades
@@ -48,6 +50,30 @@ const DEFAULT_SETTINGS: BotSettings = {
   scanIntervalSeconds: 15, // 15s scan
   rateLimitSafetyCap: 95, // 95% threshold
 };
+
+const SESSION_NONE: CredentialSession = {
+  active: false,
+  source: 'none',
+  isTestnet: true,
+};
+
+/**
+ * Every mutating call carries `X-TM-Request` so the cookie-authenticated endpoints reject anything
+ * a cross-site form or fetch could reproduce, and no call ever carries API keys.
+ */
+async function apiPost<T extends Record<string, unknown>>(
+  path: string,
+  payload: Record<string, unknown> = {}
+): Promise<{ ok: boolean; status: number; data: T }> {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-TM-Request': '1' },
+    credentials: 'same-origin',
+    body: JSON.stringify(payload),
+  });
+  const data = (await res.json().catch(() => ({}))) as T;
+  return { ok: res.ok, status: res.status, data };
+}
 
 const INITIAL_POSITIONS: TradePosition[] = [];
 const INITIAL_TRADES: ClosedTrade[] = [];
@@ -76,6 +102,7 @@ export default function HomePage() {
   // Bot Core State
   const [botActive, setBotActive] = useState<boolean>(false);
   const [settings, setSettings] = useState<BotSettings>(DEFAULT_SETTINGS);
+  const [session, setSession] = useState<CredentialSession>(SESSION_NONE);
   const [selectedSymbol, setSelectedSymbol] = useState<string>('BTCUSDT');
 
   // Binance Account Auto-Sync State (Starting Balance, Current Equity, Fees, Funding)
@@ -121,6 +148,11 @@ export default function HomePage() {
   });
   const [logs, setLogs] = useState<LogEntry[]>(INITIAL_LOGS);
 
+  // Server-side guardian: authoritative position protection + ledger, alive without this tab.
+  const [engineState, setEngineState] = useState<EngineStatusPayload | null>(null);
+  const [engineLoading, setEngineLoading] = useState<boolean>(false);
+  const [engineError, setEngineError] = useState<string | null>(null);
+
   // Connection Test
   const [isTestingConnection, setIsTestingConnection] = useState<boolean>(false);
   const [connectionResult, setConnectionResult] = useState<{
@@ -139,6 +171,14 @@ export default function HomePage() {
 
   // Track in-flight automated closes so a single position isn't closed twice concurrently
   const closingIdsRef = useRef<Set<string>>(new Set());
+  // ...and in-flight opens/scans, which previously had no lock at all: two overlapping scan cycles
+  // could submit the same live entry twice.
+  const scanInFlightRef = useRef<boolean>(false);
+  // Symbols the server engine is actively guarding. The browser monitor stands down for those so a
+  // trade is never closed (or booked) twice.
+  const engineManagedRef = useRef<Set<string>>(new Set());
+  // Signals already submitted this session, so a re-render can't re-fire an order.
+  const submittedSignalsRef = useRef<Set<string>>(new Set());
 
   // Global Interactive Mouse-Move Spotlight & Button Glow Tracker (Jitter Interactive-Button-Glow)
   useEffect(() => {
@@ -195,6 +235,23 @@ export default function HomePage() {
         let parsedSettings: Partial<BotSettings> | null = null;
         if (savedSettings) {
           parsedSettings = JSON.parse(savedSettings);
+
+          // Older builds persisted the raw API key/secret in this blob. Scrub it: browser storage is
+          // not a keystore, and anything written there should be treated as exposed.
+          const legacy = parsedSettings as Record<string, unknown>;
+          if (legacy && (legacy.apiKey || legacy.apiSecret)) {
+            delete legacy.apiKey;
+            delete legacy.apiSecret;
+            localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(parsedSettings));
+            setTimeout(() => {
+              appendLog(
+                'SYSTEM',
+                'WARN',
+                'Removed a Binance API key/secret that an earlier version had saved in this browser. Delete that key on Binance (API Management) and re-add it via Settings — treat it as exposed.'
+              );
+            }, 0);
+          }
+          if (legacy && typeof legacy.isTestnet === 'undefined') legacy.isTestnet = true;
           setSettings((prev) => ({
             ...prev,
             ...parsedSettings,
@@ -258,7 +315,7 @@ export default function HomePage() {
     }, 0);
 
     return () => clearTimeout(timer);
-  }, []);
+  }, [appendLog]);
 
   // Helper to apply updated settings and sync CompoundingState
   const applyUpdatedSettings = useCallback((newSet: BotSettings) => {
@@ -306,21 +363,15 @@ export default function HomePage() {
 
   // 3. BINANCE ACCOUNT AUTO-SYNC (Fetches Starting Balance, Equity, Platform Fees, Funding Fees & Live Positions)
   const syncBinanceAccount = useCallback(async () => {
-    if (!settings.apiKey || !settings.apiSecret) return;
-
     try {
-      const res = await fetch('/api/binance/sync-account', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          apiKey: settings.apiKey,
-          apiSecret: settings.apiSecret,
-          isTestnet: settings.isTestnet,
-        }),
-      });
+      const { ok, status, data } = await apiPost<Record<string, any>>('/api/binance/sync-account', {});
 
-      if (res.ok) {
-        const data = await res.json();
+      if (status === 401 || status === 403) {
+        setSession((prev) => (prev.active ? { ...prev, active: false, source: 'none' } : prev));
+        return;
+      }
+
+      if (ok) {
         if (typeof data.usedWeight === 'number') {
           setRateLimitStatus(
             checkRateLimit(data.usedWeight, 1200, (settings.rateLimitSafetyCap || 95) / 100)
@@ -350,7 +401,10 @@ export default function HomePage() {
             };
           });
 
-          // Reconcile open positions markPrice & unrealizedPnl with live Binance positions
+          // Reconcile open positions markPrice & unrealizedPnl with live Binance positions, and
+          // adopt any exchange position this browser doesn't know about (new device, cleared
+          // storage, or a position the exchange bracket opened). Blindness to a live position is
+          // worse than a duplicate row.
           if (Array.isArray(data.positions) && data.positions.length > 0) {
             setPositions((prevPositions) => {
               const liveBySymbol = new Map<
@@ -370,7 +424,54 @@ export default function HomePage() {
                 liveBySymbol.set(lp.symbol, lp);
               }
 
-              return prevPositions.map((pos) => {
+              const knownSymbols = new Set(prevPositions.map((p) => p.symbol));
+              const adopted: TradePosition[] = data.positions
+                .filter((lp: { symbol: string; quantity: number }) => {
+                  if (knownSymbols.has(lp.symbol)) return false;
+                  return Math.abs(Number(lp.quantity) || 0) > 0;
+                })
+                .map((lp: {
+                  symbol: string;
+                  side: 'LONG' | 'SHORT';
+                  quantity: number;
+                  entryPrice: number;
+                  markPrice: number;
+                  unrealizedProfit: number;
+                  leverage: number;
+                  margin: number;
+                }) => {
+                  const unrealizedPnl = Number(lp.unrealizedProfit.toFixed(2));
+                  return {
+                    id: `exch-${lp.symbol}-${Math.round(lp.entryPrice * 1000)}`,
+                    symbol: lp.symbol,
+                    side: lp.side,
+                    entryPrice: lp.entryPrice,
+                    markPrice: lp.markPrice,
+                    margin: lp.margin,
+                    leverage: lp.leverage || settings.leverage,
+                    quantity: Math.abs(lp.quantity),
+                    // Unknown from here: brackets live on the exchange. Zero means "no local
+                    // monitor", not "no stop" — ActivePositions flags these rows.
+                    stopLoss: 0,
+                    takeProfit: 0,
+                    unrealizedPnl,
+                    unrealizedPnlPercent: lp.margin > 0 ? Number(((unrealizedPnl / lp.margin) * 100).toFixed(2)) : 0,
+                    entryTime: Date.now(),
+                    adoptedFromExchange: true,
+                  };
+                });
+
+              if (adopted.length > 0) {
+                setTimeout(() => {
+                  appendLog(
+                    'SYSTEM',
+                    'WARN',
+                    `Adopted ${adopted.length} live Binance position(s) not present in this browser: ${adopted.map((a) => `${a.symbol} ${a.side} x${a.quantity}`).join(', ')}. No local TP/SL is set for them — check their brackets on Binance.`
+                  );
+                }, 0);
+              }
+
+              return [...prevPositions.map((pos) => {
                 const liveMatch = liveBySymbol.get(pos.symbol);
                 if (!liveMatch) return pos;
                 const markPrice = liveMatch.markPrice > 0 ? liveMatch.markPrice : pos.markPrice;
@@ -391,29 +492,157 @@ export default function HomePage() {
                   unrealizedPnl,
                   unrealizedPnlPercent,
                 };
-              });
+              }), ...adopted];
             });
           }
         }
       }
     } catch {
-      // Background sync silent fail
+      // Background sync is best-effort; failures are surfaced by the next scan instead.
     }
-  }, [settings.apiKey, settings.apiSecret, settings.isTestnet, settings.rateLimitSafetyCap]);
+  }, [settings.rateLimitSafetyCap, settings.leverage, appendLog]);
 
-  // Auto-sync account immediately on valid credentials and every 30s
+  // Refresh the server-side session/policy state (never stores keys client-side).
   useEffect(() => {
-    if (settings.apiKey && settings.apiSecret) {
-      const initialTimer = setTimeout(() => {
-        syncBinanceAccount();
-      }, 0);
-      const interval = setInterval(syncBinanceAccount, 30000);
-      return () => {
-        clearTimeout(initialTimer);
-        clearInterval(interval);
-      };
+    let alive = true;
+    const load = async () => {
+      try {
+        const res = await fetch('/api/binance/credentials', { credentials: 'same-origin', cache: 'no-store' });
+        const data = await res.json();
+        if (!alive || !res.ok) return;
+        setSession({
+          active: Boolean(data.active),
+          source: data.source ?? 'none',
+          isTestnet: data.isTestnet !== false,
+          keyHint: data.keyHint ?? null,
+          expiresInMs: data.expiresInMs ?? null,
+          orderPlacementAllowed: data.policy ? !data.policy.halted : undefined,
+          mainnetAllowed: data.policy?.mainnetAllowed,
+        });
+      } catch {
+        /* server unreachable — leave current session view alone */
+      }
+    };
+    load();
+    const interval = setInterval(load, 120000);
+    return () => {
+      alive = false;
+      clearInterval(interval);
+    };
+  }, []);
+
+  // Auto-sync account whenever a server session exists, every 30s.
+  useEffect(() => {
+    if (!session.active) return;
+    const initialTimer = setTimeout(() => {
+      syncBinanceAccount();
+    }, 0);
+    const interval = setInterval(syncBinanceAccount, 30000);
+    return () => {
+      clearTimeout(initialTimer);
+      clearInterval(interval);
+    };
+  }, [session.active, session.isTestnet, syncBinanceAccount]);
+
+  const refreshEngineStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/engine/status', {
+        headers: { 'X-TM-Request': '1' },
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      const data = (await res.json().catch(() => null)) as EngineStatusPayload | null;
+      if (res.ok && data) {
+        setEngineState(data);
+        setEngineError(null);
+        engineManagedRef.current = new Set(
+          (data.ledger?.openPositions ?? []).filter((p) => !p.foreign).map((p) => p.symbol)
+        );
+      } else {
+        setEngineError(data ? JSON.stringify(data).slice(0, 160) : `HTTP ${res.status}`);
+      }
+    } catch (err) {
+      setEngineError((err as Error).message);
+    } finally {
+      setEngineLoading(false);
     }
-  }, [settings.apiKey, settings.apiSecret, syncBinanceAccount]);
+  }, []);
+
+  useEffect(() => {
+    // Scheduled rather than called inline so the effect itself performs no state update.
+    const kick = setTimeout(() => void refreshEngineStatus(), 250);
+    const interval = setInterval(() => void refreshEngineStatus(), 10000);
+    return () => {
+      clearTimeout(kick);
+      clearInterval(interval);
+    };
+  }, [refreshEngineStatus]);
+
+  const onRefreshEngine = React.useCallback(() => {
+    setEngineLoading(true);
+    void refreshEngineStatus();
+  }, [refreshEngineStatus]);
+
+  const handleEngineAction = useCallback(
+    async (action: 'start' | 'stop' | 'halt-entries' | 'resume-entries' | 'flatten-all'): Promise<string | null> => {
+      try {
+        const { ok, data } = await apiPost<Record<string, unknown>>('/api/engine/control', {
+          action,
+          ...(action === 'flatten-all' ? { confirm: 'FLATTEN' } : {}),
+        });
+        await refreshEngineStatus();
+        appendLog(
+          'SYSTEM',
+          ok ? 'SUCCESS' : 'WARN',
+          `Engine ${action}: ${String(data.message ?? data.error ?? (ok ? 'done' : 'failed'))}`
+        );
+        return ok ? null : String(data.error ?? data.message ?? 'Engine action failed');
+      } catch (err) {
+        return (err as Error).message;
+      }
+    },
+    [appendLog, refreshEngineStatus]
+  );
+
+  /** Register a UI-opened position with the server guardian so it survives this tab closing. */
+  const trackWithEngine = useCallback(async (pos: TradePosition) => {
+    try {
+      await apiPost('/api/engine/track', pos as unknown as Record<string, unknown>);
+    } catch {
+      /* the local ledger stays authoritative; the panel will show if tracking failed */
+    }
+  }, []);
+
+  const untrackWithEngine = useCallback(async (symbol: string) => {
+    try {
+      await fetch(`/api/engine/track?symbol=${encodeURIComponent(symbol)}`, {
+        method: 'DELETE',
+        headers: { 'X-TM-Request': '1' },
+        credentials: 'same-origin',
+      });
+    } catch {
+      /* best effort */
+    }
+  }, []);
+
+  /** One switch, no redeploy: let the server open trades unattended (still fully policy-gated). */
+  const handleToggleAutopilot = useCallback(
+    async (enabled: boolean, confirm?: string): Promise<string | null> => {
+      const { ok, data } = await apiPost<Record<string, unknown>>('/api/engine/control', {
+        action: 'set-auto-entry',
+        enabled,
+        ...(confirm ? { confirm } : {}),
+      });
+      await refreshEngineStatus();
+      appendLog(
+        'SYSTEM',
+        ok ? (enabled ? 'WARN' : 'INFO') : 'ERROR',
+        `Autopilot: ${String(data.message ?? data.error ?? 'no response')}`
+      );
+      return ok ? null : String(data.error ?? data.message ?? 'Could not change autopilot state');
+    },
+    [appendLog, refreshEngineStatus]
+  );
 
   // Execute a position close on Binance and record trade history + compounding
   const finalizePositionClose = useCallback(
@@ -428,31 +657,49 @@ export default function HomePage() {
 
       let finalExitPrice = exitPrice;
 
-      // Submit real close order to Binance Futures API if credentials are set
-      if (settings.apiKey && settings.apiSecret) {
+      // Flatten on the exchange through the guarded endpoint. The server closes the *live*
+      // position size it reads from Binance, so a stale local quantity can't leave a residual.
+      if (session.active) {
         try {
-          const closeRes = await fetch('/api/binance/execute', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              apiKey: settings.apiKey,
-              apiSecret: settings.apiSecret,
-              isTestnet: settings.isTestnet,
-              action: 'CLOSE',
-              symbol: pos.symbol,
-              side: pos.side,
-              quantity: pos.quantity,
-              price: exitPrice,
-            }),
+          const { ok, status, data: closeData } = await apiPost<Record<string, any>>('/api/binance/execute', {
+            action: 'CLOSE',
+            symbol: pos.symbol,
+            side: pos.side,
+            price: exitPrice,
           });
-          if (closeRes.ok) {
-            const closeData = await closeRes.json();
-            if (closeData.avgPrice && Number(closeData.avgPrice) > 0) {
-              finalExitPrice = Number(closeData.avgPrice);
+
+          if (status === 401 || status === 403) {
+            setSession((prev) => ({ ...prev, active: false, source: 'none' }));
+            appendLog('ERROR', 'ERROR', `Not authorized to close ${pos.symbol} on Binance — reconnect your API session in Settings. Local bookkeeping only.`);
+          } else if (ok && closeData.success) {
+            if (Number(closeData.avgPrice) > 0) finalExitPrice = Number(closeData.avgPrice);
+            if (closeData.noPosition && engineManagedRef.current.has(pos.symbol)) {
+              // The engine already settled this trade against the exchange income ledger. Booking it
+              // again here from local prices would double-count PnL and corrupt the compounding step.
+              appendLog('ORDER', 'INFO', `${pos.symbol} was settled by the server engine (see the engine log); not re-booked locally.`);
+              engineManagedRef.current.delete(pos.symbol);
+              setPositions((prev) => prev.filter((p) => p.id !== pos.id));
+              closingIdsRef.current.delete(pos.id);
+              setClosingPositionId(null);
+              void untrackWithEngine(pos.symbol);
+              return;
+            }
+            if (closeData.noPosition) {
+              appendLog('ORDER', 'INFO', `${pos.symbol} was already flat on Binance (exchange bracket fired). Recorded locally at $${roundCryptoPrice(finalExitPrice)}.`);
+            }
+            void untrackWithEngine(pos.symbol);
+          } else if (!ok) {
+            appendLog('ERROR', 'ERROR', `Binance close failed for ${pos.symbol}: ${closeData.error || 'unknown error'}. Position may still be OPEN on the exchange — check Binance now.`);
+            // Do not erase local tracking of a position the exchange says is still there.
+            if (closeData.residualQty) {
+              closingIdsRef.current.delete(pos.id);
+              setClosingPositionId(null);
+              return;
             }
           }
-        } catch {
-          // Proceed with local close state update if exchange already closed via TP/SL order
+        } catch (err) {
+          const e = err as Error;
+          appendLog('ERROR', 'ERROR', `Binance close request errored for ${pos.symbol}: ${e.message}. Verify position state on Binance.`);
         }
       }
 
@@ -529,14 +776,24 @@ export default function HomePage() {
       setClosingPositionId(null);
       syncBinanceAccount();
     },
-    [appendLog, settings.apiKey, settings.apiSecret, settings.isTestnet, syncBinanceAccount]
+    [appendLog, session.active, syncBinanceAccount, untrackWithEngine]
   );
 
   // Scan Market Pairs
   const runMarketScan = useCallback(async () => {
-    if (!settings.apiKey || !settings.apiSecret) {
-      setSignals([]);
-      setIsScanning(false);
+    // Two overlapping cycles used to be able to submit the same live entry twice: closes had an
+    // in-flight lock, opens had nothing.
+    if (scanInFlightRef.current) return;
+    scanInFlightRef.current = true;
+
+    if (botActive && !session.active) {
+      scanInFlightRef.current = false;
+      setBotActive(false);
+      appendLog(
+        'ERROR',
+        'ERROR',
+        'Binance session is not active on the server — bot PAUSED and no orders will be sent. Reconnect your API key in Settings.'
+      );
       return;
     }
 
@@ -548,17 +805,33 @@ export default function HomePage() {
         `API rate limit reached ${rateLimitStatus.usagePercent.toFixed(1)}% (>=${safetyCap}% safety cap). Halting scan cycle and waiting for cooldown.`
       );
       setIsScanning(false);
+      scanInFlightRef.current = false;
       return;
     }
 
     setIsScanning(true);
     try {
-      const res = await fetch(
-        `/api/binance/scan?testnet=${settings.isTestnet}&safetyCap=${safetyCap}`
-      );
-      if (res.ok) {
-        const data = await res.json();
-        if (data.signals && Array.isArray(data.signals)) {
+      // The server derives testnet/mainnet from the session, so the scanner can never evaluate a
+      // different market from the one the executor trades.
+      const res = await fetch(`/api/binance/scan?safetyCap=${safetyCap}`, {
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      const data = await res.json().catch(() => null);
+      if (data && Array.isArray(data.failures) && data.failures.length > 0) {
+        appendLog(
+          'SCAN',
+          'WARN',
+          `${data.failures.length}/${(data.requestedPairs || []).length || data.failures.length} pairs returned no usable candles (${data.failures
+            .slice(0, 3)
+            .map((f: { pair: string; error: string }) => `${f.pair}: ${f.error}`)
+            .join('; ')}).`
+        );
+      }
+      if (!res.ok && (!data || !Array.isArray(data.signals))) {
+        appendLog('ERROR', 'ERROR', `Market scan failed: ${data?.error || `HTTP ${res.status}`}. No orders sent this cycle.`);
+      }
+      if (data && data.signals && Array.isArray(data.signals)) {
           setSignals(data.signals);
           if (data.candles) {
             setCandlesMap(data.candles);
@@ -582,6 +855,11 @@ export default function HomePage() {
               const topCandidate = data.signals.find(
                 (s: SignalEvaluation) =>
                   !openSymbols.has(s.symbol) &&
+                  // The server refuses symbols with no exchange filter data; don't even try.
+                  (data.tradeable ? data.tradeable[s.symbol] !== false : true) &&
+                  !submittedSignalsRef.current.has(
+                    `${s.symbol}:${s.action}:${s.currentPrice}`
+                  ) &&
                   (s.signal === 'STRONG_BUY' ||
                     s.signal === 'STRONG_SELL' ||
                     (s.signal === 'BUY' && s.score >= 65) ||
@@ -600,39 +878,66 @@ export default function HomePage() {
                 const entryPrice = topCandidate.currentPrice;
 
                 try {
-                  const execRes = await fetch('/api/binance/execute', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      apiKey: settings.apiKey,
-                      apiSecret: settings.apiSecret,
-                      isTestnet: settings.isTestnet,
+                  const signalId = `${topCandidate.symbol}:${topCandidate.action}:${topCandidate.currentPrice}:${topCandidate.score}`;
+                  submittedSignalsRef.current.add(signalId);
+
+                  const { ok, status, data: execData } = await apiPost<Record<string, any>>(
+                    '/api/binance/execute',
+                    {
                       action: 'OPEN',
                       symbol: topCandidate.symbol,
-                      side: topCandidate.action, // mapped to BUY/SELL in execute route
+                      side: topCandidate.action, // mapped to BUY/SELL in the execute route
                       margin: tradeMargin,
                       leverage,
                       price: entryPrice,
                       stopLoss: topCandidate.slPrice,
                       takeProfit: topCandidate.tpPrice,
-                    }),
-                  });
+                      // One signal -> one order. A replayed cycle is rejected server-side.
+                      idempotencyKey: generateUniqueId('sig'),
+                    }
+                  );
 
-                  const execData = await execRes.json();
-                  if (!execRes.ok || !execData.success) {
+                  if (status === 401 || status === 403) {
+                    setBotActive(false);
+                    setSession((prev) => ({ ...prev, active: false, source: 'none' }));
+                    appendLog('ERROR', 'ERROR', `Execution unauthorized (${status}). Bot paused — reconnect your API session in Settings.`);
+                    return;
+                  }
+
+                  if (!ok || !execData.success) {
+                    const violations = Array.isArray(execData.violations)
+                      ? ` ${execData.violations.map((v: { message: string }) => v.message).join(' | ')}`
+                      : '';
+
+                    // The server says an order DID reach Binance even though the call failed:
+                    // stop trading, adopt the real position, and surface the exposure loudly.
+                    if (execData.orderPlaced) {
+                      setBotActive(false);
+                      appendLog(
+                        'ERROR',
+                        'ERROR',
+                        `⚠ AMBIGUOUS EXECUTION (${execData.code || 'UNKNOWN'}): ${execData.error} Bot paused so no further entries are sent.`
+                      );
+                      void syncBinanceAccount();
+                      return;
+                    }
+
                     appendLog(
                       'ERROR',
                       'ERROR',
-                      `Binance Live Order Failed: ${execData.error || 'API Rejected Order'}`
+                      `Binance live order NOT placed: ${execData.error || execData.code || 'API rejected the order'}.${violations}`
                     );
                     return;
                   }
 
                   const fillPrice = parseFloat(execData.avgPrice) || entryPrice;
-                  const notional = tradeMargin * leverage;
-                  const quantity =
-                    parseFloat(execData.executedQty) ||
-                    Number((notional / fillPrice).toFixed(4));
+                  const quantity = parseFloat(execData.executedQty) || 0;
+                  // Book what the exchange actually did — LOT_SIZE/MIN_NOTIONAL rounding can change
+                  // the committed notional, and the compounding ladder must follow reality.
+                  const bookedMargin =
+                    Number(execData.effectiveMargin) > 0
+                      ? Number(execData.effectiveMargin)
+                      : tradeMargin;
 
                   const newPosition: TradePosition = {
                     id: String(execData.orderId || generateUniqueId('pos')),
@@ -640,11 +945,14 @@ export default function HomePage() {
                     side: topCandidate.action as 'LONG' | 'SHORT',
                     entryPrice: fillPrice,
                     markPrice: fillPrice,
-                    margin: tradeMargin,
-                    leverage,
-                    quantity: quantity > 0 ? quantity : 0.001,
-                    stopLoss: topCandidate.slPrice,
-                    takeProfit: topCandidate.tpPrice,
+                    margin: bookedMargin,
+                    leverage: Number(execData.leverage) || leverage,
+                    quantity:
+                      quantity > 0
+                        ? quantity
+                        : Number(((bookedMargin * leverage) / fillPrice).toFixed(6)),
+                    stopLoss: Number(execData.stopLoss) || topCandidate.slPrice,
+                    takeProfit: Number(execData.takeProfit) || topCandidate.tpPrice,
                     unrealizedPnl: 0,
                     unrealizedPnlPercent: 0,
                     entryTime: Date.now(),
@@ -664,13 +972,19 @@ export default function HomePage() {
                     appendLog(
                       'ORDER',
                       'SUCCESS',
-                      `LIVE BINANCE ORDER EXECUTED: ${topCandidate.action} (${execData.orderSide || (topCandidate.action === 'LONG' ? 'BUY' : 'SELL')}) on ${topCandidate.symbol} at $${newPosition.entryPrice}. Margin: $${tradeMargin.toFixed(2)} (${leverage}x Isolated). Indicator TP: $${topCandidate.tpPrice} / SL: $${topCandidate.slPrice}. Order ID: ${execData.orderId}`,
+                      `${execData.network === 'testnet' ? 'TESTNET' : 'LIVE MAINNET'} ORDER FILLED: ${execData.orderSide || topCandidate.action} ${newPosition.quantity} ${topCandidate.symbol} @ $${newPosition.entryPrice}. Notional $${Number(execData.effectiveNotional).toFixed(2)} / margin $${bookedMargin.toFixed(2)} @ ${newPosition.leverage}x isolated. SL $${newPosition.stopLoss} on exchange${execData.slOrderId ? ' ✓' : ' ✗ MISSING'} · TP $${newPosition.takeProfit}${execData.tpOrderId ? ' ✓' : ' (not placed)'}. Order ${execData.orderId}`,
                       {
                         signal: topCandidate.signal,
                         score: topCandidate.score,
+                        sizingNotes: execData.sizingNotes,
+                        bracketWarning: execData.bracketWarning,
                         reasons: topCandidate.reasons,
                       }
                     );
+                    if (execData.bracketWarning) {
+                      appendLog('SYSTEM', 'WARN', `Trade Master: ${execData.bracketWarning}`);
+                    }
+                    void trackWithEngine(newPosition);
                     syncBinanceAccount();
                   }
                 } catch (apiErr: unknown) {
@@ -692,7 +1006,6 @@ export default function HomePage() {
               );
             }
           }
-        }
       }
     } catch (err: unknown) {
       const error = err as Error;
@@ -700,6 +1013,7 @@ export default function HomePage() {
     } finally {
       setIsScanning(false);
       setScanCountdown(settings.scanIntervalSeconds || 15);
+      scanInFlightRef.current = false;
     }
   }, [
     botActive,
@@ -707,15 +1021,14 @@ export default function HomePage() {
     positions,
     rateLimitStatus.isThrottled,
     rateLimitStatus.usagePercent,
-    settings.apiKey,
-    settings.apiSecret,
-    settings.isTestnet,
+    session.active,
     settings.leverage,
     settings.maxOpenTrades,
     settings.rateLimitSafetyCap,
     settings.scanIntervalSeconds,
     appendLog,
     syncBinanceAccount,
+    trackWithEngine,
   ]);
 
   const runMarketScanRef = useRef(runMarketScan);
@@ -784,7 +1097,13 @@ export default function HomePage() {
             }
           }
 
-          if ((isHitTP || isHitSL) && !closingIdsRef.current.has(pos.id)) {
+          if (
+            (isHitTP || isHitSL) &&
+            !closingIdsRef.current.has(pos.id) &&
+            // The server engine owns this one: two brains acting on one position means a duplicated
+            // close and a double-booked trade in history.
+            !engineManagedRef.current.has(pos.symbol)
+          ) {
             toClose.push({
               pos: { ...pos, markPrice: currentPrice, unrealizedPnl, unrealizedPnlPercent },
               exitPrice: currentPrice,
@@ -822,6 +1141,12 @@ export default function HomePage() {
   // Manual Trade Execution from Scanner
   const handleManualExecute = useCallback(
     async (sig: SignalEvaluation) => {
+      if (!session.active) {
+        appendLog('ORDER', 'WARN', 'No active Binance session on the server — open one in Settings before placing a manual order.');
+        setActiveTab('settings');
+        return;
+      }
+
       const check = canOpenNewTrade(positions.length, settings.maxOpenTrades);
       if (!check.allowed) {
         appendLog('ORDER', 'WARN', `Cannot open trade: ${check.reason}`);
@@ -832,13 +1157,9 @@ export default function HomePage() {
       const leverage = Math.min(15, Math.max(10, settings.leverage || 10));
 
       try {
-        const execRes = await fetch('/api/binance/execute', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            apiKey: settings.apiKey,
-            apiSecret: settings.apiSecret,
-            isTestnet: settings.isTestnet,
+        const { ok, status, data: execData } = await apiPost<Record<string, any>>(
+          '/api/binance/execute',
+          {
             action: 'OPEN',
             symbol: sig.symbol,
             side: sig.action,
@@ -847,23 +1168,36 @@ export default function HomePage() {
             price: sig.currentPrice,
             stopLoss: sig.slPrice,
             takeProfit: sig.tpPrice,
-          }),
-        });
+            idempotencyKey: generateUniqueId('man'),
+          }
+        );
 
-        const execData = await execRes.json();
-        if (!execRes.ok || !execData.success) {
+        if (status === 401 || status === 403) {
+          setSession((prev) => ({ ...prev, active: false, source: 'none' }));
+          appendLog('ERROR', 'ERROR', 'Execution unauthorized — reconnect your API session in Settings.');
+          setActiveTab('settings');
+          return;
+        }
+
+        if (!ok || !execData.success) {
+          if (execData.orderPlaced) {
+            setBotActive(false);
+            appendLog('ERROR', 'ERROR', `⚠ AMBIGUOUS EXECUTION (${execData.code || 'UNKNOWN'}): ${execData.error}. Bot paused.`);
+            void syncBinanceAccount();
+            return;
+          }
           appendLog(
             'ERROR',
             'ERROR',
-            `Binance Live Order Failed: ${execData.error || 'API Rejected Order'}`
+            `Binance live order NOT placed: ${execData.error || execData.code || 'API rejected the order'}`
           );
           return;
         }
 
         const entryPrice = parseFloat(execData.avgPrice) || sig.currentPrice;
-        const notional = tradeMargin * leverage;
-        const quantity =
-          parseFloat(execData.executedQty) || Number((notional / entryPrice).toFixed(4));
+        const quantity = parseFloat(execData.executedQty) || 0;
+        const bookedMargin =
+          Number(execData.effectiveMargin) > 0 ? Number(execData.effectiveMargin) : tradeMargin;
 
         const newPos: TradePosition = {
           id: String(execData.orderId || generateUniqueId('pos')),
@@ -871,11 +1205,12 @@ export default function HomePage() {
           side: sig.action as 'LONG' | 'SHORT',
           entryPrice,
           markPrice: entryPrice,
-          margin: tradeMargin,
-          leverage,
-          quantity: quantity > 0 ? quantity : 0.001,
-          stopLoss: sig.slPrice,
-          takeProfit: sig.tpPrice,
+          margin: bookedMargin,
+          leverage: Number(execData.leverage) || leverage,
+          quantity:
+            quantity > 0 ? quantity : Number(((bookedMargin * leverage) / entryPrice).toFixed(6)),
+          stopLoss: Number(execData.stopLoss) || sig.slPrice,
+          takeProfit: Number(execData.takeProfit) || sig.tpPrice,
           unrealizedPnl: 0,
           unrealizedPnlPercent: 0,
           entryTime: Date.now(),
@@ -895,8 +1230,12 @@ export default function HomePage() {
           appendLog(
             'ORDER',
             'SUCCESS',
-            `LIVE BINANCE MANUAL ORDER EXECUTED: ${sig.action} on ${sig.symbol} at $${entryPrice}. Margin: $${tradeMargin.toFixed(2)} (${leverage}x Isolated). Indicator TP: $${sig.tpPrice} / SL: $${sig.slPrice}. Order ID: ${execData.orderId}`
+            `${execData.network === 'testnet' ? 'TESTNET' : 'LIVE MAINNET'} MANUAL ORDER FILLED: ${execData.orderSide} ${quantity} ${sig.symbol} @ $${entryPrice}. Notional $${Number(execData.effectiveNotional).toFixed(2)} (margin $${bookedMargin.toFixed(2)} @ ${leverage}x). SL $${sig.slPrice}${execData.slOrderId ? ' on exchange ✓' : ' ✗ MISSING'} · TP $${sig.tpPrice}${execData.tpOrderId ? ' ✓' : ' (not placed)'}. Order ID: ${execData.orderId}`
           );
+          if (execData.bracketWarning) {
+            appendLog('SYSTEM', 'WARN', `Trade Master: ${execData.bracketWarning}`);
+          }
+          void trackWithEngine(newPos);
           syncBinanceAccount();
         }
       } catch (apiErr: unknown) {
@@ -908,32 +1247,29 @@ export default function HomePage() {
       appendLog,
       compoundingState.currentMargin,
       positions.length,
-      settings.apiKey,
-      settings.apiSecret,
-      settings.isTestnet,
+      session.active,
       settings.leverage,
       settings.maxOpenTrades,
       syncBinanceAccount,
+      trackWithEngine,
     ]
   );
 
   // Test Binance Connection
-  const handleTestConnection = async (overrideSettings?: BotSettings) => {
-    const active = overrideSettings || settings;
+  const handleTestConnection = async () => {
     setIsTestingConnection(true);
     try {
-      const res = await fetch('/api/binance/test-connection', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          apiKey: active.apiKey,
-          apiSecret: active.apiSecret,
-          isTestnet: active.isTestnet,
-        }),
-      });
+      const { ok, data } = await apiPost<Record<string, any>>('/api/binance/test-connection', {});
 
-      const data = await res.json();
-      if (res.ok) {
+      if (data?.policy) {
+        setSession((prev) => ({
+          ...prev,
+          orderPlacementAllowed: !data.policy.halted,
+          mainnetAllowed: data.policy.mainnetAllowed,
+        }));
+      }
+
+      if (ok) {
         const isOk = Boolean(data.auth?.valid);
         setConnectionResult({
           tested: true,
@@ -977,6 +1313,57 @@ export default function HomePage() {
     }
   };
 
+  const handleConnectCredentials = useCallback(
+    async (apiKey: string, apiSecret: string, isTestnet: boolean) => {
+      try {
+        const { ok, data } = await apiPost<Record<string, any>>('/api/binance/credentials', {
+          apiKey,
+          apiSecret,
+          isTestnet,
+        });
+
+        if (ok && data.success) {
+          setSession({
+            active: true,
+            source: 'session',
+            isTestnet: Boolean(data.network === 'testnet'),
+            keyHint: data.keyHint ?? null,
+          });
+          setSettings((prev) => ({ ...prev, isTestnet: data.network !== 'mainnet' }));
+          appendLog(
+            'SYSTEM',
+            data.network === 'mainnet' ? 'WARN' : 'SUCCESS',
+            `Binance ${data.network} credentials verified. ${data.message}`
+          );
+          void syncBinanceAccount();
+          return true;
+        }
+
+        appendLog('ERROR', 'ERROR', `Credential verification failed: ${data.error || 'Binance rejected the key'}`);
+        return false;
+      } catch (err) {
+        appendLog('ERROR', 'ERROR', `Credential verification error: ${(err as Error).message}`);
+        return false;
+      }
+    },
+    [appendLog, syncBinanceAccount]
+  );
+
+  const handleDisconnectCredentials = useCallback(async () => {
+    try {
+      await fetch('/api/binance/credentials', {
+        method: 'DELETE',
+        headers: { 'X-TM-Request': '1' },
+        credentials: 'same-origin',
+      });
+    } catch {
+      /* still drop local view */
+    }
+    setBotActive(false);
+    setSession({ active: false, source: 'none', isTestnet: true });
+    appendLog('SYSTEM', 'WARN', 'Binance credential session revoked on the server. Bot stopped; no further orders will be sent.');
+  }, [appendLog]);
+
   // Performance calculations
   const totalPnl = closedTrades.reduce((acc, t) => acc + t.pnl, 0);
   const winningTrades = closedTrades.filter((t) => t.isWin).length;
@@ -990,14 +1377,21 @@ export default function HomePage() {
   const handleStartBot = useCallback(
     (updatedSettings?: BotSettings) => {
       const activeSettings = updatedSettings || settings;
-      if (!activeSettings.apiKey || !activeSettings.apiSecret) {
+      if (!session.active) {
         appendLog(
           'SYSTEM',
           'WARN',
-          'Cannot start bot: Please enter your Binance Futures API Key and Secret in Settings first.'
+          'Cannot start bot: no verified Binance session on the server. Open one in Settings first.'
         );
         setActiveTab('settings');
         return;
+      }
+      if (!activeSettings.isTestnet) {
+        appendLog(
+          'SYSTEM',
+          'WARN',
+          'MAINNET START: this bot will send real orders with real funds. Confirm your stop-loss policy and available balance on Binance before proceeding.'
+        );
       }
 
       if (updatedSettings) {
@@ -1011,10 +1405,10 @@ export default function HomePage() {
       appendLog(
         'SYSTEM',
         'SUCCESS',
-        `Trade Master bot STARTED! Scanning 5m pairs on ${activeSettings.scanIntervalSeconds || 15}s cycle with $${activeSettings.baseMargin.toFixed(2)} base margin (${activeSettings.leverage}x isolated).`
+        `Trade Master bot STARTED on ${activeSettings.isTestnet ? 'TESTNET (paper)' : 'MAINNET (REAL MONEY)'}: scanning 5m pairs every ${activeSettings.scanIntervalSeconds || 15}s with $${activeSettings.baseMargin.toFixed(2)} base margin (${activeSettings.leverage}x isolated).`
       );
     },
-    [settings, runMarketScan, appendLog, syncBinanceAccount, applyUpdatedSettings]
+    [settings, session.active, runMarketScan, appendLog, syncBinanceAccount, applyUpdatedSettings]
   );
 
   const handlePauseBot = useCallback(() => {
@@ -1027,18 +1421,18 @@ export default function HomePage() {
     if (botActive) {
       handlePauseBot();
     } else {
-      if (!settings.apiKey || !settings.apiSecret) {
+      if (!session.active) {
         appendLog(
           'SYSTEM',
           'WARN',
-          'Cannot start bot: Binance Futures API Key & Secret are required. Please configure them in Settings.'
+          'Cannot start bot: a verified Binance API session is required. Configure it in Settings.'
         );
         setActiveTab('settings');
         return;
       }
       handleStartBot();
     }
-  }, [botActive, handlePauseBot, handleStartBot, settings.apiKey, settings.apiSecret, appendLog]);
+  }, [botActive, handlePauseBot, handleStartBot, session.active, appendLog]);
 
   const selectedSignal = signals.find((s) => s.symbol === selectedSymbol) || signals[0];
   const activeSymbolForChart = selectedSignal?.symbol || selectedSymbol;
@@ -1056,12 +1450,13 @@ export default function HomePage() {
         onToggleBot={handleToggleBot}
         openPositionsCount={positions.length}
         maxOpenPositions={settings.maxOpenTrades}
-        hasApiKey={Boolean(settings.apiKey && settings.apiSecret)}
+        hasApiKey={session.active}
       />
 
       {/* 2. Main Terminal Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6">
-        {/* KPI Performance Strip */}
+        {/* KPI telemetry cards belong to the terminal (1st page) only — other tabs are focused views */}
+        {activeTab === 'positions' && (
         <KpiMetricsStrip
           totalPnl={totalPnl}
           totalPnlPercent={totalPnlPercent}
@@ -1079,10 +1474,31 @@ export default function HomePage() {
           botActive={botActive}
           binanceAccount={binanceAccount}
         />
+        )}
 
         {/* Tab 1: Active Positions Dashboard, PnL Chart & Selected Symbol Order Flow Chart */}
         {activeTab === 'positions' && (
           <div className="space-y-6">
+            <EngineStatusPanel
+              state={engineState}
+              loading={engineLoading}
+              error={engineError}
+              onAction={handleEngineAction}
+              onRefresh={onRefreshEngine}
+              onToggleAutopilot={handleToggleAutopilot}
+            />
+            {!engineState?.engine?.running && (
+              <div className="flex items-start gap-2 p-3 rounded-lg border border-amber-800/70 bg-amber-950/30 text-[11px] text-amber-200">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>
+                  <strong>No server-side guardian is running.</strong> Stop-loss re-arming, breach checks and
+                  the durable ledger only work while this browser tab is open — close the tab and the only
+                  protection left is whatever conditional orders are sitting on Binance. Set
+                  <code className="mx-1 px-1 rounded bg-slate-900 text-cyan-300">TRADE_ENGINE_ENABLED=true</code>
+                  (plus server API keys) to run it on the server.
+                </span>
+              </div>
+            )}
             <PnlChartWidget
               trades={closedTrades}
               totalPnl={totalPnl}
@@ -1119,7 +1535,7 @@ export default function HomePage() {
         {/* Tab 2: Dedicated Market Scanner Page + Interactive 5m Order Flow Chart */}
         {activeTab === 'scanner' && (
           <div className="space-y-6">
-            {Boolean(settings.apiKey && settings.apiSecret) && (
+            {session.active && (
               <InteractiveChart
                 symbol={activeSymbolForChart}
                 candles={selectedCandles}
@@ -1142,7 +1558,7 @@ export default function HomePage() {
               scanIntervalSeconds={settings.scanIntervalSeconds}
               leverage={settings.leverage}
               isScanning={isScanning}
-              hasApiKey={Boolean(settings.apiKey && settings.apiSecret)}
+              hasApiKey={session.active}
               onGoToSettings={() => setActiveTab('settings')}
             />
           </div>
@@ -1161,7 +1577,6 @@ export default function HomePage() {
         {/* Tab 5: Settings */}
         {activeTab === 'settings' && (
           <SettingsView
-            key={`${settings.apiKey}-${settings.baseMargin}-${settings.leverage}-${settings.compoundingPercent}`}
             settings={settings}
             onUpdateSettings={(newSet) => {
               applyUpdatedSettings(newSet);
@@ -1172,6 +1587,9 @@ export default function HomePage() {
               );
               syncBinanceAccount();
             }}
+            session={session}
+            onConnectCredentials={handleConnectCredentials}
+            onDisconnectCredentials={handleDisconnectCredentials}
             onTestConnection={handleTestConnection}
             isTestingConnection={isTestingConnection}
             connectionResult={connectionResult}
@@ -1183,8 +1601,16 @@ export default function HomePage() {
       </main>
 
       {/* Footer */}
-      <footer className="border-t border-slate-900 bg-slate-950 py-4 px-6 text-center text-xs text-slate-500 font-mono">
-        Trade Master · Binance Futures Terminal · ${settings.baseMargin.toFixed(2)} Base Margin · {settings.leverage}x Isolated (10x–15x)
+      <footer className="border-t border-slate-900 bg-slate-950 py-5 px-6 text-center">
+        <p className="text-xs text-slate-500 font-mono">
+          © 2026 All Rights Reserved. Design &amp; Development by{' '}
+          <a
+            href="mailto:badalworld@gmail.com"
+            className="text-cyan-400 hover:text-cyan-300 underline-offset-2 hover:underline transition-colors"
+          >
+            Badalworld
+          </a>
+        </p>
       </footer>
 
       {/* Full-Screen Trade Result Celebration / Sad Mode Overlay */}
