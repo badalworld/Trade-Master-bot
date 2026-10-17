@@ -89,7 +89,12 @@ export function ScannerTable({
   });
 
   const tradeableCount = signals.filter((s) => s.scan?.tradeable !== false).length;
-  const listEntry = (symbol: string) => opportunity?.state.entries.find((e) => e.symbol === symbol) ?? null;
+  const listEntry = (symbol: string) => {
+    // Check if this symbol is in the opportunity list entries or the promoted list.
+    const entries = opportunity?.state.entries ?? [];
+    const promoted = opportunity?.promoted ?? [];
+    return entries.find((e) => e.symbol === symbol) ?? promoted.find((e) => e.symbol === symbol) ?? null;
+  };
   const promotedSet = new Set((opportunity?.promoted ?? []).map((e) => e.symbol));
   const warnedMap = new Map((opportunity?.warned ?? []).map((w) => [w.symbol, w]));
   const skippedEntries = Object.entries(skipped ?? {});
@@ -225,7 +230,7 @@ export function ScannerTable({
         )}
 
         {/* The opportunity list: what the market scan promoted, and what it took back */}
-        {opportunity && (
+        {opportunity && opportunity.state && (
           <div className="px-5 py-2 border-b border-slate-800/70 bg-slate-950/60 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-mono">
             <span className="text-slate-300">
               <span className="text-cyan-300 font-semibold">Opportunity list</span>{' '}

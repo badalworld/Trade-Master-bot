@@ -2,6 +2,7 @@ import type {NextConfig} from 'next';
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  serverExternalPackages: ['crypto', 'fs', 'path'],
   // A trading bot must not ship past a lint failure; the previous setting silently skipped it.
   eslint: {
     ignoreDuringBuilds: false,
@@ -65,13 +66,23 @@ const nextConfig: NextConfig = {
   },
   output: 'standalone',
   transpilePackages: ['motion'],
-  webpack: (config, {dev}) => {
+  webpack: (config, {dev, isServer}) => {
     // HMR is disabled in AI Studio via DISABLE_HMR env var.
     // Do not modify—file watching is disabled to prevent flickering during agent edits.
     if (dev && process.env.DISABLE_HMR === 'true') {
       config.watchOptions = {
         ignored: /.*/,
       };
+    }
+    if (!isServer) {
+      config.resolve.fallback = {
+        ...config.resolve.fallback,
+        crypto: false,
+        fs: false,
+        path: false,
+      };
+    } else {
+      config.externals = [...(Array.isArray(config.externals) ? config.externals : []), 'crypto', 'fs', 'path'];
     }
     return config;
   },

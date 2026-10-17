@@ -47,7 +47,8 @@ export function findProtectiveStop(orders: ConditionalOrder[], side: 'LONG' | 'S
   // Closing a LONG means SELLing; a SHORT is closed by BUYing.
   const exitSide = side === 'LONG' ? 'SELL' : 'BUY';
   return orders.find(
-    (o) => o.symbol && o.type === 'STOP_MARKET' && o.side === exitSide && !TERMINAL_STATUSES.has(String(o.status).toUpperCase())
+    (o) => o.symbol && o.side === exitSide && !TERMINAL_STATUSES.has(String(o.status).toUpperCase()) &&
+      (o.type === 'STOP_MARKET' || o.type === 'CONDITIONAL' || o.type === 'STOP' || o.type.includes('STOP'))
   );
 }
 

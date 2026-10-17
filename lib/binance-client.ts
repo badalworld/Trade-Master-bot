@@ -49,7 +49,8 @@ async function signedRequest<T = Json>(
   params: Record<string, string | number | boolean | undefined>,
   opts: { timeoutMs?: number; recvWindow?: number } = {}
 ): Promise<CallResult<T>> {
-  const crypto = await import('crypto');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const crypto = require('crypto');
   const usp = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === null || v === '') continue;
@@ -381,7 +382,9 @@ export async function placeBracketOrder(
     symbol: args.symbol,
     side: args.side,
     type: args.type,
+    algoType: 'CONDITIONAL',
     stopPrice: args.stopPrice,
+    triggerPrice: args.stopPrice,
     workingType: 'MARK_PRICE',
     priceProtect: 'TRUE',
     closePosition: args.closePosition ? 'true' : 'false',
@@ -390,7 +393,7 @@ export async function placeBracketOrder(
   if (!args.closePosition && args.quantity) params.quantity = args.quantity;
   if (args.activationPrice) params.price = args.activationPrice;
 
-  const { data } = await signedRequest<Json>(creds, 'POST', '/fapi/v1/order', params);
+  const { data } = await signedRequest<Json>(creds, 'POST', '/fapi/v1/algoOrder', params);
   return toAck(data);
 }
 
@@ -400,6 +403,11 @@ export async function cancelOpenOrdersForSymbol(creds: BinanceCreds, symbol: str
   } catch (err) {
     if (err instanceof BinanceApiError && (err.code === -2011 || err.code === -4046)) return;
     throw err;
+  }
+  try {
+    await signedRequest(creds, 'DELETE', '/fapi/v1/algoOrder/allOpenOrders', { symbol });
+  } catch (err) {
+    if (err instanceof BinanceApiError && (err.code === -2011 || err.code === -4046)) return;
   }
 }
 
@@ -433,15 +441,17 @@ export interface ConditionalOrder {
  * Live conditional orders for a symbol. The guardian loop uses this to answer a question the UI
  * never could: is the protective stop still on the book right now?
  */
+let algoOrderWarned = false;
 export async function getConditionalOrders(creds: BinanceCreds, symbol?: string): Promise<ConditionalOrder[]> {
+  const params = symbol ? { symbol } : {};
   const { data } = await signedRequest<Json[] | Json>(
     creds,
     'GET',
     '/fapi/v1/openOrders',
-    symbol ? { symbol } : {}
+    params
   );
   const rows = Array.isArray(data) ? data : [];
-  return rows.map((o) => ({
+  const regular = rows.map((o) => ({
     orderId: (o.orderId as number | string) ?? '',
     symbol: String(o.symbol ?? ''),
     type: String(o.type ?? ''),
@@ -449,6 +459,34 @@ export async function getConditionalOrders(creds: BinanceCreds, symbol?: string)
     stopPrice: parseFloat(String(o.stopPrice ?? '0')) || 0,
     status: String(o.status ?? 'NEW'),
   }));
+
+  let algo: ConditionalOrder[] = [];
+  try {
+    const { data: algoData } = await signedRequest<Json[] | Json>(
+      creds,
+      'GET',
+      '/fapi/v1/algoOrder/openOrders',
+      params
+    );
+    const algoRows = Array.isArray(algoData) ? algoData : [];
+    algo = algoRows.map((o) => ({
+      orderId: (o.orderId as number | string) ?? '',
+      symbol: String(o.symbol ?? ''),
+      type: String(o.type ?? o.algoType ?? ''),
+      side: String(o.side ?? ''),
+      stopPrice: parseFloat(String(o.stopPrice ?? o.triggerPrice ?? '0')) || 0,
+      status: String(o.status ?? 'NEW'),
+    }));
+  } catch (err) {
+    // Log once — the algo endpoint is not available on all Binance accounts, and repeating the
+    // warning every 15s per position drowns the log without adding information.
+    if (!algoOrderWarned) {
+      console.warn('[binance-client] algo openOrders query failed (logged once):', (err as Error).message);
+      algoOrderWarned = true;
+    }
+  }
+
+  return [...regular, ...algo];
 }
 
 /**

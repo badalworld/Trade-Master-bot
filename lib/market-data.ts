@@ -349,7 +349,7 @@ export function summarizeSkips(signals: SignalEvaluation[]): Record<string, numb
 export function selectBestCandidate(
   signals: SignalEvaluation[],
   tradeable: Record<string, boolean> = {},
-  minScore = 65
+  minScore = 70
 ): SignalEvaluation | null {
   const eligible = signals.filter(
     (signal) => tradeable[signal.symbol] !== false && signal.scan?.tradeable !== false && isActionableSignal(signal, minScore)
@@ -544,11 +544,12 @@ export async function scanUniverse(opts: ScanOptions): Promise<ScanResult> {
  * volatility outside the band) is not an entry candidate no matter how strong the three-indicator
  * score looks — refusing that combination is the entire point of measuring the regime.
  */
-export function isActionableSignal(signal: SignalEvaluation, minScore = 65): boolean {
+export function isActionableSignal(signal: SignalEvaluation, minScore = 70): boolean {
   if (signal.scan && signal.scan.tradeable === false) return false;
+  // Require STRONG signals only (70+ score) — at least 2 of 3 indicators must be strongly confirmed.
+  // This ensures "high observation completed" before placing trades.
   return (
     signal.signal === 'STRONG_BUY' ||
-    signal.signal === 'STRONG_SELL' ||
-    ((signal.signal === 'BUY' || signal.signal === 'SELL') && signal.score >= minScore)
+    signal.signal === 'STRONG_SELL'
   );
 }

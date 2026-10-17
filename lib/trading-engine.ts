@@ -700,10 +700,24 @@ export function evaluate3IndicatorSignal(
 
   // -------------------------------------------------------------------------
   // Indicator-Driven Dynamic TP and SL (Anchored to HVN, Absorption & Imbalance)
+  // Strategy: Wider stops for noise protection, asymmetric R:R for profitability
   // -------------------------------------------------------------------------
   const safeAtr = atr > 0 ? atr : currentPrice * 0.008 || 1e-6;
   let tpPrice = currentPrice;
   let slPrice = currentPrice;
+
+  // Compute market regime early for TP/SL adjustment
+  const regime = measureRegime(candles, { adxFloor: 20, efficiencyFloor: 0.3 });
+
+  // Market regime adjustment: trending markets get tighter stops (momentum carries),
+  // choppy markets get wider stops (more noise to absorb)
+  const isTrending = regime.adx >= 25 && regime.efficiencyRatio >= 0.4;
+  const isChoppy = regime.adx < 20 || regime.efficiencyRatio < 0.3;
+
+  // SL band: 2.5-4.5x ATR (wider than before to avoid noise stops)
+  // Trending: tighter end (2.5-3.5x), Choppy: wider end (3.5-4.5x)
+  const slMinMultiplier = isTrending ? 2.5 : isChoppy ? 3.5 : 3.0;
+  const slMaxMultiplier = isTrending ? 3.5 : isChoppy ? 4.5 : 4.0;
 
   if (action === 'LONG') {
     // Candidate structural support levels from our 3 indicators below currentPrice:
@@ -725,15 +739,14 @@ export function evaluate3IndicatorSignal(
       structuralSupports.push(hvnProfile.valueAreaLow * 0.998);
     }
 
-    // Pick the tightest structural indicator support that gives at least 0.8 * ATR breathing room,
-    // and cap maximum SL distance at 1.6 * ATR so Risk/Reward is never inverted.
-    const minSl = currentPrice - 1.6 * safeAtr;
-    const maxSl = currentPrice - 0.85 * safeAtr;
+    // Pick the best structural support within our SL band
+    const minSl = currentPrice - slMaxMultiplier * safeAtr;
+    const maxSl = currentPrice - slMinMultiplier * safeAtr;
     const validSupports = structuralSupports.filter((s) => s >= minSl && s <= maxSl);
     const rawSl =
       validSupports.length > 0
-        ? Math.max(...validSupports)
-        : Math.max(minSl, Math.min(maxSl, currentPrice - 1.4 * safeAtr));
+        ? Math.max(...validSupports) // Use highest (tightest) valid support
+        : currentPrice - (slMinMultiplier + slMaxMultiplier) / 2 * safeAtr; // Midpoint if no indicator
     slPrice = roundCryptoPrice(rawSl);
 
     // Ensure SL is strictly below currentPrice
@@ -741,18 +754,21 @@ export function evaluate3IndicatorSignal(
       slPrice = roundCryptoPrice(currentPrice * 0.99);
     }
 
-    const riskDist = Math.max(currentPrice - slPrice, safeAtr * 0.8);
+    const riskDist = Math.max(currentPrice - slPrice, safeAtr * 2.0);
 
-    // Indicator-based Take Profit target: upper HVN / VAH node or Volume Profile extension (>= 1.67x risk)
+    // TP target: Asymmetric R:R ratio (minimum 2.5:1, target 3:1+)
+    // Remove the 3.5x ATR cap - let winners run to major HVN levels
     const upperNodes = [
-      ...hvnProfile.hvnLevels.filter((lvl) => lvl > currentPrice + riskDist * 1.4),
-      hvnProfile.valueAreaHigh > currentPrice + riskDist * 1.4 ? hvnProfile.valueAreaHigh : 0,
-    ].filter((lvl) => lvl > 0 && lvl <= currentPrice + 3.5 * safeAtr);
+      ...hvnProfile.hvnLevels.filter((lvl) => lvl > currentPrice + riskDist * 2.0),
+      hvnProfile.valueAreaHigh > currentPrice + riskDist * 2.0 ? hvnProfile.valueAreaHigh : 0,
+    ].filter((lvl) => lvl > 0);
 
+    // Target 3:1 R:R minimum, use highest HVN node if available
+    const minTpTarget = currentPrice + riskDist * 3.0;
     const rawTp =
       upperNodes.length > 0
-        ? Math.max(...upperNodes, currentPrice + riskDist * 1.67)
-        : currentPrice + Math.max(2.4 * safeAtr, riskDist * 1.67);
+        ? Math.max(...upperNodes, minTpTarget) // Use highest node or minimum target
+        : minTpTarget;
     tpPrice = roundCryptoPrice(rawTp);
   } else if (action === 'SHORT') {
     // Candidate structural resistance levels from our 3 indicators above currentPrice:
@@ -771,34 +787,38 @@ export function evaluate3IndicatorSignal(
       structuralResistances.push(hvnProfile.valueAreaHigh * 1.002);
     }
 
-    const minSl = currentPrice + 0.85 * safeAtr;
-    const maxSl = currentPrice + 1.6 * safeAtr;
+    const minSl = currentPrice + slMinMultiplier * safeAtr;
+    const maxSl = currentPrice + slMaxMultiplier * safeAtr;
     const validResistances = structuralResistances.filter((r) => r >= minSl && r <= maxSl);
     const rawSl =
       validResistances.length > 0
-        ? Math.min(...validResistances)
-        : Math.min(maxSl, Math.max(minSl, currentPrice + 1.4 * safeAtr));
+        ? Math.min(...validResistances) // Use lowest (tightest) valid resistance
+        : currentPrice + (slMinMultiplier + slMaxMultiplier) / 2 * safeAtr; // Midpoint if no indicator
     slPrice = roundCryptoPrice(rawSl);
 
     if (slPrice <= currentPrice) {
       slPrice = roundCryptoPrice(currentPrice * 1.01);
     }
 
-    const riskDist = Math.max(slPrice - currentPrice, safeAtr * 0.8);
+    const riskDist = Math.max(slPrice - currentPrice, safeAtr * 2.0);
 
+    // TP target: Asymmetric R:R ratio (minimum 2.5:1, target 3:1+)
     const lowerNodes = [
-      ...hvnProfile.hvnLevels.filter((lvl) => lvl < currentPrice - riskDist * 1.4),
-      hvnProfile.valueAreaLow < currentPrice - riskDist * 1.4 ? hvnProfile.valueAreaLow : 0,
-    ].filter((lvl) => lvl > 0 && lvl >= currentPrice - 3.5 * safeAtr);
+      ...hvnProfile.hvnLevels.filter((lvl) => lvl < currentPrice - riskDist * 2.0),
+      hvnProfile.valueAreaLow < currentPrice - riskDist * 2.0 ? hvnProfile.valueAreaLow : 0,
+    ].filter((lvl) => lvl > 0);
 
+    // Target 3:1 R:R minimum, use lowest HVN node if available
+    const minTpTarget = currentPrice - riskDist * 3.0;
     const rawTp =
       lowerNodes.length > 0
-        ? Math.min(...lowerNodes, currentPrice - riskDist * 1.67)
-        : currentPrice - Math.max(2.4 * safeAtr, riskDist * 1.67);
-    tpPrice = roundCryptoPrice( Math.max(rawTp, currentPrice * 0.1) );
+        ? Math.min(...lowerNodes, minTpTarget) // Use lowest node or minimum target
+        : minTpTarget;
+    tpPrice = roundCryptoPrice(Math.max(rawTp, currentPrice * 0.1));
   } else {
-    tpPrice = roundCryptoPrice(currentPrice + 2.2 * safeAtr);
-    slPrice = roundCryptoPrice(Math.max(currentPrice * 0.1, currentPrice - 1.4 * safeAtr));
+    // NEUTRAL/HOLD: Still calculate TP/SL for display purposes
+    tpPrice = roundCryptoPrice(currentPrice + 3.0 * safeAtr);
+    slPrice = roundCryptoPrice(Math.max(currentPrice * 0.1, currentPrice - 3.5 * safeAtr));
   }
 
   const actualRisk = Math.abs(currentPrice - slPrice);
@@ -822,10 +842,6 @@ export function evaluate3IndicatorSignal(
 
   const volatilityPercent = Number((atrRatio * 0.55 + rangeExpansion * 0.45).toFixed(2));
   const volatilityScore = Math.min(99, Math.round(volatilityPercent * 30));
-
-  // Trend vs chop, also on settled candles. Default thresholds here; the scanner passes the
-  // policy's own floors through `annotateSignals` for the trade/no-trade decision.
-  const regime = measureRegime(candles, { adxFloor: 20, efficiencyFloor: 0.3 });
 
   return {
     symbol,

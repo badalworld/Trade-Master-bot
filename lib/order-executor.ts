@@ -447,35 +447,20 @@ export async function openPosition(
     }
 
     if (ctx.slOrderId === undefined) {
-      let flattened = false;
-      let flattenError: string | null = null;
-      try {
-        await placeMarketOrder(creds, {
-          symbol,
-          side: exitSide,
-          quantity: formatCloseQty(executedQty, spec.filters.stepSize, spec.filters.quantityPrecision),
-          reduceOnly: true,
-          newClientOrderId: makeClientOrderId('tmfl', symbol, `${Date.now()}`),
-        });
-        flattened = true;
-      } catch (err) {
-        flattenError = err instanceof Error ? err.message : 'unknown error';
-      }
+      // Don't auto-flatten when SL placement fails — the guardian will retry next cycle.
+      // Trades must only close via TP or SL, not because of order placement errors.
       await cancelOpenOrdersForSymbol(creds, symbol).catch(() => undefined);
 
       return fail(502, {
         code: 'STOP_LOSS_UNAVAILABLE',
         symbol,
-        orderPlaced: !flattened,
-        positionMayBeOpen: !flattened,
-        autoFlattened: flattened,
+        orderPlaced: true,
+        positionMayBeOpen: true,
+        autoFlattened: false,
         executedQty,
         avgPrice: fillPrice,
-        error: `Stop-loss order was rejected (${slError}). ${
-          flattened
-            ? 'The position was immediately flattened; no exposure remains.'
-            : `WARNING: auto-flatten also failed (${flattenError}). A LIVE UNPROTECTED ${intent.side} POSITION OF ${executedQty} ${symbol} EXISTS — close it manually on Binance now.`
-        }`,
+        slOrderId: null,
+        error: `Stop-loss order was rejected (${slError}). Position left open — guardian will retry stop placement next cycle.`,
       });
     }
 

@@ -714,10 +714,18 @@ class TradeEngine {
             // means the stop state is unknown, and closing a position on that assumption is worse
             // than retrying next cycle.
             if (err instanceof BinanceApiError) {
-              const cycles = (pos.unprotectedCycles ?? 0) + 1;
-              ledger.patch(pos.symbol, { unprotectedCycles: cycles });
-              unprotected.push(pos.symbol);
-              this.log('ERROR', 'BRACKET_FAILED', `${pos.symbol} stop re-arm rejected (cycle ${cycles}/${this.status.config.unprotectedTolerance + 1}): ${(err as Error).message}`);
+              const msg = (err as Error).message.toLowerCase();
+              // If Binance says a stop already exists, the position IS protected — we just can't
+              // query it via the algo openOrders endpoint. Treat this as confirmation.
+              if (msg.includes('existing') || msg.includes('already') || msg.includes('duplicate')) {
+                ledger.patch(pos.symbol, { unprotectedCycles: 0 });
+                this.log('INFO', 'BRACKET_CONFIRMED', `${pos.symbol} stop already exists on exchange (re-arm rejected as duplicate) — position is protected.`);
+              } else {
+                const cycles = (pos.unprotectedCycles ?? 0) + 1;
+                ledger.patch(pos.symbol, { unprotectedCycles: cycles });
+                unprotected.push(pos.symbol);
+                this.log('ERROR', 'BRACKET_FAILED', `${pos.symbol} stop re-arm rejected (cycle ${cycles}/${this.status.config.unprotectedTolerance + 1}): ${(err as Error).message}`);
+              }
             } else {
               unprotected.push(pos.symbol);
               this.log('WARN', 'BRACKET_DEFERRED', `${pos.symbol} stop re-arm unreachable (${(err as Error).message}); retried next cycle, position left as-is.`);
@@ -731,9 +739,10 @@ class TradeEngine {
           break;
         }
         case 'FLATTEN': {
-          this.log('ERROR', 'AUTO_FLATTEN', plan.note);
-          await this.closeAndSettle(creds, pos.symbol, 'MANUAL_CLOSE');
-          settledThisCycle = true;
+          // Trades must only close via TP or SL — never auto-flatten just because the stop query
+          // failed. The re-arm will keep retrying every cycle.
+          unprotected.push(pos.symbol);
+          this.log('WARN', 'AUTO_FLATTEN_DISABLED', `${pos.symbol} ${plan.note} — kept open, re-arm retried next cycle.`);
           break;
         }
         case 'SKIP': {
